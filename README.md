@@ -1,20 +1,71 @@
 # mesh2threejs
 
-`mesh2threejs` reconstructs an admitted live GLB oracle as independently authored procedural/native Three.js. It supports sibling tank and generic rigid hard-surface profiles, deterministic six-pass CPU captures, CoT-derived geometry gates, an anti-gaming low-poly style contract, durable hash-bound state, and a separate-process critic.
+Give an agent a local GLB reference and `mesh2threejs` will build a separate, procedural Three.js recreation of it. The pipeline measures the live reference, writes editable Three.js source, checks the result from multiple views, and keeps iterating until the required geometry, style, and review gates pass.
 
-## Requirements and setup
+It is designed for rigid hard-surface subjects such as tanks, vehicles, buildings, machines, and props. The included `low-poly-faithful` style simplifies tessellation and microdetail while preserving the object's dimensions, silhouette, orientation, major parts, repeated-part counts, and articulation.
 
-- Node.js 22 or newer
-- A local GLB whose provenance and redistribution terms you can record
+This is not a GLB converter. The result is independently authored Three.js code that recreates the reference with primitives, procedural lofts, transforms, materials, semantic parts, and explicit pivots. The source GLB is used only as a measured oracle and is never embedded in the candidate.
+
+## What to give the agent
+
+Provide:
+
+- the local path to a `.glb` reference;
+- a short description of the subject and the desired result;
+- the model's source, author, license, and redistribution terms;
+- optional authoritative dimensions and their sources, especially for real tanks;
+- any important parts, articulation, or simplifications that must be preserved.
+
+For example:
+
+> Use the `mesh2threejs` skill to recreate `C:\references\tank.glb` as a low-poly, procedural Three.js model. Read the actual author, source URL, license, and redistribution terms from `C:\references\license.txt` before onboarding it. Preserve the rotating turret, elevating gun, wheel count, tracks, cupola, and overall dimensions. Put the task workspace in `workspaces/tank-demo`.
+
+If provenance, coordinate orientation, semantic ownership, or scale cannot be established safely, the agent will stop certification and record what remains unresolved instead of guessing.
+
+## What the pipeline does
+
+The agent will:
+
+1. inspect the GLB, record provenance, and create an immutable source hash;
+2. normalize scale, orientation, grounding, semantic parts, and articulation pivots without changing the source file;
+3. author a standalone procedural candidate module;
+4. compare the candidate with the live oracle using dimensions, silhouettes, sections, landmarks, connectivity, and profile-specific gates;
+5. render beauty, silhouette, semantic ID, depth, normal, and material diagnostic passes;
+6. turn failures into precise workorders and repair the candidate;
+7. run a separate-process critic and certify only evidence bound to the final candidate hash.
+
+Tank tasks use dedicated hull, turret, gun, running-gear, track, fabrication, and articulation checks. Other rigid objects use the generic three-axis profile without loading tank-specific instructions.
+
+## What you receive
+
+A completed workspace contains:
+
+- editable procedural Three.js source exporting `createCandidate()`;
+- geometry and style/complexity reports;
+- actionable workorders for any failed measurements;
+- six diagnostic capture passes, a comparison board, and turntable frames;
+- a hash-bound critic verdict and resumable task state;
+- recorded simplifications, oracle attribution requirements, and final candidate hash.
+
+Certification is either `oracle-relative` or `exact-real`. `exact-real` is available for tanks only when authoritative real-world dimensions and their sources have been admitted. The pipeline does not package or redistribute the source GLB automatically.
+
+The built-in critic runs in an isolated process, but it is not represented as a second AI model. A capable host may add calibrated visual findings to the same hash-bound evidence packet.
+
+## Setup
+
+Requires Node.js 22 or newer.
 
 ```sh
 npm install
-npm run validate
 npm run build
-node dist/cli.js help
+npm run validate
 ```
 
-## Workflow
+Open this repository in a supported coding agent and ask it to use the root `mesh2threejs` skill. The root [SKILL.md](SKILL.md) routes the task and loads only the relevant role, profile, and style instructions. See [host validation](docs/host-validation.md) for tested host capabilities and limitations.
+
+## CLI for manual or scripted use
+
+The agent uses the same host-neutral CLI that is available to developers:
 
 ```sh
 node dist/cli.js route "reconstruct this tracked armored vehicle"
@@ -27,16 +78,12 @@ node dist/cli.js critic workspaces/demo/critic/packet.json --out workspaces/demo
 node dist/cli.js finalize workspaces/demo/state.json
 ```
 
-The candidate module exports `createCandidate(): THREE.Object3D | Promise<THREE.Object3D>`. It may use Three.js primitives, indexed procedural lofts, transforms, and generated materials. It may not load the oracle or contain a dense topology dump.
+Run `node dist/cli.js help` for all commands. The [architecture guide](docs/architecture.md) explains the engine, and the `examples/` directory contains complete generic and tank candidate modules.
 
-Choose `exact-real` only for tanks with admitted authoritative dimensions and cited sources. Otherwise use `oracle-relative`. Source GLBs are never packaged automatically.
+## Credits and provenance
 
-## Evidence and outputs
+The tank measurement and construction doctrine adapts ideas from [Claude-of-Tanks by Kevin B. Liu](https://github.com/Kevin-Liu-01/Claude-of-Tanks/tree/f389f13f829451d64cf780c5f14473527b45f7f4), used under the [MIT License](https://github.com/Kevin-Liu-01/Claude-of-Tanks/blob/f389f13f829451d64cf780c5f14473527b45f7f4/LICENSE).
 
-Each workspace contains immutable source/preparation lineage, candidate source, reports/workorders, six diagnostic capture passes, a comparison board, turntable, critic packet/verdict, and resumable `state.json`. Any oracle change invalidates all comparison evidence; a candidate change invalidates geometry/style/critic/turntable evidence.
+The GLB intake, semantic-readiness, durable-state, and shared-render-contract architecture was informed by [img2threejs](https://github.com/img2threejs/img2threejs/tree/d6673386f89673a58736f8d398dd16ece67874f5), used under the [Apache License 2.0](https://github.com/img2threejs/img2threejs/blob/d6673386f89673a58736f8d398dd16ece67874f5/LICENSE).
 
-See `SKILL.md` for routing, `profiles/` for domain standards, `styles/` for the style contract, `docs/architecture.md` for internals, and `docs/host-validation.md` for tested host capability boundaries.
-
-## License and upstream provenance
-
-Repository code is MIT. Adapted upstream concepts and code are recorded in `NOTICE` and `docs/upstream-map.md`. Oracle assets keep their own licenses and are not covered by this repository license.
+This repository is MIT-licensed. See [NOTICE](NOTICE) and the detailed [upstream source map](docs/upstream-map.md) for file-level attribution and adaptation notes. Third-party oracle assets retain their own licenses.
