@@ -7,9 +7,10 @@ import { getProfileContract, profileContractHash } from "./contracts.js";
 import { verifyVisualReviewPacketFiles, type VisualReviewPacket } from "./review.js";
 import { getStyleContract } from "../styles/low-poly.js";
 import { evaluationIdentityHash, type EvaluationIdentity } from "./identity.js";
+import type { OraclePreparationBinding } from "./oracle.js";
 
 export type SourceStatus = "supports" | "does-not-support" | "not-retrieved" | "contradicted" | "superseded";
-export const EVIDENCE_GENERATOR_VERSION = "0.4.0";
+export const EVIDENCE_GENERATOR_VERSION = "1.0.0";
 
 export interface StateFact {
   id: string;
@@ -102,6 +103,7 @@ export interface TaskState {
   route: Route;
   oracleHash: string | null;
   candidateHash: string | null;
+  oraclePreparation: OraclePreparationBinding | null;
   observedFacts: StateFact[];
   userDecisions: Array<{ id: string; value: unknown }>;
   systemDecisions: Array<{ id: string; value: unknown; reason: string }>;
@@ -172,6 +174,7 @@ export function createTaskState(input: { taskId: string; profile: ProfileId; sty
     route: "reconstruct",
     oracleHash: null,
     candidateHash: null,
+    oraclePreparation: null,
     observedFacts: [],
     userDecisions: [{ id: "style", value: input.style }],
     systemDecisions: [{ id: "profile", value: input.profile, reason: "task routing" }],
@@ -280,6 +283,35 @@ export function bindOracle(state: TaskState, oracleHash: string): TaskState {
     for (const phase of Object.keys(next.phaseStatus)) next.phaseStatus[phase] = "invalidated";
   }
   next.oracleHash = oracleHash;
+  return next;
+}
+
+/**
+ * Establishes the admitted live oracle preparation as the only oracle authority. A different
+ * preparation immediately invalidates every downstream artifact: evidence, locks, geometry hashes,
+ * and the canonical evaluation identity are all derived from the preparation, so the chain restarts
+ * at oracle registration without the user resetting state fields by hand.
+ */
+export function bindOraclePreparation(state: TaskState, preparation: OraclePreparationBinding, reason: string): TaskState {
+  if (state.oraclePreparation?.identity === preparation.identity && state.oraclePreparation.sourceHash === preparation.sourceHash && state.oraclePreparation.preparedHash === preparation.preparedHash) return state;
+  const { phases } = lifecycle(state.profile);
+  const next = clone(state);
+  next.oraclePreparation = { ...preparation };
+  next.status = "active";
+  next.oracleHash = null;
+  next.evaluationIdentity = null;
+  next.evaluationIdentityHash = null;
+  next.locks = {};
+  next.phaseGeometryHashes = {};
+  next.phaseStatus = Object.fromEntries(phases.map((phase, index) => [phase, index === 0 ? "active" : "pending"]));
+  next.activePhase = phases[0]!;
+  next.visualReviewStatus = "awaiting";
+  for (const evidence of Object.values(next.evidence)) { evidence.valid = false; evidence.verified = false; }
+  next.systemDecisions.push({
+    id: `oracle-preparation-${next.systemDecisions.length + 1}`,
+    value: preparation.identity,
+    reason: reason.trim() || "oracle preparation changed; prior oracle-bound evidence and locks were invalidated",
+  });
   return next;
 }
 
@@ -485,7 +517,7 @@ export function recordAttempt(state: TaskState, attempt: Omit<AttemptRecord, "cr
 
 export function determineNextAction(state: TaskState): { route: Route; reason: string } {
   if (state.route === "diagnose") return { route: "diagnose", reason: "diagnose the recorded stagnation or contradictory evidence before continuing" };
-  if (!state.oracleHash) return { route: "onboard-oracle", reason: "no admitted oracle is bound to the task" };
+  if (!state.oracleHash) return { route: "onboard-oracle", reason: state.oraclePreparation ? "the bound oracle preparation has not been registered since onboarding, repair, or rebind" : "no admitted oracle is bound to the task" };
   if (!state.candidateHash) return { route: "build", reason: "no procedural candidate is bound to the task" };
   const valid = Object.values(state.evidence).filter((evidence) => evidence.valid && evidence.oracleHash === state.oracleHash && evidence.candidateHash === state.candidateHash);
   const registration = Object.values(state.evidence).find((evidence) => evidence.kind === "registration" && evidence.valid && evidence.verified && evidence.passed && evidence.oracleHash === state.oracleHash && isAuthoritativeEvidence(evidence));
@@ -634,6 +666,7 @@ export async function loadTaskState(path: string): Promise<TaskState> {
   state.articulationRequired ??= getProfileContract(state.profile).articulation.length > 0;
   state.evaluationIdentity ??= null;
   state.evaluationIdentityHash ??= null;
+  state.oraclePreparation ??= null;
   const lacksEvidenceAuthority = Object.values(state.evidence).some((evidence) => evidence.valid && evidence.verified && (!evidence.authority || !evidence.generatorVersion));
   if (lacksEvidenceAuthority) {
     const contract = getProfileContract(state.profile);
@@ -642,6 +675,7 @@ export async function loadTaskState(path: string): Promise<TaskState> {
     state.locks = {};
     state.phaseGeometryHashes = {};
     state.evidenceConfigHashes = {};
+    state.oraclePreparation = null;
     state.phaseStatus = Object.fromEntries(phases.map((phase, index) => [phase, index === 0 ? "active" : "pending"]));
     state.activePhase = phases[0]!;
     state.visualReviewStatus = "awaiting";

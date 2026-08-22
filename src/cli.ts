@@ -5,10 +5,10 @@ import { pathToFileURL } from "node:url";
 import { auditCandidateModule, inspectCandidateIdentity } from "./core/candidate.js";
 import { replayDeterministicRows, type DeterministicReplayPacket } from "./core/replay.js";
 import { evaluateCandidateWithPoses, neutralPoseForProfile, type PosedEvaluationBundle } from "./core/orchestration.js";
-import { loadPreparedOracle, onboardOracle, probeGlb, repairPreparedOracle, verifyOracleRegistration, type OnboardOracleInput, type OracleManifest, type RegistrationExpectation, type RepairPreparedOracleInput } from "./core/oracle.js";
+import { loadPreparedOracle, onboardOracle, oraclePreparationIdentity, probeGlb, repairPreparedOracle, verifyOracleRegistration, oraclePreparationBinding, type OnboardOracleInput, type OracleManifest, type RegistrationExpectation, type RepairPreparedOracleInput } from "./core/oracle.js";
 import { routeSubject } from "./core/routing.js";
-import { acceptPhase, bindCandidate, bindCandidatePhases, bindEvidenceConfig, bindOracle, certifyStateFromArtifacts, createRenderEvidenceArtifact, createRuntimeEvaluationEvidenceArtifact, createRuntimeGateEvidenceArtifact, createWorkflowGateEvidenceArtifact, determineNextAction, isAuthoritativeEvidence, loadTaskState, recordAttempt, recordEvidenceArtifact, reopenPhase, saveTaskState, setAuthoritativeDimensionStatus, verifyEvidenceArtifact, type EvidenceArtifact, type EvidenceRecord } from "./core/state.js";
-import { createWorkspaceResolver, initializeWorkspace, migrateWorkspace, rebindWorkspace, resolveStateTarget, resumeWorkspace, verifyWorkspaceCandidateIdentity } from "./core/workspace.js";
+import { acceptPhase, bindCandidate, bindCandidatePhases, bindEvidenceConfig, bindOracle, bindOraclePreparation, certifyStateFromArtifacts, createRenderEvidenceArtifact, createRuntimeEvaluationEvidenceArtifact, createRuntimeGateEvidenceArtifact, createWorkflowGateEvidenceArtifact, determineNextAction, isAuthoritativeEvidence, loadTaskState, recordAttempt, recordEvidenceArtifact, reopenPhase, saveTaskState, setAuthoritativeDimensionStatus, verifyEvidenceArtifact, type EvidenceArtifact, type EvidenceRecord } from "./core/state.js";
+import { createWorkspaceResolver, initializeWorkspace, migrateWorkspace, rebindWorkspace, resolveStateTarget, resumeWorkspace, verifyWorkspaceCandidateIdentity, verifyWorkspaceOraclePreparation } from "./core/workspace.js";
 import type { ProfileId } from "./types.js";
 import { validateOracleManifest } from "./core/schema.js";
 import { canonicalJson, fingerprintScene, sha256 } from "./core/hashing.js";
@@ -283,6 +283,10 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         if (!path) throw new Error("lock requires a state path");
         const target = await resolveStateTarget(path);
         const { statePath } = target;
+        if (target.workspaceRoot) {
+          const workspace = await resumeWorkspace(target.workspaceRoot);
+          if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
+        }
         const current = await loadTaskState(statePath);
         const phase = parsed.options.phase ?? (target.workspaceRoot ? current.activePhase : undefined);
         if (!phase) throw new Error("lock state-file mode requires --phase");
@@ -321,6 +325,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         let packet: VisualReviewPacket;
         let outputPath: string;
         if (workspace) {
+          await verifyWorkspaceOraclePreparation(workspace);
           const reviewRun = await createRunDirectory(workspace.layout.internal.visualReview, "review");
           const renderManifestPath = await latestRunFile(workspace.layout.internal.captures, "render", "render-manifest.json");
           const renderManifest = JSON.parse(await readFile(renderManifestPath, "utf8")) as { oracleHash: string; candidateHash: string; styleContractHash: string; evaluationIdentityHash: string; captures: Array<{ path: string; sha256: string; pass: string; cameraId: string }>; comparisonBoards: Array<{ path: string; sha256: string }>; turntable: Array<{ path: string; sha256: string }>; regionDiagnostics?: { path: string; sha256: string } };
@@ -409,6 +414,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         let state = await loadTaskState(statePath);
         if (target.workspaceRoot) {
           const workspace = await resumeWorkspace(target.workspaceRoot);
+          if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
           const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace);
           if (liveCandidate.candidateHash !== state.candidateHash || liveCandidate.candidateHash !== packet.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
         }
@@ -456,7 +462,8 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           const requiredDimensions = getProfileContract(current.profile).dimensions;
           const dimensions = manifest.authoritativeDimensions;
           const admitted = Boolean(dimensions && manifest.dimensionSources.length && requiredDimensions.every((key) => Number.isFinite(dimensions[key]) && dimensions[key]! > 0));
-          const state = setAuthoritativeDimensionStatus(current, admitted ? "admitted" : "not-admitted", admitted ? manifest.dimensionSources : []);
+          const bound = bindOraclePreparation(current, oraclePreparationBinding(manifest), `oracle onboarding admitted preparation ${manifest.preparedHash}`);
+          const state = setAuthoritativeDimensionStatus(bound, admitted ? "admitted" : "not-admitted", admitted ? manifest.dimensionSources : []);
           await saveTaskState(workspace.layout.internal.state, state);
         }
         io.stdout(json({ status: "onboarded", manifest: outputPath, sourceHash: manifest.sourceHash, preparedHash: manifest.preparedHash }));
@@ -475,15 +482,27 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         } : config, workspace?.root);
         const outputPath = workspace?.layout.internal.oracleManifest ?? resolve(required(parsed.options, "out"));
         await writeFile(outputPath, `${json(repaired)}\n`, workspace ? undefined : { flag: "wx" });
+        if (workspace) {
+          const current = await loadTaskState(workspace.layout.internal.state);
+          await saveTaskState(workspace.layout.internal.state, bindOraclePreparation(current, oraclePreparationBinding(repaired), `oracle repair: ${config.reason}`));
+        }
         io.stdout(json({ status: "repaired", manifest: outputPath, sourceHash: repaired.sourceHash, preparedHash: repaired.preparedHash }));
         return 0;
       }
       case "register": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
-        const manifestPath = workspace?.layout.internal.oracleManifest ?? resolve(required(parsed.options, "manifest"));
-        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as OracleManifest;
-        if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+        let manifest: OracleManifest;
+        let preparationIdentity: string;
+        if (workspace) {
+          const preparation = await verifyWorkspaceOraclePreparation(workspace);
+          manifest = preparation.manifest;
+          preparationIdentity = preparation.binding.identity;
+        } else {
+          manifest = JSON.parse(await readFile(resolve(required(parsed.options, "manifest")), "utf8")) as OracleManifest;
+          if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+          preparationIdentity = oraclePreparationIdentity(manifest);
+        }
         const expectation = JSON.parse(await readFile(resolve(required(parsed.options, "config")), "utf8")) as RegistrationExpectation;
         const oracle = await loadPreparedOracle(manifest, workspace?.root);
         const evidence = verifyOracleRegistration(oracle, expectation);
@@ -497,7 +516,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           if (!stateOption || !artifactOption) throw new Error("registration state recording requires both --state and --artifact");
           const statePath = resolve(stateOption);
           let state = bindOracle(await loadTaskState(statePath), fingerprintScene(oracle));
-          const registrationConfigHash = sha256(canonicalJson(expectation));
+          const registrationConfigHash = sha256(canonicalJson({ expectation, oraclePreparation: preparationIdentity }));
           state = bindEvidenceConfig(state, "registration", registrationConfigHash, "registration expectation changed");
           const artifact = createWorkflowGateEvidenceArtifact({ id: registrationRun?.id ?? "registration", kind: "registration", phase: "oracle-registration", oracleHash: state.oracleHash!, candidateHash: null, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: null, configHash: registrationConfigHash, gateCode: "registration.complete", passed: evidence.passed, summary: evidence.passed ? "reference registration passed" : "reference registration failed", details: evidence });
           const artifactPath = resolve(artifactOption);
@@ -519,9 +538,17 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "gate": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
-        const manifestPath = workspace?.layout.internal.oracleManifest ?? resolve(required(parsed.options, "oracle"));
-        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as OracleManifest;
-        if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+        let manifest: OracleManifest;
+        let preparationIdentity: string;
+        if (workspace) {
+          const preparation = await verifyWorkspaceOraclePreparation(workspace);
+          manifest = preparation.manifest;
+          preparationIdentity = preparation.binding.identity;
+        } else {
+          manifest = JSON.parse(await readFile(resolve(required(parsed.options, "oracle")), "utf8")) as OracleManifest;
+          if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+          preparationIdentity = oraclePreparationIdentity(manifest);
+        }
         const profile = (workspace?.project.profile ?? required(parsed.options, "profile")) as ProfileId;
         if (profile !== "tank" && profile !== "generic") throw new Error("--profile must be tank or generic");
         const subjectContractPath = workspace?.resolved.subjectContract ?? (parsed.options["subject-contract"] ? resolve(parsed.options["subject-contract"]) : undefined);
@@ -539,6 +566,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           styleContractHash: selectedStyle.hash,
           subjectContractHash: optionalContractHash(subjectContract),
           certification,
+          oraclePreparationHash: preparationIdentity,
           preparedOracleHash: manifest.preparedHash,
           authoritativeDimensionsHash: optionalContractHash(manifest.authoritativeDimensions),
           candidateSourceHash: candidateIdentity.sourceHash,
@@ -617,9 +645,13 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "render": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
-        const manifestPath = workspace?.layout.internal.oracleManifest ?? resolve(required(parsed.options, "oracle"));
-        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as OracleManifest;
-        if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+        let manifest: OracleManifest;
+        if (workspace) {
+          manifest = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
+        } else {
+          manifest = JSON.parse(await readFile(resolve(required(parsed.options, "oracle")), "utf8")) as OracleManifest;
+          if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+        }
         const oracle = await loadPreparedOracle(manifest, workspace?.root);
         const candidateIdentity = workspace ? await verifyWorkspaceCandidateIdentity(workspace) : await inspectCandidateIdentity(resolve(required(parsed.options, "candidate")));
         if (workspace && candidateIdentity.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before rendering");
@@ -706,6 +738,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const target = await resolveStateTarget(path);
         if (target.workspaceRoot) {
           const workspace = await resumeWorkspace(target.workspaceRoot);
+          if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
           const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace);
           if (liveCandidate.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
         }

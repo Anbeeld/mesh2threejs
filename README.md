@@ -1,6 +1,6 @@
-# mesh2threejs
+# mesh2threejs — Agentic GLB-to-Three.js pipeline
 
-`mesh2threejs` is an agent-driven pipeline for recreating an admitted reference GLB as editable procedural Three.js code. It measures the reference, guides the agent through construction and repair, renders matched comparisons, and keeps enough evidence to resume or verify the work later.
+`mesh2threejs` is an agentic pipeline for recreating a reference GLB as editable, procedural Three.js code. It records the reference with provenance and hashes, measures it, guides the agent through construction and repair, renders matched comparisons, and keeps enough evidence to resume or verify the work later.
 
 It is intended for rigid hard-surface subjects such as vehicles, tanks, buildings, machines, and props. It is not a mesh converter. The finished model is independently authored from Three.js primitives, procedural geometry, transforms, materials, named parts, and real articulation controls. It does not load or embed the source mesh.
 
@@ -31,14 +31,14 @@ A completed workspace can contain:
 - geometry, style, complexity, and articulation reports;
 - actionable workorders tied to failed measurements;
 - matched beauty, silhouette, semantic ID, depth, normal, and material-ID captures;
-- comparison boards, turntable frames, per-region diagnostics, and a visual-review verdict bound to files that are reopened during verification;
+- comparison boards, turntable frames, per-region diagnostics, and a visual-review verdict bound to files that are re-hashed during finalization;
 - resumable state, attribution requirements, intentional simplifications, and the final candidate hash.
 
 Tank projects use dedicated checks for hull, turret, gun, running gear, tracks, fabrication, and articulation. Other rigid objects use a generic three-axis profile.
 
 Certification is `oracle-relative` unless authoritative real-world dimensions and sources support `exact-real`. Generic subject contracts can include or exclude named semantic parts from each dimension, such as excluding an antenna from structural height. Deterministic checks do not substitute for visual review, and the pipeline does not redistribute the reference GLB.
 
-The built-in loader admits uncompressed glTF 2.0 triangle geometry in GLB containers. It decodes normalized and sparse accessors and applies node transforms, but it does not reproduce skinning or animation. Required Draco or meshopt compression fails with an explicit error. The Node.js CLI uses the deterministic CPU renderer; callers that provide a browser or headless WebGL surface can use the integrated Three.js `WebGLRenderer` path.
+The built-in loader accepts uncompressed glTF 2.0 triangle geometry in GLB containers. It decodes normalized and sparse accessors and applies node transforms, but it does not reproduce skinning or animation. Required Draco or meshopt compression fails with an explicit error. The Node.js CLI uses the deterministic CPU renderer; callers that provide a browser or headless WebGL surface can use the integrated Three.js `WebGLRenderer` path.
 
 ## Setup
 
@@ -49,6 +49,8 @@ npm install
 npm run build
 npm run validate
 ```
+
+`npm run ci` runs the same contract as CI: development validation, the E2E suite, and a package dry-run. The synthetic scale workloads live behind their own scripts: `npm run benchmark` for the analytical operators and CAD-scale generic evaluator, `npm run benchmark:glb` for generated large-GLB intake, `npm run benchmark:stress` for the multi-component hard-surface workload, and `npm run benchmark:heavy` to run both heavy paths under externally observed memory sampling.
 
 Open this repository in a supported coding agent and ask it to use the root `mesh2threejs` skill. [SKILL.md](SKILL.md) routes the work to the relevant role, profile, and style instructions. [Host validation](docs/host-validation.md) lists tested host capabilities and limitations.
 
@@ -111,7 +113,7 @@ node dist/cli.js finalize workspaces/demo
 
 The `onboard` configuration supplies provenance, coordinate-frame, normalization, and semantic-map facts. `gate` evaluates every phase independently, reports active-phase and global status separately, and normally exits according to the active phase. Use `--global` when the process exit must reflect the complete evaluation. `workorders` selects the next repair group for the active phase, and `lock` uses that phase's measured geometry and authoritative evidence by default. `render` records captures, region diagnostics, and turntable evidence. `prepare-review` builds a packet from the current workspace and checks every referenced file before an external reviewer inspects it. Low-level manifest, module, and state-file arguments remain available for scripts; run `node dist/cli.js help` for the complete command list.
 
-`project.json`, profile contracts, style contracts, and subject contracts are hash-bound to state. After an intentional configuration or referenced-contract change, run `node dist/cli.js rebind workspaces/demo`; this discards prior authority and starts a clean evidence chain. Ordinary candidate edits use the normal gate/reopen lifecycle and do not require project rebinding.
+`project.json`, profile contracts, style contracts, and subject contracts are hash-bound to state. After an intentional configuration or referenced-contract change, run `node dist/cli.js rebind workspaces/demo`; this archives the active oracle preparation under `.mesh2threejs/oracle/archive/`, discards prior authority, and starts a clean evidence chain. Ordinary candidate edits use the normal gate/reopen lifecycle and do not require project rebinding. Oracle repair follows the same rule in place: the repaired preparation replaces the bound one, and registration plus all downstream evidence is invalidated automatically.
 
 Existing workspaces from the previous root-level layout can be upgraded with:
 
@@ -123,7 +125,7 @@ Migration keeps the old layout under `.mesh2threejs/legacy`, retains its history
 
 See the [architecture guide](docs/architecture.md) for the engine design. The `examples/` directory contains generic and tank candidate modules.
 
-This repository is development-validated through its protected regression suite and analytical/synthetic workloads. Production certification of a reconstruction still depends on its admitted reference, complete evidence chain, and genuine external visual review.
+This repository is development-validated through its protected regression suite and analytical/synthetic scale workloads; a real reconstruction campaign is the next validation step. Production certification of a reconstruction still depends on its onboarded reference, complete evidence chain, and genuine external visual review.
 
 ## Credits
 

@@ -4,7 +4,8 @@ import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve 
 import type { CertificationLevel, ProfileId } from "../types.js";
 import { determineNextAction, loadTaskState, saveTaskState, createTaskState, type TaskState } from "./state.js";
 import { canonicalJson, sha256 } from "./hashing.js";
-import { validateProjectManifest, validateReferenceIndex } from "./schema.js";
+import { validateOracleManifest, validateProjectManifest, validateReferenceIndex } from "./schema.js";
+import { verifyOraclePreparation, type OracleManifest, type OraclePreparationBinding } from "./oracle.js";
 import { loadStyleContract, type StyleContract } from "../styles/low-poly.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
 import { inspectCandidateIdentity, type CandidateIdentity } from "./candidate.js";
@@ -391,6 +392,66 @@ export interface ResumedWorkspace {
   nextAction: ReturnType<typeof determineNextAction>;
 }
 
+export interface WorkspaceOraclePreparation {
+  manifest: OracleManifest;
+  binding: OraclePreparationBinding;
+  reference: ReferenceRecord;
+}
+
+/**
+ * Fails closed unless the onboarded preparation on disk is (1) intact end to end, (2) prepared from
+ * the oracle reference the project currently selects, and (3) identical to the preparation the
+ * durable state and evidence chain were gated against. Every workspace authority boundary runs
+ * this one check instead of partial per-command comparisons.
+ */
+export async function verifyWorkspaceOraclePreparation(workspace: ResumedWorkspace): Promise<WorkspaceOraclePreparation> {
+  if (!workspace.project.oracle) throw new Error("workspace has no selected oracle reference; configure project.json before onboarding");
+  const record = workspace.references.records.find((item) => item.kind === "oracle" && item.operationalPath === workspace.project.oracle);
+  if (!record) throw new Error("workspace oracle is absent from the reference index");
+  let manifestValue: unknown;
+  try {
+    manifestValue = JSON.parse(await readFile(workspace.layout.internal.oracleManifest, "utf8"));
+  } catch {
+    throw new Error("no onboarded oracle preparation exists in this workspace; run onboard first");
+  }
+  if (!validateOracleManifest(manifestValue).valid) throw new Error("oracle manifest schema is invalid");
+  const manifest = manifestValue as OracleManifest;
+  if (manifest.sourcePath !== record.operationalPath || manifest.sourceHash !== record.sha256) {
+    throw new Error("the onboarded preparation contradicts the selected oracle reference; run onboard for the current reference");
+  }
+  const binding = await verifyOraclePreparation(manifest, workspace.root);
+  const bound = workspace.state.oraclePreparation;
+  if (!bound) throw new Error("no oracle preparation is bound to workspace state; run onboard");
+  if (bound.identity !== binding.identity || bound.sourceHash !== binding.sourceHash || bound.preparedHash !== binding.preparedHash) {
+    throw new Error("the live oracle preparation differs from the state-bound preparation; rerun onboard/repair and rebuild the evidence chain");
+  }
+  return { manifest, binding, reference: record };
+}
+
+/** Archives the active preparation so a subsequent rebind cannot silently reuse it. Returns the archive directory or null when nothing was onboarded. */
+export async function archiveWorkspacePreparation(root: string): Promise<string | null> {
+  const resolver = createWorkspaceResolver(root);
+  const oracleDirectory = resolver.layout.internal.oracle;
+  let names: string[];
+  try {
+    names = (await readdir(oracleDirectory, { withFileTypes: true })).filter((entry) => entry.isFile() && (entry.name === "manifest.json" || entry.name.startsWith("prepared"))).map((entry) => entry.name);
+  } catch {
+    return null;
+  }
+  if (!names.length) return null;
+  const archiveRoot = join(oracleDirectory, "archive");
+  const existing = await pathExists(archiveRoot) ? (await readdir(archiveRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name) : [];
+  let sequence = 1;
+  for (const name of existing) {
+    const match = /^preparation-(\d+)$/u.exec(name);
+    if (match) sequence = Math.max(sequence, Number(match[1]) + 1);
+  }
+  const archive = join(archiveRoot, `preparation-${String(sequence).padStart(4, "0")}`);
+  await mkdir(archive, { recursive: true });
+  for (const name of names.sort()) await rename(join(oracleDirectory, name), join(archive, name));
+  return archive;
+}
+
 export async function resumeWorkspace(input: string): Promise<ResumedWorkspace> {
   const root = await locateWorkspaceRoot(input);
   const resolver = createWorkspaceResolver(root);
@@ -470,6 +531,8 @@ export async function rebindWorkspace(input: string): Promise<ResumedWorkspace> 
     articulationRequired: getProfileContract(project.profile).articulation.length > 0 || Boolean(subjectContract?.articulation?.length),
   });
   next.systemDecisions.push({ id: "workspace-rebind", value: next.projectConfigurationHash, reason: "explicit rebind started a new evidence chain for current project configuration and reference bytes" });
+  const archivedPreparation = await archiveWorkspacePreparation(root);
+  if (archivedPreparation) next.systemDecisions.push({ id: "oracle-preparation-archived", value: archivedPreparation, reason: "rebind archived the previous active preparation so it cannot be silently consumed by the new evidence chain" });
   const referencesTemporary = `${resolver.layout.internal.references}.${process.pid}.tmp`;
   await writeFile(referencesTemporary, `${JSON.stringify(reboundReferences, null, 2)}\n`, { flag: "wx" });
   await rename(referencesTemporary, resolver.layout.internal.references);
@@ -532,6 +595,7 @@ export async function migrateWorkspace(directory: string, options: { oracle?: st
   for (const evidence of Object.values(legacyState.evidence)) evidence.artifact = rebaseEvidencePath(evidence.artifact, root, resolver);
   for (const lock of Object.values(legacyState.locks)) for (const evidence of lock.evidence) evidence.artifact = rebaseEvidencePath(evidence.artifact, root, resolver);
   legacyState.oracleHash = null;
+  legacyState.oraclePreparation = null;
   legacyState.status = "active";
   legacyState.route = "onboard-oracle";
   legacyState.activePhase = "oracle-registration";

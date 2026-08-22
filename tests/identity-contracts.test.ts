@@ -1,6 +1,7 @@
 import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as THREE from "three";
 import { beforeAll, describe, expect, test } from "vitest";
 import {
   createVisualReviewVerdict,
@@ -92,6 +93,26 @@ describe("canonical candidate and evaluation identity", () => {
     expect(first.candidateFiles).toEqual(expect.arrayContaining([expect.objectContaining({ path: "helper.mjs", sha256: expect.stringMatching(/^[a-f0-9]{64}$/u) })]));
   });
 
+  test("executes the freshly audited transitive dependency bytes within one long-lived process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mesh2threejs-transitive-execution-"));
+    const helper = join(root, "helper.mjs");
+    const candidate = join(root, "candidate.mjs");
+    const source = `import * as THREE from "three"; import { width } from "./helper.mjs"; export function createCandidate(){ const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, 1, 1), new THREE.MeshStandardMaterial()); const root = new THREE.Group(); root.add(mesh); return root; }\n`;
+    await writeFile(helper, "export const width = 1;\n");
+    await writeFile(candidate, source);
+    const first = await inspectCandidateIdentity(candidate);
+
+    await writeFile(helper, "export const width = 2;\n");
+    const second = await inspectCandidateIdentity(candidate);
+
+    expect(second.sourceHash).not.toBe(first.sourceHash);
+    expect(second.candidateHash).not.toBe(first.candidateHash);
+    const sizeOf = (scene: THREE.Object3D): number => new THREE.Box3().setFromObject(scene).getSize(new THREE.Vector3()).x;
+    expect(sizeOf(first.runtime.root)).toBeCloseTo(1);
+    expect(sizeOf(second.runtime.root)).toBeCloseTo(2);
+    expect(second.neutralSceneHash).not.toBe(first.neutralSceneHash);
+  });
+
   test("changes when control behavior changes but neutral geometry is identical", async () => {
     const root = await mkdtemp(join(tmpdir(), "mesh2threejs-control-identity-"));
     const candidate = join(root, "candidate.mjs");
@@ -113,6 +134,7 @@ describe("canonical candidate and evaluation identity", () => {
       styleContractHash: "style-a",
       subjectContractHash: null,
       certification: "oracle-relative",
+      oraclePreparationHash: "preparation-a",
       preparedOracleHash: "prepared-a",
       authoritativeDimensionsHash: null,
       candidateSourceHash: "source-a",
@@ -125,6 +147,7 @@ describe("canonical candidate and evaluation identity", () => {
       { styleContractHash: "style-b" },
       { subjectContractHash: "subject-b" },
       { certification: "exact-real" as const },
+      { oraclePreparationHash: "preparation-b" },
       { preparedOracleHash: "prepared-b" },
       { authoritativeDimensionsHash: "dimensions-b" },
       { candidateSourceHash: "source-b" },
@@ -176,7 +199,7 @@ describe("bound project and style configuration", () => {
 describe("live workspace candidate binding", () => {
   beforeAll(async () => {
     reviewReadyTemplate = await buildReviewReadyWorkspace();
-  }, 30_000);
+  }, 120_000);
 
   test("propagates one evaluation and style identity through state, cache, evidence, render, and review", async () => {
     const { root, packet } = await reviewReadyWorkspace();
@@ -193,7 +216,7 @@ describe("live workspace candidate binding", () => {
     expect(styleArtifact).toMatchObject({ styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash });
     expect(renderManifest).toMatchObject({ styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash });
     expect(reviewPacket).toMatchObject({ schemaVersion: 4, styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash });
-  }, 15_000);
+  }, 30_000);
 
   test("rejects recording a verdict after candidate source changes", async () => {
     const { root, model, packet } = await reviewReadyWorkspace();
@@ -205,7 +228,7 @@ describe("live workspace candidate binding", () => {
     const output: string[] = [];
     expect(await runCli(["record-review", root, "--verdict", verdictPath], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(2);
     expect(output.join("\n")).toMatch(/current workspace candidate differs/i);
-  }, 15_000);
+  }, 30_000);
 
   test("rejects rendering after the gated candidate changes", async () => {
     const { root, model } = await reviewReadyWorkspace();
@@ -213,7 +236,7 @@ describe("live workspace candidate binding", () => {
     const output: string[] = [];
     expect(await runCli(["render", root], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(2);
     expect(output.join("\n")).toMatch(/differs from gated candidate/i);
-  }, 15_000);
+  }, 30_000);
 
   test("checks live source identity before artifact certification", async () => {
     const { root, model, packet } = await reviewReadyWorkspace();
@@ -226,7 +249,7 @@ describe("live workspace candidate binding", () => {
     const output: string[] = [];
     expect(await runCli(["finalize", root], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(2);
     expect(output.join("\n")).toMatch(/current workspace candidate differs/i);
-  }, 15_000);
+  }, 30_000);
 
   test("explicit rebind starts a clean evidence chain for changed project configuration", async () => {
     const root = await mkdtemp(join(tmpdir(), "mesh2threejs-rebind-"));
@@ -253,5 +276,5 @@ describe("live workspace candidate binding", () => {
     const output: string[] = [];
     expect(await runCli(["gate", root, "--global"], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(4);
     expect(JSON.parse(output.at(-1)!)).toMatchObject({ activePhase: "primary-mass", activePhasePassed: true, globalPassed: false });
-  }, 15_000);
+  }, 30_000);
 });

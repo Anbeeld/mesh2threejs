@@ -1,7 +1,7 @@
 import type { CertificationLevel, ProfileId } from "../types.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 
-export const EVALUATOR_VERSION = "4";
+export const EVALUATOR_VERSION = "5";
 export const MEASUREMENT_VERSION = "2";
 
 export interface EvaluationIdentity {
@@ -13,6 +13,7 @@ export interface EvaluationIdentity {
   styleContractHash: string;
   subjectContractHash: string | null;
   certification: CertificationLevel;
+  oraclePreparationHash: string;
   preparedOracleHash: string;
   authoritativeDimensionsHash: string | null;
   candidateSourceHash: string;

@@ -7,6 +7,6 @@ description: Correct a proven prepared-oracle normalization, semantic, pivot, or
 
 Builder convenience is not a repair reason. Require evidence of wrong axes/scale/ground, semantic ownership, pivot mapping, or a proven source defect.
 
-Use `repairPreparedOracle` to create a new prepared recipe with reason, parent prepared hash, unchanged source hash, and appended history. Never overwrite the immutable GLB. Re-run registration and invalidate every comparison artifact before returning to build.
+Use `repairPreparedOracle` to create a new prepared recipe with reason, parent prepared hash, unchanged source hash, and appended history. Never overwrite the immutable GLB. Workspace repair rebinds the new preparation to state and invalidates registration, gates, locks, render evidence, and review authority immediately; re-run registration before returning to build.
 
 This route may not edit candidate source.

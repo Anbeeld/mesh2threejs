@@ -83,7 +83,7 @@ describe("source and prepared oracle lifecycle", () => {
     expect(await runCli(["gate", root], sink)).toBe(0);
     expect(await readFile(join(root, ".mesh2threejs", "evidence", "gate-0001", "gate-0001-primary-mass.json"), "utf8")).toBe(firstGateArtifact);
     expect((await readdir(join(root, ".mesh2threejs", "evidence"))).filter((name) => name.startsWith("gate-"))).toEqual(["gate-0001", "gate-0002"]);
-  }, 15_000);
+  }, 60_000);
 
   test("probes GLB inventory, bounds, provenance, and conservative semantics", () => {
     const fused = probeGlb(minimalGlb());

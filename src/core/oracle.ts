@@ -1,7 +1,8 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, win32 } from "node:path";
 import * as THREE from "three";
 import { canonicalJson, sha256 } from "./hashing.js";
+import { validateOracleManifest } from "./schema.js";
 import type { Bounds3, Point3 } from "../types.js";
 
 type JsonObject = Record<string, unknown>;
@@ -331,6 +332,27 @@ export function loadGlbScene(input: Uint8Array): THREE.Group {
   return root;
 }
 
+/**
+ * Canonical identity of the complete authoritative preparation record. It changes whenever any
+ * decision-changing preparation input changes: selected reference, source bytes, prepared recipe,
+ * semantic/articulation mapping, normalization, repair lineage, or admitted dimensions.
+ */
+export function oraclePreparationIdentity(manifest: OracleManifest): string {
+  if (manifest.schemaVersion !== 1) throw new Error("oracle manifest schema is unsupported");
+  const { schemaVersion: _schemaVersion, ...record } = manifest;
+  return sha256(canonicalJson(record));
+}
+
+export interface OraclePreparationBinding {
+  identity: string;
+  sourceHash: string;
+  preparedHash: string;
+}
+
+export function oraclePreparationBinding(manifest: OracleManifest): OraclePreparationBinding {
+  return { identity: oraclePreparationIdentity(manifest), sourceHash: manifest.sourceHash, preparedHash: manifest.preparedHash };
+}
+
 export interface OracleManifest {
   schemaVersion: 1;
   id: string;
@@ -393,6 +415,11 @@ function storedPath(path: string, workspaceRoot: string | undefined): string {
   return workspaceRoot && !isAbsolute(path) ? path.replaceAll("\\", "/") : resolve(path);
 }
 
+/** Recorded lineage paths may originate on another platform; only relative paths are resolved against this host. */
+function recordedOriginalPath(path: string): string {
+  return isAbsolute(path) || win32.isAbsolute(path) ? path : resolve(path);
+}
+
 export async function onboardOracle(input: OnboardOracleInput): Promise<OracleManifest> {
   const referenceMode = input.referenceMode ?? (isAbsolute(input.sourcePath) ? "external" : "copy");
   if (referenceMode === "copy" && isAbsolute(input.sourcePath)) throw new Error("copy-mode oracle sourcePath must be workspace-relative");
@@ -423,7 +450,7 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     sourceHash,
     preparedPath,
     preparedHash,
-    sourceOriginalPath: input.sourceOriginalPath ? resolve(input.sourceOriginalPath) : sourceFile,
+    sourceOriginalPath: input.sourceOriginalPath ? recordedOriginalPath(input.sourceOriginalPath) : sourceFile,
     referenceMode,
     portable: referenceMode === "copy",
     source: input.source,
@@ -446,15 +473,42 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
   };
 }
 
-export async function loadPreparedOracle(manifest: OracleManifest, workspaceRoot?: string): Promise<THREE.Group> {
-  const recipeValue: unknown = JSON.parse(await readFile(workspaceFile(manifest.preparedPath, workspaceRoot, "preparedPath"), "utf8"));
+async function readVerifiedRecipe(manifest: OracleManifest, workspaceRoot?: string): Promise<PreparedRecipe> {
+  let recipeValue: unknown;
+  try {
+    recipeValue = JSON.parse(await readFile(workspaceFile(manifest.preparedPath, workspaceRoot, "preparedPath"), "utf8"));
+  } catch (error) {
+    throw new Error(`prepared oracle recipe is unreadable: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const recipe = asObject(recipeValue, "prepared oracle recipe") as unknown as PreparedRecipe;
-  const { preparedHash: ignored, ...baseRecipe } = recipe;
-  if (recipe.parentSourceHash !== manifest.sourceHash || recipe.sourcePath !== manifest.sourcePath || sha256(canonicalJson(baseRecipe)) !== manifest.preparedHash || ignored !== manifest.preparedHash) {
+  const { preparedHash: sealedHash, ...baseRecipe } = recipe;
+  if (recipe.parentSourceHash !== manifest.sourceHash || recipe.sourcePath !== manifest.sourcePath || sha256(canonicalJson(baseRecipe)) !== manifest.preparedHash || sealedHash !== manifest.preparedHash) {
     throw new Error("prepared oracle lineage/hash mismatch");
   }
+  return recipe;
+}
+
+async function readVerifiedSourceBytes(manifest: OracleManifest, workspaceRoot?: string): Promise<Buffer> {
   const sourceBytes = await readFile(workspaceFile(manifest.sourcePath, workspaceRoot, "oracle sourcePath"));
   if (sha256(sourceBytes) !== manifest.sourceHash) throw new Error("immutable source oracle bytes changed");
+  return sourceBytes;
+}
+
+/**
+ * Verifies the live preparation end to end: manifest schema, prepared recipe lineage against the
+ * manifest hashes, and immutable source bytes — then returns the canonical preparation binding.
+ * Every authority boundary uses this one verifier so no command grows its own partial check.
+ */
+export async function verifyOraclePreparation(manifest: OracleManifest, workspaceRoot?: string): Promise<OraclePreparationBinding> {
+  if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+  await readVerifiedRecipe(manifest, workspaceRoot);
+  await readVerifiedSourceBytes(manifest, workspaceRoot);
+  return oraclePreparationBinding(manifest);
+}
+
+export async function loadPreparedOracle(manifest: OracleManifest, workspaceRoot?: string): Promise<THREE.Group> {
+  const recipe = await readVerifiedRecipe(manifest, workspaceRoot);
+  const sourceBytes = await readVerifiedSourceBytes(manifest, workspaceRoot);
   const source = loadGlbScene(sourceBytes);
   const nameCounts = new Map<string, number>();
   source.traverse((object) => nameCounts.set(object.name, (nameCounts.get(object.name) ?? 0) + 1));
@@ -491,8 +545,7 @@ export interface RepairPreparedOracleInput {
 
 export async function repairPreparedOracle(manifest: OracleManifest, input: RepairPreparedOracleInput, workspaceRoot?: string): Promise<OracleManifest> {
   if (!input.reason.trim()) throw new Error("oracle repair requires a reason");
-  const sourceBytes = await readFile(workspaceFile(manifest.sourcePath, workspaceRoot, "oracle sourcePath"));
-  if (sha256(sourceBytes) !== manifest.sourceHash) throw new Error("immutable source oracle bytes changed");
+  await verifyOraclePreparation(manifest, workspaceRoot);
   const preparedFile = workspaceFile(input.preparedPath, workspaceRoot, "preparedPath");
   const preparedPath = storedPath(input.preparedPath, workspaceRoot);
   const baseRecipe: Omit<PreparedRecipe, "preparedHash"> = {
