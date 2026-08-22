@@ -184,6 +184,11 @@ describe("live oracle preparation identity", () => {
     await writeFile(registration, JSON.stringify(registrationExpectation));
     expect(await runCli(["register", fixture.root, "--config", registration], attempt.io)).toBe(2);
     expect(attempt.output.join("\n")).toMatch(/contradicts the selected oracle reference/);
+    const repairConfig = join(fixture.parent, "repair-stale.json");
+    await writeFile(repairConfig, JSON.stringify({ reason: "attempt to repair a stale preparation", preparedPath: "ignored.json" }));
+    const repairAttempt = sink();
+    expect(await runCli(["repair-oracle", fixture.root, "--config", repairConfig], repairAttempt.io)).toBe(2);
+    expect(repairAttempt.output.join("\n")).toMatch(/contradicts the selected oracle reference/);
   });
 
   test("replacing the prepared bytes after a gate blocks the next authority action", async () => {

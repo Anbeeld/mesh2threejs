@@ -63,7 +63,13 @@ export async function auditCandidateModule(entryPath: string): Promise<Candidate
     const source = await readFile(absolute, "utf8");
     sources.set(absolute, source);
     findings.push(...auditCandidateSource(source).findings.map((finding) => ({ ...finding, message: `${absolute}: ${finding.message}` })));
-    const imports = [...source.matchAll(/(?:from\s*|import\s*(?:\(\s*)?)["'](\.[^"']+)["']/gu)].map((match) => match[1]).filter((value): value is string => Boolean(value));
+    // Candidate-local imports must be static. The staged source graph is removed once the module is instantiated,
+    // so a dynamic import inside createCandidate()/setPose() would resolve into a deleted directory and produce
+    // runtime behavior that the audited bytes do not determine.
+    for (const match of source.matchAll(/import\s*\(\s*["'](\.[^"']+)["']\s*\)/gu)) {
+      findings.push({ code: "dynamic-local-import", message: `${absolute}: dynamic local import ${match[1]} escapes the staged source graph; use a static import` });
+    }
+    const imports = [...source.matchAll(/(?:from\s*|import\s*)["'](\.[^"']+)["']/gu)].map((match) => match[1]).filter((value): value is string => Boolean(value));
     for (const specifier of imports) {
       const base = resolve(dirname(absolute), specifier);
       const candidates = extname(base) ? [base] : [`${base}.js`, `${base}.mjs`, `${base}.ts`, resolve(base, "index.js")];
@@ -112,7 +118,8 @@ const STAGE_PREFIX = ".mesh2threejs-candidate-";
  * Staging under the graph's common ancestor keeps bare-specifier resolution (e.g. "three") and
  * package.json module-type semantics identical to the original location, while every load sees the
  * bytes that produced the source hash. Execution from the staged copy is short-lived: the directory
- * is removed as soon as the module graph has been instantiated.
+ * is removed as soon as the module graph has been instantiated, which is why the audit requires
+ * candidate-local imports to be static.
  */
 async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudit): Promise<{ root: string; entry: string }> {
   const entry = resolve(entryPath);

@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-23",
+  "workload": "generated large-GLB intake: bytes -> accessor decode -> node transforms -> scene -> preparation -> snapshot",
+  "expectedGateOutcome": "Intake coverage, not a fidelity fixture; this benchmark requires the real intake path to complete within the resource ceilings.",
+  "environment": {
+    "node": "v22.14.0",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logicalCpuCount": 32,
+    "totalMemoryBytes": 100579684352
+  },
+  "inputGlbBytes": 54003052,
+  "triangles": 1000000,
+  "peakObservedRssBytes": 583036928,
+  "externallyObserved": {
+    "method": "parent process samples child RSS from the OS (PowerShell WorkingSet64 on win32)",
+    "peakRssBytes": 592166912
+  },
+  "ceilings": {
+    "elapsedMs": 180000,
+    "peakObservedRssBytes": 8589934592
+  },
+  "operators": [
+    { "operator": "glb-byte-probe", "elapsedMs": 293.428 },
+    { "operator": "glb-accessor-node-scene-load", "elapsedMs": 148.403 },
+    { "operator": "loaded-scene-snapshot", "elapsedMs": 101.688 },
+    { "operator": "glb-preparation-onboard", "elapsedMs": 292.113 },
+    { "operator": "prepared-oracle-load", "elapsedMs": 179.832 },
+    { "operator": "prepared-scene-snapshot", "elapsedMs": 96.758 }
+  ]
+}

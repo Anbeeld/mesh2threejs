@@ -4,6 +4,7 @@ import { join } from "node:path";
 import * as THREE from "three";
 import { beforeAll, describe, expect, test } from "vitest";
 import {
+  auditCandidateModule,
   createVisualReviewVerdict,
   createEvaluationIdentity,
   evaluationIdentityHash,
@@ -111,6 +112,17 @@ describe("canonical candidate and evaluation identity", () => {
     expect(sizeOf(first.runtime.root)).toBeCloseTo(1);
     expect(sizeOf(second.runtime.root)).toBeCloseTo(2);
     expect(second.neutralSceneHash).not.toBe(first.neutralSceneHash);
+  });
+
+  test("rejects dynamic local imports that would resolve into the removed stage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mesh2threejs-dynamic-import-"));
+    await writeFile(join(root, "helper.mjs"), "export function buildHull(){ return null; }\n");
+    const candidate = join(root, "candidate.mjs");
+    await writeFile(candidate, `export async function createCandidate(){ const { buildHull } = await import("./helper.mjs"); return buildHull(); }\n`);
+    const audit = await auditCandidateModule(candidate);
+    expect(audit.passed).toBe(false);
+    expect(audit.findings.map((finding) => finding.code)).toContain("dynamic-local-import");
+    await expect(inspectCandidateIdentity(candidate)).rejects.toThrow(/source audit failed/u);
   });
 
   test("changes when control behavior changes but neutral geometry is identical", async () => {

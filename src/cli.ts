@@ -472,9 +472,15 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "repair-oracle": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
-        const manifestPath = workspace?.layout.internal.oracleManifest ?? resolve(required(parsed.options, "manifest"));
-        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as OracleManifest;
-        if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+        let manifest: OracleManifest;
+        if (workspace) {
+          // Repair operates on the admitted preparation of this workspace, never on whatever
+          // self-consistent manifest happens to sit at the canonical path.
+          manifest = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
+        } else {
+          manifest = JSON.parse(await readFile(resolve(required(parsed.options, "manifest")), "utf8")) as OracleManifest;
+          if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+        }
         const config = JSON.parse(await readFile(resolve(required(parsed.options, "config")), "utf8")) as RepairPreparedOracleInput;
         const repaired = await repairPreparedOracle(manifest, workspace ? {
           ...config,

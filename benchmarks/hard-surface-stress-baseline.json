@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-23",
+  "workload": "multi-component hard-surface stress: hull stations, silhouettes, watertightness, repeats, tracks, articulation",
+  "expectedGateOutcome": "All deterministic and articulation rows pass on an identical synthetic scene; the dense primitives intentionally exceed the authored-candidate segment budget, so the low-poly style contract rejects them by design while every geometry operator completes.",
+  "environment": {
+    "node": "v22.14.0",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logicalCpuCount": 32,
+    "totalMemoryBytes": 100579684352
+  },
+  "oracleTriangles": 313296,
+  "candidateTriangles": 313296,
+  "deterministicPassed": true,
+  "articulationPassed": true,
+  "peakObservedRssBytes": 416866304,
+  "externallyObserved": {
+    "method": "parent process samples child RSS from the OS (PowerShell WorkingSet64 on win32)",
+    "peakRssBytes": 422744064
+  },
+  "cacheEvidence": {
+    "oracleSnapshotMs": 211.054,
+    "candidateIterationCostMs": 9482.968,
+    "oracleShareOfGate": 0.0218,
+    "decision": "oracle-only preparation/measurement recomputation is 2-3% of a full gate at this scale, so the persistent oracle-derived cache is deferred until real-reconstruction profiling says otherwise"
+  },
+  "ceilings": {
+    "elapsedMs": 600000,
+    "peakObservedRssBytes": 12884901888
+  },
+  "dominantOperators": [
+    { "operator": "fourteen-hull-stations", "elapsedMs": 2953.105 },
+    { "operator": "watertightness-connected-islands", "elapsedMs": 2049.246 },
+    { "operator": "hull-watertightness-explicit", "elapsedMs": 1684.668 },
+    { "operator": "whole-hull-turret-silhouette", "elapsedMs": 656.812 },
+    { "operator": "oracle-snapshot-construction", "elapsedMs": 211.054 },
+    { "operator": "track-diagnostics", "elapsedMs": 5.12 },
+    { "operator": "candidate-fingerprint", "elapsedMs": 14.003 }
+  ]
+}
