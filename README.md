@@ -1,6 +1,6 @@
 # mesh2threejs
 
-`mesh2threejs` is an agent-driven pipeline for recreating a reference GLB as editable procedural Three.js code. It measures the reference, guides the agent through construction and repair, renders matched comparisons, and keeps enough evidence to resume or verify the work later.
+`mesh2threejs` is an agent-driven pipeline for recreating an admitted reference GLB as editable procedural Three.js code. It measures the reference, guides the agent through construction and repair, renders matched comparisons, and keeps enough evidence to resume or verify the work later.
 
 It is intended for rigid hard-surface subjects such as vehicles, tanks, buildings, machines, and props. It is not a mesh converter. The finished model is independently authored from Three.js primitives, procedural geometry, transforms, materials, named parts, and real articulation controls. It does not load or embed the source mesh.
 
@@ -12,6 +12,7 @@ Give the agent:
 - a short description of the subject and desired style;
 - the source, author, license, and redistribution terms for the reference;
 - any important parts, repeated-part counts, or moving controls to preserve;
+- a subject contract when a generic object needs named sections, landmarks, orientation cues, repeats, attachments, or articulation controls;
 - authoritative dimensions and their sources when exact real-world scale matters;
 - optional photos or documents that clarify details the GLB does not show.
 
@@ -19,23 +20,25 @@ A useful request looks like this:
 
 > Use the `mesh2threejs` skill to recreate `C:\references\tank.glb` as a low-poly procedural Three.js model. Attribution and license details are in `C:\references\license.txt`. Preserve the rotating turret, elevating gun, tracks, wheel count, cupola, and overall proportions. Use `workspaces/tank-demo` as the workspace.
 
-The agent creates the workspace, copies and verifies the references by default, authors the model under `model/`, and records reports and captures under `.mesh2threejs/`. If provenance, orientation, scale, or part ownership cannot be established, it records the uncertainty instead of guessing.
+The agent creates the workspace, copies and verifies the references by default, authors the model under `model/`, and records reports and captures under `.mesh2threejs/`. Each gate and render run gets a new numbered directory, so rerunning a check does not overwrite evidence that an accepted phase already references. If provenance, orientation, scale, or part ownership cannot be established, the agent records the uncertainty instead of guessing.
 
 ## What the pipeline produces
 
 A completed workspace can contain:
 
 - an editable module under `model/` that exports `createCandidate()`;
-- immutable source-reference hashes and a reproducible preparation recipe;
+- checked source-reference files and a reproducible preparation recipe;
 - geometry, style, complexity, and articulation reports;
 - actionable workorders tied to failed measurements;
 - matched beauty, silhouette, semantic ID, depth, normal, and material-ID captures;
-- comparison boards, turntable frames, and a hash-bound visual-review verdict;
+- comparison boards, turntable frames, per-region diagnostics, and a visual-review verdict bound to files that are reopened during verification;
 - resumable state, attribution requirements, intentional simplifications, and the final candidate hash.
 
 Tank projects use dedicated checks for hull, turret, gun, running gear, tracks, fabrication, and articulation. Other rigid objects use a generic three-axis profile.
 
 Certification is `oracle-relative` unless authoritative real-world dimensions and sources support `exact-real`. Deterministic checks do not substitute for visual review, and the pipeline does not redistribute the reference GLB.
+
+The built-in loader admits uncompressed glTF 2.0 triangle geometry in GLB containers. It decodes normalized and sparse accessors and applies node transforms, but it does not reproduce skinning or animation. Required Draco or meshopt compression fails with an explicit error. The Node.js CLI uses the deterministic CPU renderer; callers that provide a browser or headless WebGL surface can use the integrated Three.js `WebGLRenderer` path.
 
 ## Setup
 
@@ -95,12 +98,17 @@ node dist/cli.js next workspaces/demo
 node dist/cli.js onboard workspaces/demo --config path/to/onboard.json
 node dist/cli.js register workspaces/demo --config path/to/registration.json
 node dist/cli.js gate workspaces/demo
+node dist/cli.js workorders workspaces/demo
+node dist/cli.js lock workspaces/demo
 node dist/cli.js render workspaces/demo
+node dist/cli.js prepare-review workspaces/demo
+node dist/cli.js review-status workspaces/demo
+node dist/cli.js record-review workspaces/demo --verdict path/to/verdict.json
 node dist/cli.js reopen workspaces/demo --phase primary-mass --reason "proportion regression"
 node dist/cli.js finalize workspaces/demo
 ```
 
-The `onboard` configuration supplies provenance, coordinate-frame, normalization, and semantic-map facts. Workspace paths for the source, prepared recipe, candidate, reports, and captures are resolved automatically. Low-level manifest, module, and state-file arguments remain available for scripts; run `node dist/cli.js help` for the complete command list.
+The `onboard` configuration supplies provenance, coordinate-frame, normalization, and semantic-map facts. `gate` evaluates every phase independently, `workorders` selects the next repair group for the active phase, and `lock` uses that phase's measured geometry and authoritative evidence by default. `render` records captures, region diagnostics, and turntable evidence. `prepare-review` builds a packet from the current workspace and checks every referenced file before an external reviewer inspects it. Low-level manifest, module, and state-file arguments remain available for scripts; run `node dist/cli.js help` for the complete command list.
 
 Existing workspaces from the previous root-level layout can be upgraded with:
 

@@ -1,4 +1,4 @@
 interface:
   display_name: Visual Review
   short_description: Inspect immutable matched visual evidence without editing.
-  default_prompt: "Use $visual-review to inspect this hash-bound capture packet and return a verdict without editing files."
+  default_prompt: "Use $visual-review to verify and inspect this capture packet, then return a verdict without editing files."

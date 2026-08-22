@@ -12,16 +12,20 @@ import {
   auditCandidateModule,
   certifyStateFromArtifacts,
   createEvidenceArtifact,
+  createRuntimeGateEvidenceArtifact,
+  createWorkflowGateEvidenceArtifact,
   createTaskState,
   deriveCanonicalFrame,
   createDerivativeCacheEntry,
   evaluateCandidate,
   evaluateProfileContractGates,
+  loadTaskState,
   loadProfileContract,
   profileContractHash,
   recordEvidenceArtifact,
   readDerivativeCache,
   reopenPhase,
+  saveTaskState,
   validateProfileContract,
 } from "../src/index.js";
 import { createTankFixture } from "./helpers/scenes.js";
@@ -34,6 +38,7 @@ describe("executable profile contracts", () => {
       "fittings-articulation", "style-fabrication", "visual-review", "final",
     ]);
     expect(validateProfileContract({ ...contract, operators: [...contract.operators, "imaginary-operator"] }).valid).toBe(false);
+    expect(validateProfileContract({ ...contract, operators: [...contract.operators, "attachments"] }).errors).toContain("operator attachments is enabled but unused by every gate");
     expect(validateProfileContract({ ...contract, gates: contract.gates.filter((gate) => gate.code !== "gun.pose") }).valid).toBe(false);
   });
 
@@ -53,18 +58,56 @@ describe("executable profile contracts", () => {
     expect(report.rows.find((row) => row.code === "curves.hull")).toMatchObject({ passed: false });
     expect(report.rows.find((row) => row.code === "curves.hull")?.message).toMatch(/rear/);
   });
+
+  test("reports contract gates independently for every phase", () => {
+    const oracle = createTankFixture();
+    const candidate = createTankFixture({ turretShift: 0.5 });
+    const evaluation = evaluateCandidate({ oracle, candidate, profile: "tank" });
+    expect(evaluation.passed).toBe(false);
+    expect(evaluation.phaseGates.hull).toMatchObject({ passed: true });
+    expect(evaluation.phaseGates.turret).toMatchObject({ passed: false });
+    expect(evaluation.phaseGates.hull?.rows.map((row) => row.phase)).toEqual(["hull", "hull", "hull", "hull"]);
+  });
 });
 
 describe("phase locks and artifact authority", () => {
-  test("prevents silent changes to accepted geometry and invalidates dependants on explicit reopen", () => {
+  test("rejects passing labels that do not prove every gate required by the phase", () => {
+    let state = bindCandidatePhases(bindOracle(createTaskState({ taskId: "gate-proof", profile: "tank", style: "low-poly-faithful" }), "oracle"), "candidate", { hull: "hull" });
+    const artifact = createEvidenceArtifact({
+      id: "claimed-hull",
+      kind: "deterministic-gate",
+      phase: "hull",
+      oracleHash: "oracle",
+      candidateHash: "candidate",
+      profileContractHash: state.profileContractHash,
+      configHash: "fixture",
+      gateResults: ["curves.hull", "hull.stations", "dimensions.hull-length", "orientation.physical"].map((code) => ({ code, passed: true, score: 100 })),
+      result: { passed: true, summary: "claimed pass" },
+    });
+    state = recordEvidenceArtifact(state, "claimed-hull.json", artifact);
+    expect(() => acceptPhase(state, "hull", { geometryHash: "hull", evidenceIds: [artifact.id], contractHash: state.profileContractHash })).toThrow(/required gates/i);
+  });
+
+  test("prevents silent changes to accepted geometry and invalidates dependants on explicit reopen", async () => {
     let state = bindCandidate(bindOracle(createTaskState({ taskId: "lock", profile: "tank", style: "low-poly-faithful" }), "oracle"), "candidate-a");
     for (const [id, kind, phase] of [["registration", "registration", "oracle-registration"], ["hull-gate", "deterministic-gate", "hull"]] as const) {
-      state = recordEvidenceArtifact(state, `${id}.json`, createEvidenceArtifact({ id, kind, phase, oracleHash: "oracle", candidateHash: "candidate-a", profileContractHash: state.profileContractHash, configHash: "fixture", result: { passed: true, summary: "fixture" } }));
+      const gateResults = phase === "oracle-registration"
+        ? [{ code: "registration.complete", passed: true, score: 100 }]
+        : ["curves.hull", "hull.stations", "dimensions.hull-length", "orientation.physical"].map((code) => ({ code, passed: true, score: 100 }));
+      const artifact = phase === "oracle-registration"
+        ? createWorkflowGateEvidenceArtifact({ id, kind, phase, oracleHash: "oracle", candidateHash: "candidate-a", profileContractHash: state.profileContractHash, configHash: "fixture", gateCode: "registration.complete", passed: true, summary: "fixture" })
+        : createRuntimeGateEvidenceArtifact({ id, phase, oracleHash: "oracle", candidateHash: "candidate-a", profileContractHash: state.profileContractHash, configHash: "fixture", report: { profile: "tank", passed: true, score: 100, rows: gateResults.map((gate) => ({ ...gate, phase, component: "fixture", severity: "critical", message: "fixture" })), workorders: [] } });
+      state = recordEvidenceArtifact(state, `${id}.json`, artifact);
     }
     state = acceptPhase(state, "oracle-registration", { geometryHash: "oracle", evidenceIds: ["registration"], contractHash: state.profileContractHash });
     state.phaseGeometryHashes.hull = "hull-a";
     state = acceptPhase(state, "hull", { geometryHash: "hull-a", evidenceIds: ["hull-gate"], contractHash: state.profileContractHash });
-    expect(() => bindCandidatePhases(state, "candidate-with-turret", { hull: "hull-a", turret: "turret-a" })).not.toThrow();
+    const advanced = bindCandidatePhases(state, "candidate-with-turret", { hull: "hull-a", turret: "turret-a" });
+    expect(advanced.evidence["hull-gate"]).toMatchObject({ valid: true, verified: true });
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-advanced-lock-"));
+    const statePath = join(directory, "state.json");
+    await saveTaskState(statePath, advanced);
+    await expect(loadTaskState(statePath)).resolves.toMatchObject({ candidateHash: "candidate-with-turret" });
     expect(() => bindCandidate(state, "candidate-b")).toThrow(/locked phase/i);
     state = reopenPhase(state, "hull", "correct a measured station regression");
     state = bindCandidate(state, "candidate-b");

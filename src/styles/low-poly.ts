@@ -31,16 +31,6 @@ export function regularPolygonFacetingCorridor(radius: number, segments: number)
   return radius * (1 - Math.cos(Math.PI / segments));
 }
 
-function componentTriangles(snapshot: SceneSnapshot, component: SceneComponent): number {
-  return component.triangleIndices.length;
-}
-
-function estimateSegments(snapshot: SceneSnapshot, component: SceneComponent): number | null {
-  const triangles = componentTriangles(snapshot, component);
-  if (triangles < 24) return null;
-  return Math.max(3, Math.round(triangles / 4));
-}
-
 function matchesSemanticPattern(semanticId: string, pattern: string): boolean {
   const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*");
   return new RegExp(`^${escaped}$`, "u").test(semanticId);
@@ -89,7 +79,7 @@ function componentEnvelopeRows(oracle: SceneSnapshot, candidate: SceneSnapshot, 
       }
       continue;
     }
-    const segments = estimateSegments(candidate, candidateComponent);
+    const segments = candidateComponent.representation.segmentCounts.length ? Math.max(...candidateComponent.representation.segmentCounts) : null;
     const radius = Math.max(...oracleComponent.bounds.size) / 2;
     const faceting = segments ? regularPolygonFacetingCorridor(radius, segments) : 0;
     for (let axis = 0; axis < 3; axis += 1) {
@@ -129,24 +119,53 @@ function componentEnvelopeRows(oracle: SceneSnapshot, candidate: SceneSnapshot, 
   return rows;
 }
 
+function colorDistance(a: number, b: number): number {
+  const channel = (value: number, shift: number): number => ((value >> shift) & 0xff) / 255;
+  return Math.hypot(channel(a, 16) - channel(b, 16), channel(a, 8) - channel(b, 8), channel(a, 0) - channel(b, 0));
+}
+
+function representationRows(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: StyleContract): GateRow[] {
+  const rows: GateRow[] = [];
+  for (const component of Object.values(candidate.components)) {
+    if (component.representation.segmentCounts.length) {
+      const minimum = Math.min(...component.representation.segmentCounts);
+      const maximum = Math.max(...component.representation.segmentCounts);
+      const passed = minimum >= contract.complexity.segmentRange[0] && maximum <= contract.complexity.segmentRange[1];
+      rows.push({ code: `style.segments.${component.id}`, component: component.id, passed, score: passed ? 100 : 0, severity: "major", message: `${component.id} declared radial/curve segments ${minimum}-${maximum}; required ${contract.complexity.segmentRange[0]}-${contract.complexity.segmentRange[1]}`, oracleValue: `${contract.complexity.segmentRange[0]}-${contract.complexity.segmentRange[1]}`, candidateValue: `${minimum}-${maximum}` });
+    }
+    rows.push({ code: `style.shading.${component.id}`, component: component.id, passed: component.representation.flatOrFaceted, score: component.representation.flatOrFaceted ? 100 : 0, severity: "major", message: component.representation.flatOrFaceted ? `${component.id} uses flat or explicitly faceted geometry` : `${component.id} must use flat shading or explicit faceting` });
+    rows.push({ code: `style.material.${component.id}`, component: component.id, passed: component.representation.simplePbr, score: component.representation.simplePbr ? 100 : 0, severity: "major", message: component.representation.simplePbr ? `${component.id} uses the simple PBR vocabulary` : `${component.id} uses a material outside the simple PBR vocabulary` });
+    rows.push({ code: `style.texture.${component.id}`, component: component.id, passed: component.representation.generatedOrNoTextures, score: component.representation.generatedOrNoTextures ? 100 : 0, severity: "major", message: component.representation.generatedOrNoTextures ? `${component.id} uses no texture or a generated texture` : `${component.id} uses a texture without generated-source metadata` });
+    const expectedColors = oracle.components[component.id]?.representation.colors ?? [];
+    if (expectedColors.length && component.representation.colors.length) {
+      const distance = Math.max(...component.representation.colors.map((color) => Math.min(...expectedColors.map((expected) => colorDistance(color, expected)))));
+      const passed = distance <= 0.35;
+      rows.push({ code: `style.palette.${component.id}`, component: component.id, passed, score: passed ? 100 : Math.max(0, 100 - distance * 100), severity: "major", message: `${component.id} subject-palette distance ${distance.toFixed(3)}; maximum 0.350`, oracleValue: 0.35, candidateValue: distance, deviation: distance - 0.35 });
+    }
+  }
+  return rows;
+}
+
 export function evaluateLowPolyStyle(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: StyleContract): GateReport {
-  const rows = [...componentEnvelopeRows(oracle, candidate, contract), ...featureSizeRows(candidate, contract)];
-  const complexity: Array<[string, number, number]> = [
-    ["triangles", candidate.triangleCount, contract.complexity.triangleMax],
-    ["meshes", candidate.meshCount, contract.complexity.meshMax],
-    ["materials", candidate.materialCount, contract.complexity.materialMax],
+  const rows = [...componentEnvelopeRows(oracle, candidate, contract), ...featureSizeRows(candidate, contract), ...representationRows(oracle, candidate, contract)];
+  const complexity: Array<[string, number, number, number]> = [
+    ["triangles", candidate.triangleCount, contract.complexity.triangleTarget, contract.complexity.triangleMax],
+    ["meshes", candidate.meshCount, contract.complexity.meshTarget, contract.complexity.meshMax],
+    ["materials", candidate.materialCount, contract.complexity.materialTarget, contract.complexity.materialMax],
   ];
-  for (const [name, actual, maximum] of complexity) {
+  for (const [name, actual, target, maximum] of complexity) {
+    const passed = actual <= maximum;
+    const score = actual <= target ? 100 : passed ? Math.max(1, 100 - ((actual - target) / Math.max(maximum - target, 1)) * 50) : 0;
     rows.push({
       code: `style.complexity.${name}`,
       component: "whole-object",
-      passed: actual <= maximum,
-      score: actual <= maximum ? 100 : 0,
+      passed,
+      score,
       severity: "major",
-      message: `${name}: ${actual}; maximum ${maximum}`,
-      oracleValue: maximum,
+      message: `${name}: ${actual}; target ${target}; maximum ${maximum}`,
+      oracleValue: target,
       candidateValue: actual,
-      deviation: actual - maximum,
+      deviation: actual - target,
     });
   }
   return {

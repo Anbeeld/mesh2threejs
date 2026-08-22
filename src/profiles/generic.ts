@@ -1,7 +1,9 @@
 import type { CaptureCamera, GateReport, GateRow, SceneComponent, SceneSnapshot } from "../types.js";
 import { rowsToWorkorders, scoreSilhouetteCurves, type CurvePoint } from "../core/compare.js";
-import { checkAttachments, countConnectedIslands, measureBounds, measureSection, measureSignedVolume, silhouetteCurves } from "../core/measurement.js";
+import { checkAttachments, countConnectedIslands, measureBounds, measureRobustBounds, measureSection, measureSignedVolume, silhouetteCurves } from "../core/measurement.js";
 import { deriveCanonicalFrame, rasterizeCapture, standardRenderProfile } from "../core/render.js";
+import { selectSnapshotComponents } from "../core/geometry.js";
+import { getProfileContract } from "../core/contracts.js";
 
 export interface GenericSubjectContract {
   requiredSemantics?: string[];
@@ -11,6 +13,16 @@ export interface GenericSubjectContract {
   landmarks?: Array<{ semanticId: string; tolerance: number }>;
   connectivity?: Array<{ semanticId: string; maxIslands: number }>;
   repeats?: Array<{ role: string; axis: "x" | "y" | "z"; tolerance: number }>;
+  articulation?: Array<{ control: string; moving: string[]; stationary: string[]; samples: number[] }>;
+  phaseOwnership?: Partial<Record<"primary-mass" | "attachments" | "identity-features", string[]>>;
+  orientation?:
+    | { kind: "landmark-direction"; from: string; to: string; toleranceDegrees: number }
+    | { kind: "signed-volume"; minimumAbsoluteVolume?: number };
+}
+
+export interface GenericProfileOptions {
+  certification?: "exact-real" | "oracle-relative";
+  authoritativeDimensions?: { width: number; height: number; depth: number };
 }
 
 function metricRow(code: string, component: string, oracle: number, candidate: number, tolerance: number, severity: "critical" | "major" = "critical"): GateRow {
@@ -80,13 +92,17 @@ function criticalRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow[
 }
 
 function primaryAttachment(snapshot: SceneSnapshot): Array<{ child: string; parent: string; maxGap: number }> {
-  return snapshot.components.attachment && snapshot.components.primary
-    ? [{ child: "attachment", parent: "primary", maxGap: 0.01 }]
+  const semantics = getProfileContract("generic").semantics;
+  const parent = semantics.required.find((id) => snapshot.components[id]);
+  const child = semantics.optional.find((id) => snapshot.components[id]);
+  return parent && child
+    ? [{ child, parent, maxGap: 0.01 }]
     : [];
 }
 
 function semanticRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow[] {
-  return ["primary", "attachment"].filter((id) => Boolean(oracle.components[id])).map((id) => {
+  const semantics = getProfileContract("generic").semantics;
+  return [...semantics.required, ...semantics.optional].filter((id) => Boolean(oracle.components[id])).map((id) => {
     const present = Boolean(candidate.components[id]);
     return {
       code: `semantic.${id}`,
@@ -101,27 +117,67 @@ function semanticRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow[
   });
 }
 
-export function evaluateGenericProfile(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: GenericSubjectContract = {}): GateReport {
-  const oracleBounds = measureBounds(oracle);
-  const candidateBounds = measureBounds(candidate);
+export function evaluateGenericProfile(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: GenericSubjectContract = {}, options: GenericProfileOptions = {}): GateReport {
+  const oracleBounds = measureRobustBounds(oracle);
+  const candidateBounds = measureRobustBounds(candidate);
+  if (options.certification === "exact-real" && !options.authoritativeDimensions) throw new Error("exact-real generic certification requires authoritative width, height, and depth");
+  const dimensionKeys = ["width", "height", "depth"] as const;
+  if (options.authoritativeDimensions && !dimensionKeys.every((key) => Number.isFinite(options.authoritativeDimensions?.[key]) && options.authoritativeDimensions![key] > 0)) throw new Error(`authoritative generic dimensions require ${dimensionKeys.join(", ")}`);
+  if (options.authoritativeDimensions && Object.values(options.authoritativeDimensions).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("authoritative generic dimensions must be positive finite values");
+  const expectedDimensions = options.authoritativeDimensions ?? { width: oracleBounds.size[0], height: oracleBounds.size[1], depth: oracleBounds.size[2] };
   const dimensions = [
-    metricRow("dimensions.width", "whole-object", oracleBounds.size[0], candidateBounds.size[0], 0.01),
-    metricRow("dimensions.height", "whole-object", oracleBounds.size[1], candidateBounds.size[1], 0.01),
-    metricRow("dimensions.depth", "whole-object", oracleBounds.size[2], candidateBounds.size[2], 0.01),
+    metricRow("dimensions.width", "whole-object", expectedDimensions.width, candidateBounds.size[0], 0.01),
+    metricRow("dimensions.height", "whole-object", expectedDimensions.height, candidateBounds.size[1], 0.01),
+    metricRow("dimensions.depth", "whole-object", expectedDimensions.depth, candidateBounds.size[2], 0.01),
   ];
-  const oracleHandedness = measureSignedVolume(oracle);
-  const candidateHandedness = measureSignedVolume(candidate);
-  const orientationPassed = Math.abs(oracleHandedness) > 1e-9 && Math.sign(oracleHandedness) === Math.sign(candidateHandedness);
+  const orientationMeasurement = (): { passed: boolean; expected: number; actual: number; message: string } => {
+    if (contract.orientation?.kind === "signed-volume") {
+      const expected = measureSignedVolume(oracle);
+      const actual = measureSignedVolume(candidate);
+      const minimum = contract.orientation.minimumAbsoluteVolume ?? 1e-9;
+      const passed = Math.abs(expected) >= minimum && Math.abs(actual) >= minimum && Math.sign(expected) === Math.sign(actual);
+      return { passed, expected, actual, message: `declared signed-volume orientation expected ${Math.sign(expected)}, measured ${Math.sign(actual)}` };
+    }
+    const declared = contract.orientation?.kind === "landmark-direction" ? contract.orientation : undefined;
+    let from = declared?.from;
+    let to = declared?.to;
+    if (!from || !to) {
+      const shared = Object.keys(oracle.components).filter((id) => candidate.components[id]);
+      let bestDistance = 0;
+      for (const a of shared) for (const b of shared) {
+        const first = oracle.components[a]!.bounds.center;
+        const second = oracle.components[b]!.bounds.center;
+        const distance = Math.hypot(...first.map((value, axis) => value - second[axis]!));
+        if (distance > bestDistance) { bestDistance = distance; from = a; to = b; }
+      }
+    }
+    const expectedFrom = from ? oracle.components[from]?.bounds.center : undefined;
+    const expectedTo = to ? oracle.components[to]?.bounds.center : undefined;
+    const actualFrom = from ? candidate.components[from]?.bounds.center : undefined;
+    const actualTo = to ? candidate.components[to]?.bounds.center : undefined;
+    if (!expectedFrom || !expectedTo || !actualFrom || !actualTo) {
+      return { passed: !declared, expected: 1, actual: declared ? -1 : 1, message: declared ? `declared orientation landmarks ${from ?? "<missing>"}/${to ?? "<missing>"} are unavailable` : "orientation is not physically distinguishable; declare directional landmarks when it matters" };
+    }
+    const expectedVector = expectedTo.map((value, axis) => value - expectedFrom[axis]!) as [number, number, number];
+    const actualVector = actualTo.map((value, axis) => value - actualFrom[axis]!) as [number, number, number];
+    const expectedLength = Math.hypot(...expectedVector);
+    const actualLength = Math.hypot(...actualVector);
+    if (expectedLength < 1e-9 || actualLength < 1e-9) return { passed: !declared, expected: 1, actual: 0, message: declared ? "declared orientation landmarks are coincident" : "orientation is not physically distinguishable; declare directional landmarks when it matters" };
+    const cosine = expectedVector.reduce((sum, value, axis) => sum + value * actualVector[axis]!, 0) / (expectedLength * actualLength);
+    const minimumCosine = Math.cos(((declared?.toleranceDegrees ?? 5) * Math.PI) / 180);
+    return { passed: cosine >= minimumCosine, expected: 1, actual: cosine, message: `direction ${from}->${to} cosine ${cosine.toFixed(5)}; required ${minimumCosine.toFixed(5)}` };
+  };
+  const orientationValue = orientationMeasurement();
   const orientation: GateRow = {
     code: "orientation.physical",
     component: "whole-object",
-    passed: orientationPassed,
-    score: orientationPassed ? 100 : 0,
+    passed: orientationValue.passed,
+    score: orientationValue.passed ? 100 : 0,
     severity: "critical",
-    message: `physical handedness expected ${Math.sign(oracleHandedness)}, measured ${Math.sign(candidateHandedness)}; metadata is informational only`,
-    oracleValue: oracleHandedness,
-    candidateValue: candidateHandedness,
-    deviation: candidateHandedness - oracleHandedness,
+    message: `${orientationValue.message}; metadata is informational only`,
+    oracleValue: orientationValue.expected,
+    candidateValue: orientationValue.actual,
+    deviation: orientationValue.actual - orientationValue.expected,
   };
   const attachmentChecks = checkAttachments(candidate, contract.attachments ?? primaryAttachment(oracle));
   const attachments: GateRow[] = attachmentChecks.map((check) => ({
@@ -176,14 +232,5 @@ export function evaluateGenericProfile(oracle: SceneSnapshot, candidate: SceneSn
 }
 
 export function filterSnapshot(snapshot: SceneSnapshot, filter: (component: SceneComponent) => boolean): SceneSnapshot {
-  const components = Object.fromEntries(Object.entries(snapshot.components).filter(([, component]) => filter(component)));
-  const ids = new Set(Object.keys(components));
-  const triangles = snapshot.triangles.filter((triangle) => ids.has(triangle.componentId));
-  return {
-    ...snapshot,
-    components,
-    triangles,
-    triangleCount: triangles.length,
-    meshCount: Object.keys(components).length,
-  };
+  return selectSnapshotComponents(snapshot, filter);
 }

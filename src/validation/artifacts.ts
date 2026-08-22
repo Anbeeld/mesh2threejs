@@ -6,6 +6,7 @@ import type { AnySchema } from "ajv";
 import { loadProfileContract, validateProfileContract } from "../core/contracts.js";
 import { evaluateCandidateWithPoses } from "../core/orchestration.js";
 import { analyticalGeneric, analyticalTank } from "../fixtures/analytical.js";
+import { EVIDENCE_GENERATOR_VERSION } from "../core/state.js";
 
 export interface ArtifactValidationResult {
   validated: number;
@@ -20,6 +21,15 @@ export async function validateRepositoryArtifacts(root: string): Promise<Artifac
   const base = resolve(root);
   const errors: string[] = [];
   let validated = 0;
+  try {
+    const packageJson = await jsonFile(join(base, "package.json")) as { version?: unknown; files?: unknown; dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+    if (packageJson.version !== EVIDENCE_GENERATOR_VERSION) errors.push(`package version ${String(packageJson.version)} does not match evidence generator ${EVIDENCE_GENERATOR_VERSION}`);
+    if (!Array.isArray(packageJson.files) || !packageJson.files.includes("CLAUDE.md")) errors.push("package files must include CLAUDE.md");
+    const three = packageJson.dependencies?.three;
+    const types = packageJson.devDependencies?.["@types/three"];
+    if (!three || !types || three.split(".").slice(0, 2).join(".") !== types.split(".").slice(0, 2).join(".")) errors.push("three and @types/three minor versions must align");
+    validated += 1;
+  } catch (error) { errors.push(`package.json: ${String(error)}`); }
   const schemaNames = ["project-manifest.v1.json", "reference-index.v1.json", "oracle-manifest.v1.json", "render-profile.v1.json"];
   for (const name of schemaNames) {
     try {
@@ -51,9 +61,9 @@ export async function validateRepositoryArtifacts(root: string): Promise<Artifac
         oracle,
         candidate: {
           root: candidate,
-          setPose: ({ turretYaw, gunElevation }) => {
-            if (turret) turret.rotation.y = turretYaw;
-            if (gun) gun.rotation.x = gunElevation;
+          setPose: (pose) => {
+            if (turret) turret.rotation.y = pose.turretYaw ?? 0;
+            if (gun) gun.rotation.x = pose.gunElevation ?? 0;
             candidate.updateMatrixWorld(true);
           },
         },

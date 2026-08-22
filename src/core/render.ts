@@ -4,6 +4,8 @@ import { PNG } from "pngjs";
 import * as THREE from "three";
 import type { CaptureCamera, CaptureFrame, CapturePass, Point3, RenderProfile, SceneSnapshot, SceneTriangle } from "../types.js";
 import { canonicalJson, sha256 } from "./hashing.js";
+import { forEachSceneTriangle, selectSnapshotComponents } from "./geometry.js";
+import { compareMasks } from "./measurement.js";
 
 export interface CanonicalFrame {
   width: number;
@@ -185,12 +187,12 @@ export function rasterizeCapture(snapshot: SceneSnapshot, profile: RenderProfile
   zbuffer.fill(Number.POSITIVE_INFINITY);
   const basis = cameraBasis(camera);
 
-  for (const triangle of snapshot.triangles) {
+  forEachSceneTriangle(snapshot, (triangle) => {
     const projected = triangle.points.map((point) => project(point, profile, camera, basis)) as [ProjectedPoint, ProjectedPoint, ProjectedPoint];
-    if (!projected.every((point) => point.valid)) continue;
+    if (!projected.every((point) => point.valid)) return;
     const [a, b, c] = projected;
     const area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
-    if (Math.abs(area) < 1e-12) continue;
+    if (Math.abs(area) < 1e-12) return;
     const minX = Math.max(0, Math.floor(Math.min(a.x, b.x, c.x)));
     const maxX = Math.min(width - 1, Math.ceil(Math.max(a.x, b.x, c.x)));
     const minY = Math.max(0, Math.floor(Math.min(a.y, b.y, c.y)));
@@ -210,7 +212,7 @@ export function rasterizeCapture(snapshot: SceneSnapshot, profile: RenderProfile
         data.set(triangleColor(triangle, pass, depth, profile), offset * 4);
       }
     }
-  }
+  });
   return {
     pass,
     cameraId: camera.id,
@@ -247,11 +249,12 @@ export async function createTurntable(
   directory: string,
   snapshot: SceneSnapshot,
   profile: RenderProfile,
-  options: { frames?: number; radius?: number; elevation?: number } = {},
+  options: { frames?: number; radius?: number; elevation?: number; target?: Point3 } = {},
 ): Promise<string[]> {
   const frames = options.frames ?? 24;
   const radius = options.radius ?? 12;
   const elevation = options.elevation ?? 4;
+  const target = options.target ?? [0, 0, 0];
   await mkdir(directory, { recursive: true });
   const paths: string[] = [];
   for (let index = 0; index < frames; index += 1) {
@@ -259,8 +262,8 @@ export async function createTurntable(
     const camera: CaptureCamera = {
       id: `turntable-${String(index).padStart(3, "0")}`,
       projection: "perspective",
-      position: [Math.sin(angle) * radius, elevation, Math.cos(angle) * radius],
-      target: [0, 0.8, 0],
+      position: [target[0] + Math.sin(angle) * radius, target[1] + elevation, target[2] + Math.cos(angle) * radius],
+      target,
     };
     const frame = rasterizeCapture(snapshot, profile, camera, "beauty");
     const path = join(directory, `${camera.id}.png`);
@@ -268,4 +271,42 @@ export async function createTurntable(
     paths.push(path);
   }
   return paths;
+}
+
+export interface RegionDiagnostic {
+  semanticId: string;
+  view: string;
+  silhouetteIou: number;
+  missingRatio: number;
+  excessRatio: number;
+  depthMae: number;
+  normalMae: number;
+  materialMae: number;
+}
+
+function frameMae(oracle: CaptureFrame, candidate: CaptureFrame, oracleMask: CaptureFrame, candidateMask: CaptureFrame): number {
+  let total = 0; let samples = 0;
+  for (let pixel = 0; pixel < oracle.width * oracle.height; pixel += 1) {
+    if ((oracleMask.data[pixel * 4 + 3] ?? 0) === 0 && (candidateMask.data[pixel * 4 + 3] ?? 0) === 0) continue;
+    for (let channel = 0; channel < 3; channel += 1) total += Math.abs((oracle.data[pixel * 4 + channel] ?? 0) - (candidate.data[pixel * 4 + channel] ?? 0)) / 255;
+    samples += 3;
+  }
+  return samples ? total / samples : 0;
+}
+
+export function compareRegionDiagnostics(oracle: SceneSnapshot, candidate: SceneSnapshot, profile: RenderProfile, cameras: CaptureCamera[]): RegionDiagnostic[] {
+  const ids = [...new Set([...Object.keys(oracle.components), ...Object.keys(candidate.components)])].sort();
+  const diagnostics: RegionDiagnostic[] = [];
+  for (const semanticId of ids) {
+    const oracleRegion = selectSnapshotComponents(oracle, (component) => component.id === semanticId);
+    const candidateRegion = selectSnapshotComponents(candidate, (component) => component.id === semanticId);
+    for (const camera of cameras) {
+      const oracleMask = rasterizeCapture(oracleRegion, profile, camera, "alpha-silhouette");
+      const candidateMask = rasterizeCapture(candidateRegion, profile, camera, "alpha-silhouette");
+      const masks = compareMasks(oracleMask, candidateMask);
+      const pair = (pass: "depth" | "normal" | "roughness-material-id"): number => frameMae(rasterizeCapture(oracleRegion, profile, camera, pass), rasterizeCapture(candidateRegion, profile, camera, pass), oracleMask, candidateMask);
+      diagnostics.push({ semanticId, view: camera.id, silhouetteIou: masks.iou, missingRatio: masks.missingRatio, excessRatio: masks.excessRatio, depthMae: pair("depth"), normalMae: pair("normal"), materialMae: pair("roughness-material-id") });
+    }
+  }
+  return diagnostics;
 }

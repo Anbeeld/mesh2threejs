@@ -1,23 +1,24 @@
 import * as THREE from "three";
 import type { Axis, Bounds3, CaptureFrame, Point3, SceneComponent, SceneSnapshot } from "../types.js";
-import { boundsFromPoints, componentPoints } from "./geometry.js";
+import { boundsFromPoints, forEachSceneTriangle, sceneTriangleAt } from "./geometry.js";
 
 const axisIndex: Record<Axis, 0 | 1 | 2> = { x: 0, y: 1, z: 2 };
 
 export function measureBounds(snapshot: SceneSnapshot, filter?: (component: SceneComponent) => boolean): Bounds3 {
-  return boundsFromPoints(componentPoints(snapshot, filter));
+  const components = Object.values(snapshot.components).filter((component) => !filter || filter(component));
+  return boundsFromPoints(components.flatMap((component) => [component.bounds.min, component.bounds.max]));
 }
 
 export function measureRobustBounds(snapshot: SceneSnapshot, options: { exclude?: RegExp; trimFraction?: number } = {}): Bounds3 {
-  const points = componentPoints(snapshot, (component) => !options.exclude?.test(component.id));
-  if (!points.length) return boundsFromPoints([]);
+  const components = Object.values(snapshot.components).filter((component) => !options.exclude?.test(component.id) && component.triangleIndices.length > 0);
+  if (!components.length) return boundsFromPoints([]);
   const trim = Math.max(0, Math.min(0.1, options.trimFraction ?? 0.002));
   const min: Point3 = [0, 1, 2].map((axis) => {
-    const values = points.map((point) => point[axis]!).sort((a, b) => a - b);
+    const values = components.map((component) => component.bounds.min[axis]!).sort((a, b) => a - b);
     return values[Math.floor((values.length - 1) * trim)]!;
   }) as Point3;
   const max: Point3 = [0, 1, 2].map((axis) => {
-    const values = points.map((point) => point[axis]!).sort((a, b) => a - b);
+    const values = components.map((component) => component.bounds.max[axis]!).sort((a, b) => a - b);
     return values[Math.ceil((values.length - 1) * (1 - trim))]!;
   }) as Point3;
   return { min, max, size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]], center: [(max[0] + min[0]) / 2, (max[1] + min[1]) / 2, (max[2] + min[2]) / 2] };
@@ -56,8 +57,8 @@ export function measureSection(snapshot: SceneSnapshot, request: SectionRequest)
   const axis = axisIndex[request.axis];
   const selected = request.semanticIds ? new Set(request.semanticIds) : null;
   const points: Point3[] = [];
-  for (const triangle of snapshot.triangles) {
-    if (selected && !selected.has(triangle.componentId)) continue;
+  forEachSceneTriangle(snapshot, (triangle) => {
+    if (selected && !selected.has(triangle.componentId)) return;
     const [a, b, c] = triangle.points;
     for (const point of triangle.points) {
       if (Math.abs(point[axis] - request.position) <= request.thickness / 2) points.push(point);
@@ -66,7 +67,7 @@ export function measureSection(snapshot: SceneSnapshot, request: SectionRequest)
       const point = interpolatePlane(start, end, axis, request.position);
       if (point) points.push(point);
     }
-  }
+  });
   const bounds = boundsFromPoints(points);
   return { ...bounds, axis: request.axis, position: request.position, thickness: request.thickness, sampleCount: points.length };
 }
@@ -121,7 +122,7 @@ export function checkArticulation(
   const rows = [
     ...contract.moving.map((semanticId) => {
       const delta = matrixDistance(before[semanticId], after[semanticId]);
-      return { semanticId, expected: "moving" as const, delta, passed: delta > contract.epsilon };
+      return { semanticId, expected: "moving" as const, delta, passed: Boolean(before[semanticId] && after[semanticId]) && delta > contract.epsilon };
     }),
     ...contract.stationary.map((semanticId) => {
       const delta = matrixDistance(before[semanticId], after[semanticId]);
@@ -195,8 +196,8 @@ function roundedPoint(point: Point3): string {
 export function checkWatertightness(snapshot: SceneSnapshot, semanticIds?: string[]): Array<{ componentId: string; boundaryEdges: number; passed: boolean }> {
   const selected = semanticIds ? new Set(semanticIds) : null;
   const edgesByComponent = new Map<string, Map<string, number>>();
-  for (const triangle of snapshot.triangles) {
-    if (selected && !selected.has(triangle.componentId)) continue;
+  forEachSceneTriangle(snapshot, (triangle) => {
+    if (selected && !selected.has(triangle.componentId)) return;
     let edges = edgesByComponent.get(triangle.componentId);
     if (!edges) {
       edges = new Map();
@@ -207,7 +208,7 @@ export function checkWatertightness(snapshot: SceneSnapshot, semanticIds?: strin
       const key = [roundedPoint(start), roundedPoint(end)].sort().join("|");
       edges.set(key, (edges.get(key) ?? 0) + 1);
     }
-  }
+  });
   return [...edgesByComponent].map(([componentId, edges]) => {
     const boundaryEdges = [...edges.values()].filter((count) => count === 1).length;
     return { componentId, boundaryEdges, passed: boundaryEdges === 0 };
@@ -234,15 +235,16 @@ export function measureLandmarks(snapshot: SceneSnapshot, request: { semanticPat
 export function measureSignedVolume(snapshot: SceneSnapshot): number {
   const origin = measureBounds(snapshot).center;
   let volume = 0;
-  for (const triangle of snapshot.triangles) {
+  forEachSceneTriangle(snapshot, (triangle) => {
     const points = triangle.points.map((point) => new THREE.Vector3(point[0] - origin[0], point[1] - origin[1], point[2] - origin[2])) as [THREE.Vector3, THREE.Vector3, THREE.Vector3];
     volume += points[0].dot(points[1].clone().cross(points[2])) / 6;
-  }
+  });
   return volume;
 }
 
 export function countConnectedIslands(snapshot: SceneSnapshot, semanticId: string): number {
-  const triangles = snapshot.triangles.filter((triangle) => triangle.componentId === semanticId);
+  const component = snapshot.components[semanticId];
+  const triangles = component ? Array.from(component.triangleIndices, (index) => sceneTriangleAt(snapshot, index)!) : [];
   if (!triangles.length) return 0;
   const vertices = triangles.map((triangle) => new Set(triangle.points.map(roundedPoint)));
   const parent = triangles.map((_, index) => index);

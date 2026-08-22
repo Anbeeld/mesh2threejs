@@ -6,7 +6,7 @@
     "optional": ["hull-upper", "cupola", "sprocket", "idler", "return-roller"],
     "critical": ["hull", "turret", "gun", "turret-pivot", "gun-pivot"]
   },
-  "operators": ["adaptive-orthographic-curves", "articulation-poses", "bounds-robust", "connectivity", "critical-semantics", "fabrication", "hull-pinned-registration", "landmarks", "physical-orientation", "repeated-instances", "sections", "track-course"],
+  "operators": ["adaptive-orthographic-curves", "articulation-poses", "bounds-robust", "connectivity", "critical-semantics", "fabrication", "landmarks", "physical-orientation", "repeated-instances", "sections", "track-course"],
   "phases": [
     {"id":"oracle-registration","dependsOn":[],"owner":"oracle","requiredGates":["registration.complete"]},
     {"id":"hull","dependsOn":["oracle-registration"],"owner":"builder","requiredGates":["curves.hull","hull.stations","dimensions.hull-length","orientation.physical"]},

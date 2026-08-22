@@ -1,11 +1,13 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
-import type { CertificationLevel, ProfileId } from "../types.js";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+import type { CertificationLevel, GateReport, ProfileId } from "../types.js";
 import type { Route } from "./routing.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
+import { verifyVisualReviewPacketFiles, type VisualReviewPacket } from "./review.js";
 
 export type SourceStatus = "supports" | "does-not-support" | "not-retrieved" | "contradicted" | "superseded";
+export const EVIDENCE_GENERATOR_VERSION = "0.3.0";
 
 export interface StateFact {
   id: string;
@@ -29,10 +31,21 @@ export interface EvidenceRecord {
   profileContractHash?: string;
   configHash?: string;
   verified?: boolean;
+  gateResults?: GateEvidenceResult[];
+  authority?: EvidenceAuthority;
+  generatorVersion?: string;
+}
+
+export type EvidenceAuthority = "declared" | "runtime-gate-evaluation" | "runtime-render-capture" | "oracle-registration" | "external-visual-review";
+
+export interface GateEvidenceResult {
+  code: string;
+  passed: boolean;
+  score: number;
 }
 
 export interface EvidenceArtifact {
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   kind: EvidenceRecord["kind"];
   phase: string;
@@ -43,6 +56,8 @@ export interface EvidenceArtifact {
   generator: { name: "mesh2threejs"; version: string };
   createdAt: string;
   result: { passed: boolean; summary: string; details?: unknown };
+  gateResults?: GateEvidenceResult[];
+  authority: EvidenceAuthority;
   artifactHash: string;
 }
 
@@ -107,6 +122,23 @@ function lifecycle(profile: ProfileId): { phases: string[]; dependencies: Record
     phases: contract.phases.map((phase) => phase.id),
     dependencies: Object.fromEntries(contract.phases.map((phase) => [phase.id, phase.dependsOn])),
   };
+}
+
+function gateAuthority(owner: "oracle" | "builder" | "reviewer" | "finalizer"): EvidenceAuthority {
+  if (owner === "oracle") return "oracle-registration";
+  if (owner === "reviewer") return "external-visual-review";
+  return "runtime-gate-evaluation";
+}
+
+function evidenceAuthority(kind: EvidenceRecord["kind"]): EvidenceAuthority {
+  if (kind === "registration") return "oracle-registration";
+  if (kind === "visual-review") return "external-visual-review";
+  if (kind === "turntable") return "runtime-render-capture";
+  return "runtime-gate-evaluation";
+}
+
+export function isAuthoritativeEvidence(evidence: EvidenceRecord): boolean {
+  return evidence.authority === evidenceAuthority(evidence.kind) && evidence.generatorVersion === EVIDENCE_GENERATOR_VERSION;
 }
 
 function clone<T>(value: T): T {
@@ -206,7 +238,8 @@ export function bindCandidatePhases(state: TaskState, candidateHash: string, pha
     if (!phaseHashes[phase] || phaseHashes[phase] !== lock.geometryHash) throw new Error(`candidate changes locked phase geometry: ${phase}; reopen it first`);
   }
   if (next.candidateHash && next.candidateHash !== candidateHash) {
-    invalidate(next, (evidence) => evidence.kind !== "registration");
+    const lockedEvidenceIds = new Set(Object.values(next.locks).flatMap((lock) => lock.evidence.map((binding) => binding.id)));
+    invalidate(next, (evidence) => evidence.kind !== "registration" && !lockedEvidenceIds.has(evidence.id));
     next.visualReviewStatus = "awaiting";
   }
   next.candidateHash = candidateHash;
@@ -234,20 +267,63 @@ export function recordEvidence(state: TaskState, evidence: Omit<EvidenceRecord, 
   return next;
 }
 
-export function createEvidenceArtifact(input: Omit<EvidenceArtifact, "schemaVersion" | "generator" | "createdAt" | "artifactHash">): EvidenceArtifact {
+type UnsealedEvidence = Omit<EvidenceArtifact, "schemaVersion" | "generator" | "createdAt" | "artifactHash" | "authority">;
+
+function sealEvidenceArtifact(input: UnsealedEvidence, authority: EvidenceAuthority): EvidenceArtifact {
   const payload = {
-    schemaVersion: 2 as const,
+    schemaVersion: 3 as const,
     ...input,
-    generator: { name: "mesh2threejs" as const, version: "0.2.0" },
+    authority,
+    generator: { name: "mesh2threejs" as const, version: EVIDENCE_GENERATOR_VERSION },
     createdAt: new Date().toISOString(),
   };
   return { ...payload, artifactHash: sha256(canonicalJson(payload)) };
 }
 
+export function createEvidenceArtifact(input: UnsealedEvidence): EvidenceArtifact {
+  return sealEvidenceArtifact(input, "declared");
+}
+
+export function createRuntimeGateEvidenceArtifact(input: Omit<UnsealedEvidence, "kind" | "gateResults" | "result"> & { report: GateReport }): EvidenceArtifact {
+  if (!input.report.rows.length || input.report.rows.some((row) => row.phase !== input.phase)) throw new Error(`runtime gate report is empty or contains rows outside phase ${input.phase}`);
+  const { report, ...artifact } = input;
+  return sealEvidenceArtifact({
+    ...artifact,
+    kind: "deterministic-gate",
+    gateResults: report.rows.map((row) => ({ code: row.code, passed: row.passed, score: row.score })),
+    result: { passed: report.passed, summary: `${input.phase} runtime gate score ${report.score}`, details: report },
+  }, "runtime-gate-evaluation");
+}
+
+export function createRuntimeEvaluationEvidenceArtifact(input: Omit<UnsealedEvidence, "kind" | "gateResults" | "result"> & { kind: "style" | "complexity" | "articulation"; report: GateReport }): EvidenceArtifact {
+  if (!input.report.rows.length) throw new Error(`${input.kind} runtime report is empty`);
+  const { report, ...artifact } = input;
+  return sealEvidenceArtifact({ ...artifact, result: { passed: report.passed, summary: `${input.kind} runtime score ${report.score}`, details: report } }, "runtime-gate-evaluation");
+}
+
+export function createRenderEvidenceArtifact(input: Omit<UnsealedEvidence, "kind" | "gateResults" | "result"> & { manifest: { turntable: Array<{ path: string; sha256: string }>; [key: string]: unknown } }): EvidenceArtifact {
+  if (!input.manifest.turntable.length || input.manifest.turntable.some((item) => !item.path.trim() || !/^[a-f0-9]{64}$/u.test(item.sha256))) throw new Error("render evidence requires valid turntable files");
+  const { manifest, ...artifact } = input;
+  return sealEvidenceArtifact({ ...artifact, kind: "turntable", result: { passed: true, summary: `${manifest.turntable.length} create-only turntable frames`, details: manifest } }, "runtime-render-capture");
+}
+
+export function createWorkflowGateEvidenceArtifact(input: Omit<UnsealedEvidence, "gateResults" | "result"> & { gateCode: "registration.complete" | "visual.review"; passed: boolean; summary: string; details?: unknown }): EvidenceArtifact {
+  const { gateCode, passed, summary, details, ...artifact } = input;
+  const expectedKind = gateCode === "registration.complete" ? "registration" : "visual-review";
+  if (artifact.kind !== expectedKind) throw new Error(`${gateCode} evidence must use kind ${expectedKind}`);
+  return sealEvidenceArtifact({ ...artifact, gateResults: [{ code: gateCode, passed, score: passed ? 100 : 0 }], result: { passed, summary, ...(details === undefined ? {} : { details }) } }, gateCode === "registration.complete" ? "oracle-registration" : "external-visual-review");
+}
+
 export function verifyEvidenceArtifact(artifact: EvidenceArtifact): void {
   const { artifactHash, ...payload } = artifact;
-  if (artifact.schemaVersion !== 2 || artifact.generator?.name !== "mesh2threejs") throw new Error("evidence artifact schema/generator is invalid");
+  if (artifact.schemaVersion !== 3 || artifact.generator?.name !== "mesh2threejs" || artifact.generator.version !== EVIDENCE_GENERATOR_VERSION) throw new Error("evidence artifact schema/generator is invalid or unsupported");
+  if (!["declared", "runtime-gate-evaluation", "runtime-render-capture", "oracle-registration", "external-visual-review"].includes(artifact.authority)) throw new Error("evidence artifact authority is invalid");
   if (sha256(canonicalJson(payload)) !== artifactHash) throw new Error(`evidence artifact hash is invalid: ${artifact.id}`);
+  const gateCodes = new Set<string>();
+  for (const gate of artifact.gateResults ?? []) {
+    if (!gate.code.trim() || gateCodes.has(gate.code) || !Number.isFinite(gate.score) || gate.score < 0 || gate.score > 100) throw new Error(`evidence artifact has invalid gate results: ${artifact.id}`);
+    gateCodes.add(gate.code);
+  }
 }
 
 export function recordEvidenceArtifact(state: TaskState, artifactPath: string, artifact: EvidenceArtifact): TaskState {
@@ -256,6 +332,7 @@ export function recordEvidenceArtifact(state: TaskState, artifactPath: string, a
   if (state.profileContractHash !== artifact.profileContractHash) throw new Error("evidence artifact profile contract is stale");
   const configured = state.evidenceConfigHashes[artifact.kind];
   if (configured && configured !== artifact.configHash) throw new Error(`evidence artifact ${artifact.kind} config is stale; explicitly bind the new config first`);
+  if (state.evidence[artifact.id]) throw new Error(`evidence id already exists and cannot be overwritten: ${artifact.id}`);
   const next = clone(state);
   next.evidenceConfigHashes[artifact.kind] = artifact.configHash;
   next.evidence[artifact.id] = {
@@ -272,6 +349,9 @@ export function recordEvidenceArtifact(state: TaskState, artifactPath: string, a
     profileContractHash: artifact.profileContractHash,
     configHash: artifact.configHash,
     verified: true,
+    authority: artifact.authority,
+    generatorVersion: artifact.generator.version,
+    ...(artifact.gateResults ? { gateResults: artifact.gateResults.map((gate) => ({ ...gate })) } : {}),
   };
   if (artifact.kind === "visual-review") next.visualReviewStatus = artifact.result.passed ? "passed" : "failed";
   next.verificationResults.push({ id: `verification-${next.verificationResults.length + 1}`, passed: artifact.result.passed, evidenceId: artifact.id });
@@ -293,6 +373,7 @@ export function bindEvidenceConfig(state: TaskState, kind: EvidenceRecord["kind"
 
 export function acceptPhase(state: TaskState, phase: string, input: { geometryHash: string; evidenceIds: string[]; contractHash: string }): TaskState {
   const { phases, dependencies } = lifecycle(state.profile);
+  const contract = getProfileContract(state.profile);
   const index = phases.indexOf(phase);
   if (index < 0 || phase === "final") throw new Error(`phase ${phase} cannot be locked`);
   if (input.contractHash !== state.profileContractHash) throw new Error("phase lock contract hash is stale");
@@ -301,6 +382,16 @@ export function acceptPhase(state: TaskState, phase: string, input: { geometryHa
     const evidence = state.evidence[id];
     if (!evidence || !evidence.valid || !evidence.verified || !evidence.passed || evidence.phase !== phase) throw new Error(`phase lock evidence is missing, failing, stale, or for another phase: ${id}`);
   }
+  const requiredGates = contract.phases.find((item) => item.id === phase)?.requiredGates ?? [];
+  const owner = contract.phases.find((item) => item.id === phase)?.owner;
+  const requiredAuthority = gateAuthority(owner ?? "builder");
+  const suppliedGates = input.evidenceIds.flatMap((id) => state.evidence[id]?.authority === requiredAuthority && state.evidence[id]?.generatorVersion === EVIDENCE_GENERATOR_VERSION ? state.evidence[id]?.gateResults ?? [] : []);
+  const gatesByCode = new Map(contract.gates.map((gate) => [gate.code, gate]));
+  const missingGates = requiredGates.filter((code) => {
+    const threshold = gatesByCode.get(code)?.threshold ?? 100;
+    return !suppliedGates.some((gate) => gate.code === code && gate.passed && gate.score >= threshold);
+  });
+  if (missingGates.length) throw new Error(`phase ${phase} evidence does not prove required gates: ${missingGates.join(", ")}`);
   if (phase !== "oracle-registration" && state.phaseGeometryHashes[phase] && state.phaseGeometryHashes[phase] !== input.geometryHash) throw new Error(`phase ${phase} geometry hash does not match the measured candidate phase`);
   for (const dependency of dependencies[phase] ?? []) {
     if (!state.locks[dependency] && state.phaseStatus[dependency] !== "skipped") throw new Error(`phase ${phase} depends on unlocked phase ${dependency}`);
@@ -363,12 +454,18 @@ export function determineNextAction(state: TaskState): { route: Route; reason: s
   if (!state.oracleHash) return { route: "onboard-oracle", reason: "no admitted oracle is bound to the task" };
   if (!state.candidateHash) return { route: "build", reason: "no procedural candidate is bound to the task" };
   const valid = Object.values(state.evidence).filter((evidence) => evidence.valid && evidence.oracleHash === state.oracleHash && evidence.candidateHash === state.candidateHash);
-  const registration = Object.values(state.evidence).find((evidence) => evidence.kind === "registration" && evidence.valid && evidence.verified && evidence.passed && evidence.oracleHash === state.oracleHash);
+  const registration = Object.values(state.evidence).find((evidence) => evidence.kind === "registration" && evidence.valid && evidence.verified && evidence.passed && evidence.oracleHash === state.oracleHash && isAuthoritativeEvidence(evidence));
   if (!registration) return { route: "onboard-oracle", reason: "verified registration evidence is missing or failing" };
-  const missingBuildEvidence = (["deterministic-gate", "style", "complexity", "articulation", "turntable"] as const).filter((kind) => !valid.some((evidence) => evidence.kind === kind && evidence.verified && evidence.passed));
+  const contract = getProfileContract(state.profile);
+  if (!state.locks["oracle-registration"]) return { route: "onboard-oracle", reason: "registration evidence is ready but the oracle-registration phase is not locked" };
+  const unlockedBuildPhases = contract.phases.filter((phase) => phase.owner === "builder" && !state.locks[phase.id]).map((phase) => phase.id);
+  if (unlockedBuildPhases.length) return { route: "build", reason: `builder phases remain unlocked: ${unlockedBuildPhases.join(", ")}` };
+  const buildEvidence = contract.completion.requiredEvidence.filter((kind): kind is EvidenceRecord["kind"] => kind !== "registration" && kind !== "visual-review");
+  const missingBuildEvidence = buildEvidence.filter((kind) => !valid.some((evidence) => evidence.kind === kind && evidence.verified && evidence.passed && isAuthoritativeEvidence(evidence)));
   if (missingBuildEvidence.length) return { route: "build", reason: `current build evidence is missing or failing: ${missingBuildEvidence.join(", ")}` };
-  const visual = valid.find((evidence) => evidence.kind === "visual-review" && evidence.passed && evidence.verified);
+  const visual = valid.find((evidence) => evidence.kind === "visual-review" && evidence.passed && evidence.verified && isAuthoritativeEvidence(evidence));
   if (!visual) return { route: "visual-review", reason: "fresh external visual review evidence is required" };
+  if (!state.locks["visual-review"]) return { route: "visual-review", reason: "external review passed but the visual-review phase is not locked" };
   return { route: "finalize", reason: "deterministic and external visual evidence are ready for final certification checks" };
 }
 
@@ -381,11 +478,32 @@ export function certifyState(state: TaskState): TaskState {
   }
   const unlocked = contract.phases.map((phase) => phase.id).filter((phase) => phase !== "final" && !state.locks[phase] && state.phaseStatus[phase] !== "skipped");
   if (unlocked.length) throw new Error(`certification has unlocked phases: ${unlocked.join(", ")}`);
+  for (const phase of contract.phases.filter((item) => item.id !== "final")) {
+    const lock = state.locks[phase.id];
+    if (!lock) continue;
+    const requiredAuthority = gateAuthority(phase.owner);
+    const records = lock.evidence.map((binding) => state.evidence[binding.id]).filter((record): record is EvidenceRecord => Boolean(record));
+    if (records.length !== lock.evidence.length || records.some((record) => !record.valid || !record.verified || !record.passed)) throw new Error(`certification phase lock has stale or invalid evidence: ${phase.id}`);
+    const gateResults = records.filter((record) => record.authority === requiredAuthority && record.generatorVersion === EVIDENCE_GENERATOR_VERSION).flatMap((record) => record.gateResults ?? []);
+    const missingGates = phase.requiredGates.filter((code) => {
+      const threshold = contract.gates.find((gate) => gate.code === code)?.threshold ?? 100;
+      return !gateResults.some((gate) => gate.code === code && gate.passed && gate.score >= threshold);
+    });
+    if (missingGates.length) throw new Error(`certification phase lock lacks authoritative gates: ${phase.id}: ${missingGates.join(", ")}`);
+  }
   const driftedLocks = Object.values(state.locks).filter((lock) => lock.phase !== "oracle-registration" && state.phaseGeometryHashes[lock.phase] !== lock.geometryHash);
   if (driftedLocks.length) throw new Error(`certification has phase geometry drift: ${driftedLocks.map((lock) => lock.phase).join(", ")}`);
+  const finalPhase = contract.phases.find((phase) => phase.id === "final");
+  const finalAuthority = finalPhase ? gateAuthority(finalPhase.owner) : "runtime-gate-evaluation";
+  const validGateResults = Object.values(state.evidence).filter((evidence) => evidence.valid && evidence.verified && evidence.passed && evidence.oracleHash === state.oracleHash && evidence.candidateHash === state.candidateHash && evidence.authority === finalAuthority && evidence.generatorVersion === EVIDENCE_GENERATOR_VERSION).flatMap((evidence) => evidence.gateResults ?? []);
+  const finalMissing = (finalPhase?.requiredGates ?? []).filter((code) => {
+    const threshold = contract.gates.find((gate) => gate.code === code)?.threshold ?? 100;
+    return !validGateResults.some((gate) => gate.code === code && gate.passed && gate.score >= threshold);
+  });
+  if (finalMissing.length) throw new Error(`certification final gates are missing or failing: ${finalMissing.join(", ")}`);
   const requiredEvidence = contract.completion.requiredEvidence as EvidenceRecord["kind"][];
   const missing = requiredEvidence.filter((kind) => !Object.values(state.evidence).some((evidence) =>
-    evidence.kind === kind && evidence.valid && evidence.verified === true && evidence.passed && evidence.oracleHash === state.oracleHash && evidence.configHash === state.evidenceConfigHashes[kind] && (kind === "registration" || evidence.candidateHash === state.candidateHash)));
+    evidence.kind === kind && evidence.valid && evidence.verified === true && evidence.passed && isAuthoritativeEvidence(evidence) && evidence.oracleHash === state.oracleHash && evidence.configHash === state.evidenceConfigHashes[kind] && (kind === "registration" || evidence.candidateHash === state.candidateHash)));
   if (missing.length) throw new Error(`certification evidence missing or stale: ${missing.join(", ")}`);
   if (state.unresolvedItems.some((item) => item.blocking)) throw new Error("certification has unresolved blocking items");
   const next = clone(state);
@@ -395,20 +513,49 @@ export function certifyState(state: TaskState): TaskState {
 }
 
 export async function certifyStateFromArtifacts(state: TaskState, artifactRoot?: string): Promise<TaskState> {
-  const artifactPath = (path: string): string => artifactRoot && !isAbsolute(path) ? resolve(artifactRoot, path) : path;
+  const artifactPath = (path: string): string => {
+    if (!artifactRoot) return path;
+    const resolved = isAbsolute(path) ? resolve(path) : resolve(artifactRoot, path);
+    const relation = relative(resolve(artifactRoot), resolved);
+    if (relation === ".." || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(relation)) throw new Error(`evidence artifact escapes workspace: ${path}`);
+    return resolved;
+  };
+  const turntableHashSets: string[][] = [];
+  const reviewedTurntableHashSets: string[][] = [];
   for (const lock of Object.values(state.locks)) {
     for (const binding of lock.evidence) {
       const artifact = JSON.parse(await readFile(artifactPath(binding.artifact), "utf8")) as EvidenceArtifact;
       verifyEvidenceArtifact(artifact);
-      if (artifact.artifactHash !== binding.artifactHash || artifact.id !== binding.id || artifact.phase !== lock.phase || !artifact.result.passed) throw new Error(`phase lock evidence is stale or contradictory: ${lock.phase}/${binding.id}`);
+      const record = state.evidence[binding.id];
+      if (!record?.valid || !record.verified || artifact.artifactHash !== binding.artifactHash || artifact.id !== binding.id || artifact.phase !== lock.phase || !artifact.result.passed || artifact.authority !== record.authority || canonicalJson(artifact.gateResults ?? []) !== canonicalJson(record.gateResults ?? [])) throw new Error(`phase lock evidence is stale or contradictory: ${lock.phase}/${binding.id}`);
     }
   }
   for (const evidence of Object.values(state.evidence).filter((item) => item.valid && item.verified)) {
     const artifact = JSON.parse(await readFile(artifactPath(evidence.artifact), "utf8")) as EvidenceArtifact;
     verifyEvidenceArtifact(artifact);
-    if (artifact.artifactHash !== evidence.artifactHash || artifact.id !== evidence.id || artifact.result.passed !== evidence.passed) {
+    if (artifact.artifactHash !== evidence.artifactHash || artifact.id !== evidence.id || artifact.result.passed !== evidence.passed || artifact.authority !== evidence.authority || artifact.generator.version !== evidence.generatorVersion || canonicalJson(artifact.gateResults ?? []) !== canonicalJson(evidence.gateResults ?? [])) {
       throw new Error(`evidence artifact contradicts state: ${evidence.id}`);
     }
+    if (artifact.kind === "visual-review") {
+      const details = artifact.result.details as { packet?: VisualReviewPacket } | undefined;
+      if (!details?.packet) throw new Error(`visual review evidence lacks its referenced packet: ${artifact.id}`);
+      await verifyVisualReviewPacketFiles(details.packet, artifactRoot);
+      reviewedTurntableHashSets.push([...details.packet.turntableHashes].sort());
+    }
+    if (artifact.kind === "turntable" && artifact.authority === "runtime-render-capture") {
+      const details = artifact.result.details as { turntable?: Array<{ path?: string; sha256?: string }> } | undefined;
+      if (!details?.turntable?.length) throw new Error(`turntable evidence lacks referenced frames: ${artifact.id}`);
+      const hashes: string[] = [];
+      for (const frame of details.turntable) {
+        if (!frame.path || !frame.sha256) throw new Error(`turntable evidence has an invalid frame reference: ${artifact.id}`);
+        if (sha256(await readFile(artifactPath(frame.path))) !== frame.sha256) throw new Error(`turntable evidence frame changed or is incorrect: ${frame.path}`);
+        hashes.push(frame.sha256);
+      }
+      turntableHashSets.push(hashes.sort());
+    }
+  }
+  for (const reviewed of reviewedTurntableHashSets) {
+    if (!turntableHashSets.some((rendered) => canonicalJson(rendered) === canonicalJson(reviewed))) throw new Error("visual review turntable does not match authoritative render evidence");
   }
   return certifyState(state);
 }
@@ -444,8 +591,24 @@ export async function loadTaskState(path: string): Promise<TaskState> {
     throw new Error("task state schema is invalid");
   }
   if (!state.profileContractHash || !state.locks || !state.reopens || !state.visualReviewStatus || !state.evidenceConfigHashes || !state.phaseGeometryHashes) throw new Error("task state lacks durable phase/review/config fields");
+  const lacksEvidenceAuthority = Object.values(state.evidence).some((evidence) => evidence.valid && evidence.verified && (!evidence.authority || !evidence.generatorVersion));
+  if (lacksEvidenceAuthority) {
+    const contract = getProfileContract(state.profile);
+    const phases = contract.phases.map((phase) => phase.id);
+    for (const evidence of Object.values(state.evidence)) { evidence.valid = false; evidence.verified = false; }
+    state.locks = {};
+    state.phaseGeometryHashes = {};
+    state.evidenceConfigHashes = {};
+    state.phaseStatus = Object.fromEntries(phases.map((phase, index) => [phase, index === 0 ? "active" : "pending"]));
+    state.activePhase = phases[0]!;
+    state.visualReviewStatus = "awaiting";
+    state.status = "active";
+    state.systemDecisions.push({ id: "state-evidence-authority-migration", value: EVIDENCE_GENERATOR_VERSION, reason: "invalidated legacy evidence and locks because their evaluation authority cannot be established" });
+  }
+  const lockedEvidenceIds = new Set(Object.values(state.locks).flatMap((lock) => lock.evidence.map((binding) => binding.id)));
   for (const evidence of Object.values(state.evidence)) {
-    if (evidence.valid && ((state.oracleHash && evidence.oracleHash !== state.oracleHash) || (evidence.kind !== "registration" && state.candidateHash && evidence.candidateHash !== state.candidateHash))) {
+    const staleCandidate = evidence.kind !== "registration" && state.candidateHash && evidence.candidateHash !== state.candidateHash;
+    if (evidence.valid && ((state.oracleHash && evidence.oracleHash !== state.oracleHash) || (staleCandidate && !lockedEvidenceIds.has(evidence.id)))) {
       throw new Error(`task state is contradictory: valid evidence ${evidence.id} is bound to stale hashes`);
     }
     if (evidence.valid && evidence.verified && evidence.configHash !== state.evidenceConfigHashes[evidence.kind]) throw new Error(`task state is contradictory: valid evidence ${evidence.id} has a stale config hash`);

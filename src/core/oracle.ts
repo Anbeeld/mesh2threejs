@@ -88,7 +88,7 @@ function normalizedScalar(value: number, componentType: number): number {
   }
 }
 
-function readAccessor(parsed: ParsedGlb, accessorIndex: number): { values: number[]; count: number; components: number; min?: number[]; max?: number[] } {
+function readAccessor(parsed: ParsedGlb, accessorIndex: number): { values: Float64Array; count: number; components: number; min?: number[]; max?: number[] } {
   const accessors = asArray(parsed.json.accessors);
   const accessor = asObject(accessors[accessorIndex], `accessor ${accessorIndex}`);
   const views = asArray(parsed.json.bufferViews);
@@ -99,7 +99,7 @@ function readAccessor(parsed: ParsedGlb, accessorIndex: number): { values: numbe
   const count = Number(accessor.count);
   if (!componentBytes || !components || !Number.isInteger(count) || count < 0) throw new Error(`accessor ${accessorIndex} is invalid`);
   const accessorOffset = Number(accessor.byteOffset ?? 0);
-  const values: number[] = new Array(count * components).fill(0);
+  const values = new Float64Array(count * components);
   if (typeof viewIndex === "number") {
     const view = asObject(views[viewIndex], `bufferView ${viewIndex}`);
     if ((view.buffer ?? 0) !== 0) throw new Error("external or multi-buffer GLB is unsupported");
@@ -220,7 +220,8 @@ export function probeGlb(input: Uint8Array): GlbProbe {
   else if (meshes.length >= 2 && meaningfulNames.length >= 2) semanticReadiness = "reliable";
   else semanticReadiness = "partial";
   if (!materials.length) warnings.push("GLB has no materials");
-  if (!skins.length) warnings.push("GLB has no skins; static geometry remains usable");
+  if (skins.length) warnings.push("skins are inventoried but static preparation does not reproduce skin deformation");
+  if (animations.length) warnings.push("animations are inventoried but static preparation does not reproduce animation clips");
   const asset = parsed.json.asset && typeof parsed.json.asset === "object" ? parsed.json.asset as JsonObject : {};
   return {
     schemaVersion: 1,
@@ -256,14 +257,14 @@ function buildPrimitive(parsed: ParsedGlb, primitiveValue: unknown, name: string
   const positions = readAccessor(parsed, attributes.POSITION);
   if (positions.components !== 3) throw new Error("POSITION accessor must be VEC3");
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions.values, 3));
+  geometry.setAttribute("position", new THREE.BufferAttribute(Float32Array.from(positions.values), 3));
   if (typeof attributes.NORMAL === "number") {
     const normals = readAccessor(parsed, attributes.NORMAL);
-    if (normals.components === 3) geometry.setAttribute("normal", new THREE.Float32BufferAttribute(normals.values, 3));
+    if (normals.components === 3) geometry.setAttribute("normal", new THREE.BufferAttribute(Float32Array.from(normals.values), 3));
   }
   if (typeof primitive.indices === "number") {
     const indices = readAccessor(parsed, primitive.indices);
-    geometry.setIndex(indices.values);
+    geometry.setIndex(new THREE.BufferAttribute(Uint32Array.from(indices.values), 1));
   }
   if (!geometry.getAttribute("normal")) geometry.computeVertexNormals();
   const materialValue = typeof primitive.material === "number" ? materialValues[primitive.material] : undefined;

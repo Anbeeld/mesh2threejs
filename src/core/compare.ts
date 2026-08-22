@@ -36,6 +36,7 @@ export function scoreSilhouetteCurves(
 ): CurveScore {
   const oracleSpan = span(oracle, false);
   const candidateSpan = span(candidate, false);
+  if (!oracleSpan && !candidateSpan && normalizationDimension > 0) return { score: 100, meanPct: 0, p95Pct: 0, coverPct: 0, worst: [] };
   const oracleBody = span(oracle, true) ?? oracleSpan;
   const candidateBody = span(candidate, true) ?? candidateSpan;
   if (!oracleSpan || !candidateSpan || !oracleBody || !candidateBody || normalizationDimension <= 0) {

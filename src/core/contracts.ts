@@ -90,6 +90,8 @@ export function validateProfileContract(value: unknown): ContractValidation {
   if (!Array.isArray(contract.gates) || !contract.gates.length) errors.push("gates must be non-empty");
   const operators = new Set(EXECUTABLE_OPERATORS);
   for (const operator of contract.operators ?? []) if (!operators.has(operator)) errors.push(`unknown operator: ${operator}`);
+  const usedOperators = new Set((contract.gates ?? []).map((gate) => gate.operator));
+  for (const operator of new Set(contract.operators ?? [])) if (!usedOperators.has(operator)) errors.push(`operator ${operator} is enabled but unused by every gate`);
   const phaseIds = new Set((contract.phases ?? []).map((phase) => phase.id));
   const gateCodes = new Set((contract.gates ?? []).map((gate) => gate.code));
   if (phaseIds.size !== (contract.phases ?? []).length) errors.push("phase ids must be unique");

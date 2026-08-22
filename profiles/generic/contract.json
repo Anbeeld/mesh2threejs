@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "id": "generic",
   "semantics": {"required":["primary"],"optional":["attachment"],"critical":["primary"]},
-  "operators": ["adaptive-orthographic-curves","articulation-poses","attachments","bounds-robust","connectivity","critical-semantics","landmarks","physical-orientation","repeated-instances","sections"],
+  "operators": ["adaptive-orthographic-curves","attachments","bounds-robust","connectivity","critical-semantics","physical-orientation"],
   "phases": [
     {"id":"oracle-registration","dependsOn":[],"owner":"oracle","requiredGates":["registration.complete"]},
     {"id":"primary-mass","dependsOn":["oracle-registration"],"owner":"builder","requiredGates":["dimensions.robust","orientation.physical","silhouette.views"]},
@@ -26,5 +26,5 @@
   "articulation":[],
   "repeats":[],
   "stylePermissions":{"maySimplify":["micro-detail"],"mustPreserve":["macro-proportions","orientation","critical-features"]},
-  "completion":{"requiresVisualReview":true,"requiredEvidence":["registration","deterministic-gate","style","complexity","articulation","visual-review","turntable"]}
+  "completion":{"requiresVisualReview":true,"requiredEvidence":["registration","deterministic-gate","style","complexity","visual-review","turntable"]}
 }

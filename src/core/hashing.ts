@@ -25,18 +25,35 @@ export function fingerprintScene(root: THREE.Object3D): string {
 }
 
 export function fingerprintSnapshot(snapshot: SceneSnapshot, semanticIds?: ReadonlySet<string>, options: { includeMaterials?: boolean } = {}): string {
-  const components = Object.values(snapshot.components).filter((component) => !semanticIds || semanticIds.has(component.id));
-  const accepted = new Set(components.map((component) => component.id));
-  const payload = {
+  const components = Object.values(snapshot.components).filter((component) => !semanticIds || semanticIds.has(component.id)).sort((a, b) => a.id.localeCompare(b.id));
+  const hash = createHash("sha256");
+  hash.update(canonicalJson({
     metadata: snapshot.metadata,
-    components: components
-      .sort((a, b) => a.id.localeCompare(b.id))
-      .map(({ id, role, parentSemanticId, critical, origin }) => ({ id, role, parentSemanticId, critical, origin })),
-    triangles: snapshot.triangles.filter((triangle) => !semanticIds || accepted.has(triangle.componentId)).map((triangle) => ({
-      componentId: triangle.componentId,
-      ...(options.includeMaterials === false ? {} : { materialId: triangle.materialId, color: triangle.color, roughness: triangle.roughness }),
-      points: triangle.points,
-    })),
+    components: components.map(({ id, role, parentSemanticId, critical, origin, representation }) => ({ id, role, parentSemanticId, critical, origin, ...(options.includeMaterials === false ? {} : { representation }) })),
+  }));
+  const positions = Buffer.from(snapshot.triangleData.positions.buffer, snapshot.triangleData.positions.byteOffset, snapshot.triangleData.positions.byteLength);
+  const materialIndices = Buffer.from(snapshot.triangleData.materialIndices.buffer, snapshot.triangleData.materialIndices.byteOffset, snapshot.triangleData.materialIndices.byteLength);
+  const colors = Buffer.from(snapshot.triangleData.colors.buffer, snapshot.triangleData.colors.byteOffset, snapshot.triangleData.colors.byteLength);
+  const roughness = Buffer.from(snapshot.triangleData.roughness.buffer, snapshot.triangleData.roughness.byteOffset, snapshot.triangleData.roughness.byteLength);
+  const updateRun = (start: number, endExclusive: number): void => {
+    hash.update(positions.subarray(start * 9 * Float64Array.BYTES_PER_ELEMENT, endExclusive * 9 * Float64Array.BYTES_PER_ELEMENT));
+    if (options.includeMaterials !== false) {
+      hash.update(materialIndices.subarray(start * Uint32Array.BYTES_PER_ELEMENT, endExclusive * Uint32Array.BYTES_PER_ELEMENT));
+      hash.update(colors.subarray(start * Uint32Array.BYTES_PER_ELEMENT, endExclusive * Uint32Array.BYTES_PER_ELEMENT));
+      hash.update(roughness.subarray(start * Float32Array.BYTES_PER_ELEMENT, endExclusive * Float32Array.BYTES_PER_ELEMENT));
+    }
   };
-  return sha256(canonicalJson(payload));
+  for (const component of components) {
+    hash.update(component.id);
+    let runStart: number | undefined;
+    let previous: number | undefined;
+    for (const triangleIndex of component.triangleIndices) {
+      const physicalIndex = snapshot.triangleSelection?.[triangleIndex] ?? triangleIndex;
+      if (runStart === undefined) runStart = physicalIndex;
+      else if (previous !== undefined && physicalIndex !== previous + 1) { updateRun(runStart, previous + 1); runStart = physicalIndex; }
+      previous = physicalIndex;
+    }
+    if (runStart !== undefined && previous !== undefined) updateRun(runStart, previous + 1);
+  }
+  return hash.digest("hex");
 }

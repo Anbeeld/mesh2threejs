@@ -4,9 +4,11 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   createComparisonBoard,
+  compareRegionDiagnostics,
   createTurntable,
   initializeWorkspace,
   rasterizeCapture,
+  renderCapture,
   snapshotScene,
   standardRenderProfile,
   writeCapturePng,
@@ -28,6 +30,15 @@ describe("diagnostic render and workspace contract", () => {
     }
   });
 
+  test("selects the CPU renderer explicitly when no WebGL surface is available", () => {
+    const root = createGenericFixture();
+    const snapshot = snapshotScene(root);
+    const profile = standardRenderProfile({ width: 32, height: 32 });
+    const camera = { id: "front", projection: "orthographic" as const, position: [0, 2, 8] as const, target: [0, 0, 0] as const };
+    expect(renderCapture({ root, snapshot, profile, camera, pass: "beauty", backend: "auto" }).backend).toBe("deterministic-cpu");
+    expect(() => renderCapture({ root, snapshot, profile, camera, pass: "beauty", backend: "three-webgl" })).toThrow(/surface/);
+  });
+
   test("creates comparison boards and turntables bound to one profile", async () => {
     const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-board-"));
     const snapshot = snapshotScene(createGenericFixture());
@@ -39,6 +50,16 @@ describe("diagnostic render and workspace contract", () => {
     const turntable = await createTurntable(join(directory, "turntable"), snapshot, profile, { frames: 8 });
     expect(board.width).toBe(96);
     expect(turntable).toHaveLength(8);
+  });
+
+  test("reports depth, normal, material, and mask errors per semantic region", () => {
+    const oracle = snapshotScene(createGenericFixture());
+    const candidate = snapshotScene(createGenericFixture({ detached: true }));
+    const profile = standardRenderProfile({ width: 48, height: 48 });
+    const camera = { id: "front", projection: "orthographic" as const, position: [0, 2, 8] as const, target: [0, 0, 0] as const };
+    const rows = compareRegionDiagnostics(oracle, candidate, profile, [camera]);
+    expect(rows.find((row) => row.semanticId === "attachment")).toMatchObject({ view: "front" });
+    expect(rows.find((row) => row.semanticId === "attachment")!.silhouetteIou).toBeLessThan(1);
   });
 
   test("initializes durable workspace manifests", async () => {

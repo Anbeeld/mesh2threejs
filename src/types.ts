@@ -34,13 +34,30 @@ export interface SceneComponent {
   role?: string;
   parentSemanticId?: string;
   critical: boolean;
-  triangleIndices: number[];
+  triangleIndices: Uint32Array;
   bounds: Bounds3;
   origin?: Point3;
+  representation: {
+    segmentCounts: number[];
+    flatOrFaceted: boolean;
+    simplePbr: boolean;
+    generatedOrNoTextures: boolean;
+    colors: number[];
+  };
 }
 
 export interface SceneSnapshot {
-  triangles: SceneTriangle[];
+  triangleData: {
+    positions: Float64Array;
+    normals: Float32Array;
+    componentIndices: Uint32Array;
+    materialIndices: Uint32Array;
+    colors: Uint32Array;
+    roughness: Float32Array;
+    componentIds: string[];
+    materialIds: string[];
+  };
+  triangleSelection?: Uint32Array;
   components: Record<string, SceneComponent>;
   meshCount: number;
   materialCount: number;
@@ -143,7 +160,7 @@ export interface CandidateModule {
 
 export interface CandidateRuntime {
   root: THREE.Object3D;
-  setPose: (pose: { turretYaw: number; gunElevation: number }) => void | Promise<void>;
+  setPose: (pose: Record<string, number>) => void | Promise<void>;
   sourceHash?: string;
 }
 

@@ -66,7 +66,7 @@ function materialRecord(
   mesh: THREE.Mesh,
   triangleIndex: number,
   materialId: (material: THREE.Material | undefined) => string,
-): { id: string; color: number; roughness: number } {
+): { id: string; color: number; roughness: number; simplePbr: boolean; generatedOrNoTexture: boolean; flatShaded: boolean } {
   const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
   let materialIndex = 0;
   const indexOffset = triangleIndex * 3;
@@ -79,46 +79,61 @@ function materialRecord(
   }
   const material = materials[materialIndex] ?? materials[0];
   const standard = material as THREE.MeshStandardMaterial | undefined;
+  const map = standard?.map;
   return {
     id: materialId(material),
     color: standard?.color?.getHex() ?? 0x7f7f7f,
     roughness: typeof standard?.roughness === "number" ? standard.roughness : 0.7,
+    simplePbr: Boolean(material && ((material as THREE.MeshStandardMaterial).isMeshStandardMaterial || (material as THREE.MeshPhysicalMaterial).isMeshPhysicalMaterial)),
+    generatedOrNoTexture: !map || map.userData.generated === true || typeof map.userData.sourceHash === "string",
+    flatShaded: standard?.flatShading === true,
   };
 }
 
-function pointFromAttribute(attribute: THREE.BufferAttribute | THREE.InterleavedBufferAttribute, index: number, matrix: THREE.Matrix4): Point3 {
-  const vector = new THREE.Vector3(attribute.getX(index), attribute.getY(index), attribute.getZ(index));
-  vector.applyMatrix4(matrix);
-  return [vector.x, vector.y, vector.z];
+function geometrySegments(geometry: THREE.BufferGeometry): number[] {
+  const parameters = (geometry as THREE.BufferGeometry & { parameters?: Record<string, unknown> }).parameters;
+  if (!parameters) return [];
+  return [parameters.radialSegments, parameters.tubularSegments, parameters.widthSegments]
+    .filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value >= 3);
 }
 
-function faceNormal(points: [Point3, Point3, Point3]): Point3 {
-  const a = new THREE.Vector3(...points[0]);
-  const b = new THREE.Vector3(...points[1]);
-  const c = new THREE.Vector3(...points[2]);
-  const normal = b.sub(a).cross(c.sub(a)).normalize();
-  return [normal.x, normal.y, normal.z];
+function intrinsicallyFaceted(geometry: THREE.BufferGeometry): boolean {
+  if (/(?:Box|Plane|Polyhedron|Edges|Shape)/u.test(geometry.type)) return true;
+  if (geometry.type !== "ExtrudeGeometry") return false;
+  const parameters = (geometry as THREE.BufferGeometry & { parameters?: { shapes?: THREE.Shape | THREE.Shape[]; options?: { bevelEnabled?: boolean } } }).parameters;
+  if (!parameters?.shapes || parameters.options?.bevelEnabled !== false) return false;
+  const shapes = Array.isArray(parameters.shapes) ? parameters.shapes : [parameters.shapes];
+  const curves = shapes.flatMap((shape) => [shape, ...shape.holes].flatMap((path) => path.curves));
+  return curves.length > 0 && curves.every((curve) => curve.type === "LineCurve");
+}
+
+function writeTransformedPoint(attribute: THREE.BufferAttribute | THREE.InterleavedBufferAttribute, index: number, matrix: THREE.Matrix4, target: Float64Array, offset: number, bounds: Bounds3): void {
+  const x = attribute.getX(index); const y = attribute.getY(index); const z = attribute.getZ(index);
+  const e = matrix.elements;
+  const w = 1 / ((e[3]! * x) + (e[7]! * y) + (e[11]! * z) + e[15]! || 1);
+  const tx = ((e[0]! * x) + (e[4]! * y) + (e[8]! * z) + e[12]!) * w;
+  const ty = ((e[1]! * x) + (e[5]! * y) + (e[9]! * z) + e[13]!) * w;
+  const tz = ((e[2]! * x) + (e[6]! * y) + (e[10]! * z) + e[14]!) * w;
+  target[offset] = tx; target[offset + 1] = ty; target[offset + 2] = tz;
+  bounds.min[0] = Math.min(bounds.min[0], tx); bounds.min[1] = Math.min(bounds.min[1], ty); bounds.min[2] = Math.min(bounds.min[2], tz);
+  bounds.max[0] = Math.max(bounds.max[0], tx); bounds.max[1] = Math.max(bounds.max[1], ty); bounds.max[2] = Math.max(bounds.max[2], tz);
+}
+
+function writeFaceNormal(positions: Float64Array, positionOffset: number, normals: Float32Array, normalOffset: number): void {
+  const abx = positions[positionOffset + 3]! - positions[positionOffset]!;
+  const aby = positions[positionOffset + 4]! - positions[positionOffset + 1]!;
+  const abz = positions[positionOffset + 5]! - positions[positionOffset + 2]!;
+  const acx = positions[positionOffset + 6]! - positions[positionOffset]!;
+  const acy = positions[positionOffset + 7]! - positions[positionOffset + 1]!;
+  const acz = positions[positionOffset + 8]! - positions[positionOffset + 2]!;
+  const nx = aby * acz - abz * acy; const ny = abz * acx - abx * acz; const nz = abx * acy - aby * acx;
+  const length = Math.hypot(nx, ny, nz) || 1;
+  normals[normalOffset] = nx / length; normals[normalOffset + 1] = ny / length; normals[normalOffset + 2] = nz / length;
 }
 
 export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
   root.updateMatrixWorld(true);
-  const triangles: SceneTriangle[] = [];
-  const componentDrafts = new Map<string, Omit<SceneComponent, "bounds"> & { bounds: Bounds3 }>();
-  const materialIds = new Set<string>();
-  const materialIdentity = new WeakMap<THREE.Material, string>();
-  let nextMaterialId = 0;
-  const stableMaterialId = (material: THREE.Material | undefined): string => {
-    if (!material) return "material-missing";
-    const existing = materialIdentity.get(material);
-    if (existing) return existing;
-    const id = `material-${nextMaterialId}`;
-    nextMaterialId += 1;
-    materialIdentity.set(material, id);
-    return id;
-  };
-  let meshCount = 0;
   const semanticOwners = new Map<string, THREE.Object3D>();
-
   root.traverse((object) => {
     const semanticId = typeof object.userData.semanticId === "string" ? object.userData.semanticId : undefined;
     if (!semanticId) return;
@@ -127,61 +142,90 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
     semanticOwners.set(semanticId, object);
   });
 
+  type MeshEntry = { mesh: THREE.Mesh; position: THREE.BufferAttribute | THREE.InterleavedBufferAttribute; index: THREE.BufferAttribute | null; triangleCount: number; owner: ReturnType<typeof semanticOwner> };
+  const entries: MeshEntry[] = [];
+  const componentCounts = new Map<string, number>();
   root.traverse((object) => {
     const mesh = object as THREE.Mesh;
     if (!mesh.isMesh || !mesh.visible || !mesh.geometry) return;
     const position = mesh.geometry.getAttribute("position");
     if (!position) return;
-    meshCount += 1;
-    const owner = semanticOwner(mesh);
-    let component = componentDrafts.get(owner.id);
-    if (!component) {
-      component = {
-        id: owner.id,
-        name: mesh.name || owner.id,
-        ...(owner.role ? { role: owner.role } : {}),
-        ...(owner.parent ? { parentSemanticId: owner.parent } : {}),
-        critical: owner.critical,
-        triangleIndices: [],
-        bounds: emptyBounds(),
-      };
-      componentDrafts.set(owner.id, component);
-    }
     const index = mesh.geometry.index;
     const triangleCount = index ? Math.floor(index.count / 3) : Math.floor(position.count / 3);
-    for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
-      const indices = index
-        ? [index.getX(triangleIndex * 3), index.getX(triangleIndex * 3 + 1), index.getX(triangleIndex * 3 + 2)]
-        : [triangleIndex * 3, triangleIndex * 3 + 1, triangleIndex * 3 + 2];
-      const a = indices[0];
-      const b = indices[1];
-      const c = indices[2];
-      if (a === undefined || b === undefined || c === undefined) continue;
-      const points: [Point3, Point3, Point3] = [
-        pointFromAttribute(position, a, mesh.matrixWorld),
-        pointFromAttribute(position, b, mesh.matrixWorld),
-        pointFromAttribute(position, c, mesh.matrixWorld),
-      ];
-      const material = materialRecord(mesh, triangleIndex, stableMaterialId);
-      materialIds.add(material.id);
-      const record: SceneTriangle = {
-        points,
-        normal: faceNormal(points),
-        componentId: owner.id,
-        materialId: material.id,
-        color: material.color,
-        roughness: material.roughness,
-      };
-      component.triangleIndices.push(triangles.length);
-      points.forEach((point) => includePoint(component!.bounds, point));
-      triangles.push(record);
-    }
+    const owner = semanticOwner(mesh);
+    entries.push({ mesh, position, index, triangleCount, owner });
+    componentCounts.set(owner.id, (componentCounts.get(owner.id) ?? 0) + triangleCount);
   });
 
-  const components: Record<string, SceneComponent> = {};
-  for (const [id, component] of componentDrafts) {
-    components[id] = { ...component, bounds: finishBounds(component.bounds) };
+  const componentIds = [...componentCounts.keys()];
+  const componentIndexById = new Map(componentIds.map((id, index) => [id, index]));
+  const triangleCount = entries.reduce((sum, entry) => sum + entry.triangleCount, 0);
+  const positions = new Float64Array(triangleCount * 9);
+  const normals = new Float32Array(triangleCount * 3);
+  const componentIndices = new Uint32Array(triangleCount);
+  const materialIndices = new Uint32Array(triangleCount);
+  const colors = new Uint32Array(triangleCount);
+  const roughness = new Float32Array(triangleCount);
+  const materialIdentity = new WeakMap<THREE.Material, string>();
+  const materialIds: string[] = [];
+  const materialIndexById = new Map<string, number>();
+  const stableMaterialId = (material: THREE.Material | undefined): string => {
+    if (!material) return "material-missing";
+    const existing = materialIdentity.get(material);
+    if (existing) return existing;
+    const id = `material-${materialIds.length}`;
+    materialIdentity.set(material, id);
+    return id;
+  };
+  type ComponentDraft = Omit<SceneComponent, "bounds" | "triangleIndices"> & { bounds: Bounds3; triangleIndices: Uint32Array; cursor: number };
+  const componentDrafts = new Map<string, ComponentDraft>();
+  for (const entry of entries) {
+    if (componentDrafts.has(entry.owner.id)) continue;
+    componentDrafts.set(entry.owner.id, {
+      id: entry.owner.id,
+      name: entry.mesh.name || entry.owner.id,
+      ...(entry.owner.role ? { role: entry.owner.role } : {}),
+      ...(entry.owner.parent ? { parentSemanticId: entry.owner.parent } : {}),
+      critical: entry.owner.critical,
+      triangleIndices: new Uint32Array(componentCounts.get(entry.owner.id) ?? 0),
+      cursor: 0,
+      bounds: emptyBounds(),
+      representation: { segmentCounts: [], flatOrFaceted: true, simplePbr: true, generatedOrNoTextures: true, colors: [] },
+    });
   }
+  let outputTriangle = 0;
+  for (const entry of entries) {
+    const component = componentDrafts.get(entry.owner.id)!;
+    const segments = geometrySegments(entry.mesh.geometry);
+    const uniformMaterial = entry.mesh.geometry.groups.length === 0 && !Array.isArray(entry.mesh.material) ? materialRecord(entry.mesh, 0, stableMaterialId) : undefined;
+    component.representation.segmentCounts.push(...segments.filter((value) => !component.representation.segmentCounts.includes(value)));
+    for (let triangleIndex = 0; triangleIndex < entry.triangleCount; triangleIndex += 1) {
+      const indices = entry.index
+        ? [entry.index.getX(triangleIndex * 3), entry.index.getX(triangleIndex * 3 + 1), entry.index.getX(triangleIndex * 3 + 2)]
+        : [triangleIndex * 3, triangleIndex * 3 + 1, triangleIndex * 3 + 2];
+      const positionOffset = outputTriangle * 9;
+      writeTransformedPoint(entry.position, indices[0]!, entry.mesh.matrixWorld, positions, positionOffset, component.bounds);
+      writeTransformedPoint(entry.position, indices[1]!, entry.mesh.matrixWorld, positions, positionOffset + 3, component.bounds);
+      writeTransformedPoint(entry.position, indices[2]!, entry.mesh.matrixWorld, positions, positionOffset + 6, component.bounds);
+      writeFaceNormal(positions, positionOffset, normals, outputTriangle * 3);
+      const material = uniformMaterial ?? materialRecord(entry.mesh, triangleIndex, stableMaterialId);
+      let materialIndex = materialIndexById.get(material.id);
+      if (materialIndex === undefined) { materialIndex = materialIds.length; materialIndexById.set(material.id, materialIndex); materialIds.push(material.id); }
+      component.representation.flatOrFaceted &&= material.flatShaded || intrinsicallyFaceted(entry.mesh.geometry) || segments.length > 0;
+      component.representation.simplePbr &&= material.simplePbr;
+      component.representation.generatedOrNoTextures &&= material.generatedOrNoTexture;
+      if (!component.representation.colors.includes(material.color)) component.representation.colors.push(material.color);
+      componentIndices[outputTriangle] = componentIndexById.get(entry.owner.id)!;
+      materialIndices[outputTriangle] = materialIndex;
+      colors[outputTriangle] = material.color;
+      roughness[outputTriangle] = material.roughness;
+      component.triangleIndices[component.cursor++] = outputTriangle;
+      outputTriangle += 1;
+    }
+  }
+
+  const components: Record<string, SceneComponent> = {};
+  for (const [id, { cursor: _cursor, ...component }] of componentDrafts) components[id] = { ...component, bounds: finishBounds(component.bounds) };
   for (const [id, object] of semanticOwners) {
     const worldOrigin = object.getWorldPosition(new THREE.Vector3());
     const origin: Point3 = [worldOrigin.x, worldOrigin.y, worldOrigin.z];
@@ -196,18 +240,19 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
       ...(typeof object.userData.semanticRole === "string" ? { role: object.userData.semanticRole } : {}),
       ...(parent ? { parentSemanticId: parent } : {}),
       critical: object.userData.critical === true,
-      triangleIndices: [],
+      triangleIndices: new Uint32Array(0),
       bounds: finishBounds({ min, max, size: [0, 0, 0], center: [0, 0, 0] }),
       origin,
+      representation: { segmentCounts: [], flatOrFaceted: true, simplePbr: true, generatedOrNoTextures: true, colors: [] },
     };
   }
   const forwardAxis = typeof root.userData.forwardAxis === "string" ? root.userData.forwardAxis : undefined;
   return {
-    triangles,
+    triangleData: { positions, normals, componentIndices, materialIndices, colors, roughness, componentIds, materialIds },
     components,
-    meshCount,
-    materialCount: materialIds.size,
-    triangleCount: triangles.length,
+    meshCount: entries.length,
+    materialCount: materialIds.length,
+    triangleCount,
     metadata: { name: root.name, ...(forwardAxis ? { forwardAxis } : {}) },
   };
 }
@@ -224,7 +269,43 @@ export function componentPoints(snapshot: SceneSnapshot, filter?: (component: Sc
       .filter((component) => !filter || filter(component))
       .map((component) => component.id),
   );
-  return snapshot.triangles
-    .filter((triangle) => accepted.has(triangle.componentId))
-    .flatMap((triangle) => triangle.points);
+  const points: Point3[] = [];
+  forEachSceneTriangle(snapshot, (triangle) => { if (accepted.has(triangle.componentId)) points.push(...triangle.points); });
+  return points;
+}
+
+export function sceneTriangleAt(snapshot: SceneSnapshot, index: number): SceneTriangle | undefined {
+  if (!Number.isInteger(index) || index < 0 || index >= snapshot.triangleCount) return undefined;
+  index = snapshot.triangleSelection?.[index] ?? index;
+  const point = (vertex: number): Point3 => {
+    const offset = index * 9 + vertex * 3;
+    return [snapshot.triangleData.positions[offset]!, snapshot.triangleData.positions[offset + 1]!, snapshot.triangleData.positions[offset + 2]!];
+  };
+  const normalOffset = index * 3;
+  return {
+    points: [point(0), point(1), point(2)],
+    normal: [snapshot.triangleData.normals[normalOffset]!, snapshot.triangleData.normals[normalOffset + 1]!, snapshot.triangleData.normals[normalOffset + 2]!],
+    componentId: snapshot.triangleData.componentIds[snapshot.triangleData.componentIndices[index]!]!,
+    materialId: snapshot.triangleData.materialIds[snapshot.triangleData.materialIndices[index]!]!,
+    color: snapshot.triangleData.colors[index]!,
+    roughness: snapshot.triangleData.roughness[index]!,
+  };
+}
+
+export function forEachSceneTriangle(snapshot: SceneSnapshot, visit: (triangle: SceneTriangle, index: number) => void): void {
+  for (let index = 0; index < snapshot.triangleCount; index += 1) visit(sceneTriangleAt(snapshot, index)!, index);
+}
+
+export function selectSnapshotComponents(snapshot: SceneSnapshot, filter: (component: SceneComponent) => boolean): SceneSnapshot {
+  const components = Object.fromEntries(Object.entries(snapshot.components).filter(([, component]) => filter(component)));
+  const oldIndices = Object.values(components).flatMap((component) => Array.from(component.triangleIndices));
+  const remapped = Object.fromEntries(Object.entries(components).map(([id, component]) => [id, { ...component, triangleIndices: new Uint32Array(component.triangleIndices.length) }])) as Record<string, SceneComponent>;
+  const cursors = new Map<string, number>();
+  oldIndices.forEach((oldIndex, newIndex) => {
+    const triangle = sceneTriangleAt(snapshot, oldIndex)!;
+    const cursor = cursors.get(triangle.componentId) ?? 0;
+    remapped[triangle.componentId]!.triangleIndices[cursor] = newIndex;
+    cursors.set(triangle.componentId, cursor + 1);
+  });
+  return { ...snapshot, components: remapped, triangleSelection: Uint32Array.from(oldIndices.map((index) => snapshot.triangleSelection?.[index] ?? index)), triangleCount: oldIndices.length, meshCount: Object.keys(components).length };
 }

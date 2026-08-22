@@ -1,6 +1,6 @@
 import { access, cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   createTaskState,
@@ -80,7 +80,7 @@ describe("self-contained workspace lifecycle", () => {
     expect(index.records).toHaveLength(3);
     for (const record of index.records) {
       expect(record.operationalPath).not.toMatch(/^[A-Za-z]:[\\/]/u);
-      expect(record.originalPath).toMatch(/^[A-Za-z]:[\\/]/u);
+      expect(isAbsolute(record.originalPath)).toBe(true);
       expect(sha256(await readFile(join(root, record.operationalPath)))).toBe(record.sha256);
     }
   });

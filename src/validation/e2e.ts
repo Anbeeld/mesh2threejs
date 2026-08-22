@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { analyticalGeneric, analyticalTank } from "../fixtures/analytical.js";
@@ -41,18 +41,33 @@ async function main(): Promise<void> {
         if (pass === "beauty") { boardPath = join(directory, item.id, "board.png"); await createComparisonBoard(boardPath, oracleFrame, candidateFrame); }
       }
       const turntable = await createTurntable(join(directory, item.id, "turntable"), candidateSnapshot, profile, { frames: 8 });
+      const captures = await Promise.all(capturePaths.map(async (capture) => ({ path: capture.path, sha256: sha256(await readFile(capture.path)), pass: capture.pass, cameraId: "hero" })));
+      const boardHash = sha256(await readFile(boardPath));
+      const turntableFiles = await Promise.all(turntable.map(async (path) => ({ path, sha256: sha256(await readFile(path)), role: "turntable" as const })));
+      const metadataFiles = await Promise.all((["deterministic", "style", "articulation", "region"] as const).map(async (role) => {
+        const path = join(directory, item.id, `${role}.json`);
+        await writeFile(path, `${JSON.stringify({ role, evaluation })}\n`);
+        return { path, sha256: sha256(await readFile(path)), role };
+      }));
+      const byRole = Object.fromEntries(metadataFiles.map((file) => [file.role, file]));
       const packet = createVisualReviewPacket({
         candidateHash: evaluation.candidateHash,
         oracleHash: evaluation.oracleHash,
         profile: item.profile,
         profileContractHash: sha256(item.profile),
-        styleHash: sha256("low-poly-faithful"),
-        deterministicArtifactHash: sha256(JSON.stringify(evaluation)),
-        captures: await Promise.all(capturePaths.map(async (capture) => ({ path: capture.path, sha256: sha256(await readFile(capture.path)), pass: capture.pass, cameraId: "hero" }))),
-        comparisonBoardHashes: [sha256(await readFile(boardPath))],
-        turntableHashes: await Promise.all(turntable.map(async (path) => sha256(await readFile(path)))),
-        articulationArtifactHash: sha256(JSON.stringify(evaluation.articulation)),
-        regionEvidence: { status: "available", semanticArtifactHash: sha256("analytical-semantic-ids") },
+        styleHash: byRole.style!.sha256,
+        deterministicArtifactHash: byRole.deterministic!.sha256,
+        captures,
+        comparisonBoardHashes: [boardHash],
+        turntableHashes: turntableFiles.map((file) => file.sha256),
+        articulationArtifactHash: byRole.articulation!.sha256,
+        regionEvidence: { status: "available", semanticArtifactHash: byRole.region!.sha256 },
+        files: [
+          ...captures.map((capture) => ({ path: capture.path, sha256: capture.sha256, role: "capture" as const })),
+          { path: boardPath, sha256: boardHash, role: "comparison-board" },
+          ...turntableFiles,
+          ...metadataFiles,
+        ],
       });
       const review = awaitingVisualReview(packet);
       process.stdout.write(`${item.id}: deterministic=${evaluation.deterministic.score.toFixed(1)} style=${evaluation.style.score.toFixed(1)} articulation=${evaluation.articulation.score.toFixed(1)} review=${review.status} captures=${capturePaths.length} turntable=${turntable.length}\n`);

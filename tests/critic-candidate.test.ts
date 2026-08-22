@@ -5,12 +5,16 @@ import { describe, expect, test } from "vitest";
 import {
   auditCandidateSource,
   awaitingVisualReview,
+  canonicalJson,
   createDeterministicReplayPacket,
   createVisualReviewPacket,
   loadCandidateModule,
   loadCandidateRuntime,
   fingerprintScene,
   replayDeterministicRows,
+  sha256,
+  verifyVisualReviewPacketFiles,
+  verifyVisualReviewPacket,
 } from "../src/index.js";
 
 describe("canonical procedural candidate", () => {
@@ -58,7 +62,32 @@ describe("deterministic replay and visual authority", () => {
       turntableHashes: [hash],
       articulationArtifactHash: hash,
       regionEvidence: { status: "available", semanticArtifactHash: hash },
+      files: ["capture", "comparison-board", "turntable", "deterministic", "style", "articulation", "region"].map((role) => ({ path: "beauty-front.png", sha256: hash, role })) as never,
     });
     expect(awaitingVisualReview(packet).status).toBe("awaiting-visual-review");
+    expect(() => verifyVisualReviewPacket({ ...packet, schemaVersion: 2 } as unknown as typeof packet)).toThrow(/schema/);
+    const invalid = { ...packet, files: [] };
+    const { packetHash: _oldHash, ...payload } = invalid;
+    invalid.packetHash = sha256(canonicalJson(payload));
+    expect(() => verifyVisualReviewPacket(invalid)).toThrow(/referenced files/);
+  });
+
+  test("reopens every referenced file when validating a review packet", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-review-files-"));
+    const path = join(directory, "capture.png");
+    const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    await writeFile(path, bytes);
+    const hash = sha256(bytes);
+    const packet = createVisualReviewPacket({
+      candidateHash: "candidate-a", oracleHash: "oracle-a", profile: "generic", profileContractHash: hash,
+      styleHash: hash, deterministicArtifactHash: hash,
+      captures: [{ path, sha256: hash, pass: "beauty", cameraId: "front" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash,
+      regionEvidence: { status: "available", semanticArtifactHash: hash },
+      files: ["capture", "comparison-board", "turntable", "deterministic", "style", "articulation", "region"].map((role) => ({ path, sha256: hash, role })) as never,
+    });
+    await expect(verifyVisualReviewPacketFiles(packet)).resolves.toBeUndefined();
+    await expect(verifyVisualReviewPacketFiles(packet, join(directory, "workspace"))).rejects.toThrow(/escapes/);
+    await writeFile(path, Buffer.from("changed"));
+    await expect(verifyVisualReviewPacketFiles(packet)).rejects.toThrow(/changed|incorrect/);
   });
 });

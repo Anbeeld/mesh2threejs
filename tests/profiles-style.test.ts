@@ -57,6 +57,19 @@ describe("sibling subject profiles", () => {
     expect(() => evaluateTankProfile(snapshotScene(createTankFixture()), snapshotScene(createTankFixture()), {
       certification: "exact-real",
     })).toThrow(/authoritative dimensions/);
+    expect(() => evaluateTankProfile(snapshotScene(createTankFixture()), snapshotScene(createTankFixture()), {
+      certification: "exact-real",
+      authoritativeDimensions: { hullLength: 6 } as never,
+    })).toThrow(/hullLength.*overallLength.*width.*height/);
+  });
+
+  test("exact-real generic evaluation consumes admitted dimensions", () => {
+    const oracle = snapshotScene(createGenericFixture());
+    expect(() => evaluateGenericProfile(oracle, oracle, {}, { certification: "exact-real" })).toThrow(/authoritative/);
+    expect(() => evaluateGenericProfile(oracle, oracle, {}, { certification: "exact-real", authoritativeDimensions: { width: 4 } as never })).toThrow(/width.*height.*depth/);
+    const bounds = { width: 5.5, height: 3, depth: 3 };
+    const report = evaluateGenericProfile(oracle, snapshotScene(createGenericFixture({ depth: 1 })), {}, { certification: "exact-real", authoritativeDimensions: bounds });
+    expect(report.rows.find((row) => row.code === "dimensions.depth")).toMatchObject({ oracleValue: 3, passed: false });
   });
 
   test("accepts an identical articulated tank as physically seated", () => {
@@ -83,6 +96,22 @@ describe("sibling subject profiles", () => {
     const report = evaluateGenericProfile(snapshotScene(createGenericFixture()), snapshotScene(candidate));
     expect(report.rows.find((row) => row.code === "semantic.attachment")?.passed).toBe(false);
   });
+
+  test("uses declared directional landmarks and does not reject open planar references", () => {
+    const planar = new THREE.Group();
+    planar.add(semanticMesh("sheet", new THREE.PlaneGeometry(2, 3)));
+    const planarReport = evaluateGenericProfile(snapshotScene(planar), snapshotScene(planar.clone(true)), { requiredSemantics: ["sheet"] });
+    expect(planarReport.rows.find((row) => row.code === "orientation.physical")?.passed).toBe(true);
+    expect(planarReport.rows.filter((row) => row.code.startsWith("silhouette.")).every((row) => row.passed)).toBe(true);
+
+    const oracle = createGenericFixture();
+    const reversed = createGenericFixture();
+    reversed.getObjectByName("attachment")!.position.x *= -1;
+    const report = evaluateGenericProfile(snapshotScene(oracle), snapshotScene(reversed), {
+      orientation: { kind: "landmark-direction", from: "primary", to: "attachment", toleranceDegrees: 5 },
+    });
+    expect(report.rows.find((row) => row.code === "orientation.physical")?.passed).toBe(false);
+  });
 });
 
 describe("low-poly-faithful anti-gaming gate", () => {
@@ -102,6 +131,9 @@ describe("low-poly-faithful anti-gaming gate", () => {
     expect(evaluateLowPolyStyle(snapshotScene(oracle), snapshotScene(coarse), lowPolyFaithful).passed).toBe(true);
     expect(evaluateLowPolyStyle(snapshotScene(oracle), snapshotScene(wrongRadius), lowPolyFaithful).passed).toBe(false);
     expect(evaluateLowPolyStyle(snapshotScene(oracle), snapshotScene(shifted), lowPolyFaithful).passed).toBe(false);
+    const oversmoothed = new THREE.Group();
+    oversmoothed.add(semanticMesh("wheel", new THREE.CylinderGeometry(1, 1, 0.4, 32)));
+    expect(evaluateLowPolyStyle(snapshotScene(oracle), snapshotScene(oversmoothed), lowPolyFaithful).rows.find((row) => row.code === "style.segments.wheel")?.passed).toBe(false);
   });
 
   test("does not let a lower triangle budget relax macro geometry", () => {
@@ -111,6 +143,12 @@ describe("low-poly-faithful anti-gaming gate", () => {
     const report = evaluateLowPolyStyle(oracle, wrong, contract);
     expect(report.passed).toBe(false);
     expect(report.rows.some((row) => row.code.includes("envelope"))).toBe(true);
+  });
+
+  test("recognizes the kit track course as explicitly faceted geometry", () => {
+    const snapshot = snapshotScene(createTankFixture());
+    expect(snapshot.components["track-1"]?.representation.flatOrFaceted).toBe(true);
+    expect(evaluateLowPolyStyle(snapshot, snapshot, lowPolyFaithful).passed).toBe(true);
   });
 
   test("allows a faithful faceted turret but rejects its wrong footprint", () => {

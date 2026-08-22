@@ -4,8 +4,10 @@ import { join } from "node:path";
 import * as THREE from "three";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
+  canonicalJson,
   createDeterministicReplayPacket,
   createEvidenceArtifact,
+  createWorkflowGateEvidenceArtifact,
   createFitting,
   createFrustum,
   createLoftGeometry,
@@ -30,6 +32,7 @@ import {
   repeatParts,
   runCli,
   snapshotScene,
+  sha256,
 } from "../src/index.js";
 import { createGenericFixture, createTankFixture } from "./helpers/scenes.js";
 
@@ -47,7 +50,7 @@ describe("extended durable CLI", () => {
     expect(await runCli(["bind-oracle", root, "--hash", "oracle"], io().sink)).toBe(0);
     expect(await runCli(["bind-candidate", root, "--hash", "candidate"], io().sink)).toBe(0);
     let state = await loadTaskState(statePath);
-    const registration = createEvidenceArtifact({ id: "registration", kind: "registration", phase: "oracle-registration", oracleHash: "oracle", candidateHash: null, profileContractHash: state.profileContractHash, configHash: "config", result: { passed: true, summary: "registered" } });
+    const registration = createWorkflowGateEvidenceArtifact({ id: "registration", kind: "registration", phase: "oracle-registration", oracleHash: "oracle", candidateHash: null, profileContractHash: state.profileContractHash, configHash: "config", gateCode: "registration.complete", passed: true, summary: "registered" });
     const artifactPath = join(root, ".mesh2threejs", "evidence", "registration.json");
     await mkdir(join(root, ".mesh2threejs", "evidence"), { recursive: true });
     await writeFile(artifactPath, `${JSON.stringify(registration)}\n`);
@@ -76,8 +79,10 @@ describe("extended durable CLI", () => {
     await runCli(["bind-oracle", root, "--hash", "oracle"], io().sink);
     await runCli(["bind-candidate", root, "--hash", "candidate"], io().sink);
     const state = await loadTaskState(statePath);
-    const hash = "a".repeat(64);
-    const config = { oracleHash: "oracle", candidateHash: "candidate", profile: "generic" as const, profileContractHash: state.profileContractHash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "beauty.png", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "available" as const, semanticArtifactHash: hash } };
+    const imageBytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    await writeFile(join(root, "beauty.png"), imageBytes);
+    const hash = sha256(imageBytes);
+    const config = { oracleHash: "oracle", candidateHash: "candidate", profile: "generic" as const, profileContractHash: state.profileContractHash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "beauty.png", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "available" as const, semanticArtifactHash: hash }, files: ["capture", "comparison-board", "turntable", "deterministic", "style", "articulation", "region"].map((role) => ({ path: "beauty.png", sha256: hash, role })) as never };
     const configPath = join(root, "review-config.json"); const packetPath = join(root, "review-packet.json");
     await writeFile(configPath, JSON.stringify(config));
     expect(await runCli(["prepare-review", configPath, "--out", packetPath], io().sink)).toBe(0);
@@ -88,6 +93,15 @@ describe("extended durable CLI", () => {
     const verdictPath = join(root, "verdict.json"); await writeFile(verdictPath, JSON.stringify(verdict));
     expect(await runCli(["record-review", statePath, "--packet", packetPath, "--verdict", verdictPath, "--artifact", join(root, "evidence", "visual.json")], io().sink)).toBe(0);
     expect((await loadTaskState(statePath)).visualReviewStatus).toBe("passed");
+  });
+
+  test("does not reinterpret an invalid workspace as a low-level input file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mesh2threejs-invalid-workspace-"));
+    await runCli(["init", "--workspace", root, "--id", "invalid", "--goal", "fixture", "--profile", "generic"], io().sink);
+    await writeFile(join(root, "project.json"), "{}\n");
+    const result = io();
+    expect(await runCli(["prepare-review", root], result.sink)).toBe(2);
+    expect(result.output.join("\n")).toMatch(/project\.json schema is invalid/);
   });
 });
 
@@ -131,8 +145,32 @@ describe("activated generic operators and construction kit", () => {
     const root = createTankFixture();
     const turret = root.getObjectByName("turret-pivot")!;
     const gun = root.getObjectByName("gun-pivot")!;
-    const result = await evaluateCandidateWithPoses({ oracle: createTankFixture(), candidate: { root, setPose: ({ turretYaw, gunElevation }) => { turret.rotation.y = turretYaw; gun.rotation.x = gunElevation; root.updateMatrixWorld(true); } }, profile: "tank" });
+    const result = await evaluateCandidateWithPoses({ oracle: createTankFixture(), candidate: { root, setPose: (pose) => { turret.rotation.y = pose.turretYaw ?? 0; gun.rotation.x = pose.gunElevation ?? 0; root.updateMatrixWorld(true); } }, profile: "tank" });
     expect(result.articulation.passed).toBe(true);
+    expect(result.articulation.rows.some((row) => row.code.includes("turretYaw"))).toBe(true);
+  });
+
+  test("executes generic articulation declared by the subject contract", async () => {
+    const root = createGenericFixture();
+    const attachment = root.getObjectByName("attachment")!;
+    const result = await evaluateCandidateWithPoses({
+      oracle: createGenericFixture(),
+      candidate: { root, setPose: (pose) => { attachment.rotation.y = pose.lidAngle ?? 0; root.updateMatrixWorld(true); } },
+      profile: "generic",
+      subjectContract: { articulation: [{ control: "lidAngle", moving: ["attachment"], stationary: ["primary"], samples: [-0.5, 0.5] }] },
+    });
+    expect(result.articulation.passed).toBe(true);
+    expect(result.articulation.rows).toHaveLength(2);
+    expect(result.phaseGates.attachments?.passed).toBe(true);
+
+    const failed = await evaluateCandidateWithPoses({
+      oracle: createGenericFixture(),
+      candidate: { root: createGenericFixture(), setPose: () => undefined },
+      profile: "generic",
+      subjectContract: { articulation: [{ control: "lidAngle", moving: ["attachment"], stationary: ["primary"], samples: [-0.5, 0.5] }] },
+    });
+    expect(failed.articulation.passed).toBe(false);
+    expect(failed.phaseGates.attachments?.passed).toBe(false);
   });
 });
 
@@ -163,12 +201,17 @@ describe("fail-closed validation branches", () => {
     expect(createDerivativeCacheEntry({ sourceHash: "s", preparedHash: "p", profileContractHash: "c", measurementVersion: "v", cameraFrameHash: "f", renderConfigHash: "r" }, 1).value).toBe(1);
     expect(validateProfileContract(null).valid).toBe(false);
     expect(validateProfileContract({ schemaVersion: 1, id: "bad", phases: [], gates: [], operators: [] }).errors.length).toBeGreaterThan(2);
-    expect(() => createVisualReviewPacket({ oracleHash: "o", candidateHash: "c", profile: "generic", profileContractHash: "h", styleHash: "h", deterministicArtifactHash: "h", captures: [], comparisonBoardHashes: [], turntableHashes: [], articulationArtifactHash: "h", regionEvidence: { status: "unavailable", reason: "semantic IDs invalid" } })).toThrow(/requires/);
+    expect(() => createVisualReviewPacket({ oracleHash: "o", candidateHash: "c", profile: "generic", profileContractHash: "h", styleHash: "h", deterministicArtifactHash: "h", captures: [], comparisonBoardHashes: [], turntableHashes: [], articulationArtifactHash: "h", regionEvidence: { status: "unavailable", reason: "semantic IDs invalid" }, files: [] })).toThrow(/requires/);
     expect(() => createVisualReviewVerdict({ packetHash: "x", reviewer: { kind: "external-vision", id: "" }, verdict: "PASS", findings: [] })).toThrow(/identity/);
     expect(() => createVisualReviewVerdict({ packetHash: "x", reviewer: { kind: "external-vision", id: "reviewer" }, verdict: "PASS", findings: [{ criterion: "x", evidence: "x", severity: "major", regionView: "hero", expectedCorrection: "fix", reopenPhase: "primary-mass" }] })).toThrow(/contradicts/);
     const hash = "a".repeat(64);
-    const packet = createVisualReviewPacket({ oracleHash: "o", candidateHash: "c", profile: "generic", profileContractHash: hash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "x", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "unavailable", reason: "semantic IDs invalid" } });
+    const packet = createVisualReviewPacket({ oracleHash: "o", candidateHash: "c", profile: "generic", profileContractHash: hash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "x", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "unavailable", reason: "semantic IDs invalid" }, files: ["capture", "comparison-board", "turntable", "deterministic", "style", "articulation"].map((role) => ({ path: "x", sha256: hash, role })) as never });
     const verdict = createVisualReviewVerdict({ packetHash: "stale", reviewer: { kind: "external-vision", id: "reviewer" }, verdict: "PASS", findings: [] });
     expect(() => verifyVisualReviewVerdict(packet, verdict)).toThrow(/stale/);
+    const contradictory = createVisualReviewVerdict({ packetHash: packet.packetHash, reviewer: { kind: "external-vision", id: "reviewer" }, verdict: "PASS", findings: [] });
+    contradictory.findings.push({ criterion: "shape", evidence: "board", severity: "major", regionView: "hero", expectedCorrection: "repair", reopenPhase: "primary-mass" });
+    const { verdictHash: _oldVerdictHash, ...verdictPayload } = contradictory;
+    contradictory.verdictHash = sha256(canonicalJson(verdictPayload));
+    expect(() => verifyVisualReviewVerdict(packet, contradictory)).toThrow(/contradicts/);
   });
 });

@@ -1,10 +1,20 @@
 import * as THREE from "three";
-import type { CaptureCamera, CaptureFrame, CapturePass, RenderProfile } from "../types.js";
+import type { CaptureCamera, CaptureFrame, CapturePass, RenderProfile, SceneSnapshot } from "../types.js";
 import { canonicalJson, sha256 } from "./hashing.js";
+import { rasterizeCapture } from "./render.js";
 
 export interface ThreeRenderSurface {
   canvas: HTMLCanvasElement | OffscreenCanvas;
   context?: WebGL2RenderingContext;
+}
+
+export type RenderBackend = "auto" | "deterministic-cpu" | "three-webgl";
+
+export function renderCapture(input: { root: THREE.Object3D; snapshot: SceneSnapshot; profile: RenderProfile; camera: CaptureCamera; pass: CapturePass; backend?: RenderBackend; surface?: ThreeRenderSurface }): { frame: CaptureFrame; backend: Exclude<RenderBackend, "auto"> } {
+  const backend = input.backend ?? "auto";
+  if (backend === "three-webgl" && !input.surface) throw new Error("three-webgl rendering requires a caller-provided browser or headless WebGL surface");
+  if (input.surface && backend !== "deterministic-cpu") return { frame: renderWithThreeWebGL(input.root, input.profile, input.camera, input.pass, input.surface), backend: "three-webgl" };
+  return { frame: rasterizeCapture(input.snapshot, input.profile, input.camera, input.pass), backend: "deterministic-cpu" };
 }
 
 function makeCamera(profile: RenderProfile, capture: CaptureCamera): THREE.Camera {
