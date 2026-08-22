@@ -1,0 +1,4 @@
+interface:
+  display_name: "Onboard Oracle"
+  short_description: "Admit and register a source GLB oracle"
+  default_prompt: "Use $onboard-oracle to probe, admit, and register this source GLB."

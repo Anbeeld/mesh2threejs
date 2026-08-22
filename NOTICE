@@ -1,0 +1,19 @@
+mesh2threejs
+Copyright (c) 2026 Anbeeld
+
+This project includes adaptations informed by:
+
+Claude-of-Tanks, commit f389f13f829451d64cf780c5f14473527b45f7f4
+Copyright (c) 2026 Kevin B. Liu
+Licensed under the MIT License.
+
+img2threejs, commit d6673386f89673a58736f8d398dd16ece67874f5
+Licensed under the Apache License, Version 2.0.
+
+PROMPTING.md, commit ea8c5e7e22134ac57984d67a2cdc7c29c7c4ba90
+Copyright (c) 2026 Anbeeld
+Licensed under the MIT License.
+
+The source and license map in docs/upstream-map.md identifies the adapted
+concepts and implementation locations. Third-party oracle assets are not
+included and retain their own licenses.

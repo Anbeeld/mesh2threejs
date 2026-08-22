@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mesh to Three.js"
+  short_description: "Reconstruct GLB oracles as procedural Three.js"
+  default_prompt: "Use $mesh2threejs to reconstruct this live GLB oracle with durable evidence."

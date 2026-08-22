@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repair Prepared Oracle"
+  short_description: "Repair only proven prepared-oracle defects"
+  default_prompt: "Use $repair-oracle to correct a proven prepared-oracle defect with lineage."

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mesh2threejs.local/schemas/style-contract.v1.json",
+  "type": "object",
+  "required": ["schemaVersion", "id", "preserve", "simplify", "omit", "complexity", "appearance", "macroRelativeTolerance", "centerRelativeTolerance"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "const": "low-poly-faithful" },
+    "preserve": { "type": "object", "required": ["macroGeometry", "orientation", "articulation", "repeatedCounts"], "properties": { "macroGeometry": { "const": true }, "orientation": { "const": true }, "articulation": { "const": true }, "repeatedCounts": { "const": true } }, "additionalProperties": false },
+    "simplify": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "omit": { "type": "array", "items": { "type": "string" } },
+    "complexity": { "type": "object", "required": ["triangleTarget", "triangleMax", "meshTarget", "meshMax", "materialTarget", "materialMax", "segmentRange"], "properties": { "triangleTarget": {"type":"integer","minimum":1}, "triangleMax": {"type":"integer","minimum":1}, "meshTarget": {"type":"integer","minimum":1}, "meshMax": {"type":"integer","minimum":1}, "materialTarget": {"type":"integer","minimum":1}, "materialMax": {"type":"integer","minimum":1}, "segmentRange": {"type":"array","prefixItems":[{"type":"integer","minimum":3},{"type":"integer","minimum":3}],"minItems":2,"maxItems":2} }, "additionalProperties": false },
+    "appearance": { "type": "object", "required": ["shading", "materialVocabulary", "texturePolicy", "palette"], "properties": { "shading": { "const": "flat-or-faceted" }, "materialVocabulary": { "const": "simple-pbr" }, "texturePolicy": { "const": "none-or-generated" }, "palette": { "const": "subject-derived" } }, "additionalProperties": false },
+    "macroRelativeTolerance": { "type": "number", "minimum": 0, "maximum": 0.02 },
+    "centerRelativeTolerance": { "type": "number", "minimum": 0, "maximum": 0.02 }
+  },
+  "additionalProperties": false
+}

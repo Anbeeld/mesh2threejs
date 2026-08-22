@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mesh2threejs.local/schemas/render-profile.v1.json",
+  "type": "object",
+  "required": ["schemaVersion", "renderer", "background", "environment", "camera", "passes"],
+  "properties": {
+    "schemaVersion": { "const": "render-profile.v1" },
+    "renderer": { "type": "object" },
+    "background": { "type": "array", "minItems": 4, "maxItems": 4 },
+    "environment": { "type": "object" },
+    "camera": { "type": "object" },
+    "passes": { "type": "array", "uniqueItems": true, "minItems": 6, "items": { "enum": ["beauty", "alpha-silhouette", "semantic-id", "depth", "normal", "roughness-material-id"] } }
+  },
+  "additionalProperties": false
+}

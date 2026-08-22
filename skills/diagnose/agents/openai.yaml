@@ -1,0 +1,4 @@
+interface:
+  display_name: "Diagnose Stagnation"
+  short_description: "Diagnose stalled reconstruction evidence"
+  default_prompt: "Use $diagnose to identify the root cause of reconstruction stagnation."

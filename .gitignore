@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+*.tgz
+.mesh2threejs/
+workspaces/*/evidence/
+workspaces/*/state.json
+workspaces/*/oracle/source.*
+workspaces/*/oracle/prepared.*

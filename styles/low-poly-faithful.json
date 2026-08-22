@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "low-poly-faithful",
+  "preserve": { "macroGeometry": true, "orientation": true, "articulation": true, "repeatedCounts": true },
+  "simplify": ["curvature tessellation", "track links", "small mechanical substructure", "surface microdetail"],
+  "omit": ["micro fasteners", "sub-pixel seams", "non-critical hidden mechanisms"],
+  "complexity": { "triangleTarget": 25000, "triangleMax": 75000, "meshTarget": 160, "meshMax": 500, "materialTarget": 12, "materialMax": 32, "segmentRange": [6, 16] },
+  "appearance": { "shading": "flat-or-faceted", "materialVocabulary": "simple-pbr", "texturePolicy": "none-or-generated", "palette": "subject-derived" },
+  "macroRelativeTolerance": 0.01,
+  "centerRelativeTolerance": 0.01
+}

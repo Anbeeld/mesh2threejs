@@ -1,0 +1,1 @@
+{"schemaVersion":1,"profile":"generic","required":["dimensions.width","dimensions.height","dimensions.depth","orientation.forward","silhouette.side","silhouette.front","silhouette.plan","attachment.contiguity","critical-feature.*"],"passFloor":90}

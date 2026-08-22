@@ -1,0 +1,121 @@
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, test } from "vitest";
+import * as THREE from "three";
+import { loadPreparedOracle, onboardOracle, probeGlb, repairPreparedOracle, verifyOracleRegistration } from "../src/index.js";
+
+function minimalGlb(options: { multipart?: boolean; translated?: boolean } = {}): Buffer {
+  const positions = new Float32Array([
+    -1, -1, -1, 1, -1, -1, 1, 1, -1,
+    -1, -1, -1, 1, 1, -1, -1, 1, -1,
+  ]);
+  const bin = Buffer.from(positions.buffer);
+  const mesh = { primitives: [{ attributes: { POSITION: 0 } }], name: "body" };
+  const nodes = options.multipart
+    ? [{ mesh: 0, name: "hull" }, { mesh: 0, name: "turret", translation: [0, 2, 0] }]
+    : [{ mesh: 0, name: "Object_0", ...(options.translated ? { translation: [3, 0, 0] } : {}) }];
+  const json = {
+    asset: { version: "2.0", generator: "mesh2threejs-test" },
+    buffers: [{ byteLength: bin.length }],
+    bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: bin.length }],
+    accessors: [{ bufferView: 0, componentType: 5126, count: 6, type: "VEC3", min: [-1, -1, -1], max: [1, 1, -1] }],
+    meshes: [mesh],
+    nodes,
+    scenes: [{ nodes: nodes.map((_, index) => index) }],
+    scene: 0,
+  };
+  let jsonBytes = Buffer.from(JSON.stringify(json));
+  jsonBytes = Buffer.concat([jsonBytes, Buffer.alloc((4 - (jsonBytes.length % 4)) % 4, 0x20)]);
+  const binBytes = Buffer.concat([bin, Buffer.alloc((4 - (bin.length % 4)) % 4)]);
+  const total = 12 + 8 + jsonBytes.length + 8 + binBytes.length;
+  const output = Buffer.alloc(total);
+  output.write("glTF", 0);
+  output.writeUInt32LE(2, 4);
+  output.writeUInt32LE(total, 8);
+  output.writeUInt32LE(jsonBytes.length, 12);
+  output.writeUInt32LE(0x4e4f534a, 16);
+  jsonBytes.copy(output, 20);
+  const binHeader = 20 + jsonBytes.length;
+  output.writeUInt32LE(binBytes.length, binHeader);
+  output.writeUInt32LE(0x004e4942, binHeader + 4);
+  binBytes.copy(output, binHeader + 8);
+  return output;
+}
+
+describe("source and prepared oracle lifecycle", () => {
+  test("probes GLB inventory, bounds, provenance, and conservative semantics", () => {
+    const fused = probeGlb(minimalGlb());
+    const multipart = probeGlb(minimalGlb({ multipart: true }));
+    expect(fused.scene.meshCount).toBe(1);
+    expect(fused.bounds?.size).toEqual([2, 2, 0]);
+    expect(fused.semanticReadiness).toBe("insufficient");
+    expect(multipart.semanticReadiness).toBe("partial");
+    expect(fused.sha256).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  test("rejects malformed GLB rather than guessing", () => {
+    expect(() => probeGlb(Buffer.from("not glb"))).toThrow(/GLB/);
+  });
+
+  test("records immutable lineage and applies a reproducible preparation recipe", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-oracle-"));
+    const source = join(directory, "source.glb");
+    const prepared = join(directory, "prepared.json");
+    await writeFile(source, minimalGlb({ translated: true }));
+    const manifest = await onboardOracle({
+      id: "fixture",
+      sourcePath: source,
+      preparedPath: prepared,
+      source: "self-authored analytical fixture",
+      author: "mesh2threejs",
+      license: "MIT",
+      redistribution: "allowed",
+      coordinateFrame: "right-handed",
+      upAxis: "+y",
+      forwardAxis: "+z",
+      grounding: "min-y=0",
+      scale: 2,
+      semanticMap: { Object_0: "primary" },
+      articulationMap: {},
+      normalization: { translation: [-3, 1, 0], rotationEuler: [0, 0, 0], scale: 2 },
+      authoritativeDimensions: null,
+      dimensionSources: [],
+    });
+    expect(manifest.sourceHash).not.toBe(manifest.preparedHash);
+    expect(JSON.parse(await readFile(prepared, "utf8")).parentSourceHash).toBe(manifest.sourceHash);
+    const scene = await loadPreparedOracle(manifest);
+    const mesh = scene.getObjectByName("Object_0");
+    expect(mesh?.userData.semanticId).toBe("primary");
+    expect(mesh?.getWorldPosition(new THREE.Vector3()).x).toBeCloseTo(0);
+
+    const registration = verifyOracleRegistration(scene, {
+      forwardAxis: "+z",
+      upAxis: "+y",
+      expectedScale: 2,
+      groundY: 0,
+      requiredSemantics: ["primary"],
+      requiredPivots: [],
+      tolerance: 1e-6,
+    });
+    expect(registration.passed).toBe(true);
+
+    const repairedPath = join(directory, "prepared-repaired.json");
+    const repaired = await repairPreparedOracle(manifest, {
+      reason: "admit an articulation pivot after inspection",
+      preparedPath: repairedPath,
+      articulationMap: { primary: "primary-pivot" },
+    });
+    expect(repaired.sourceHash).toBe(manifest.sourceHash);
+    expect(repaired.preparedHash).not.toBe(manifest.preparedHash);
+    expect(repaired.repairHistory).toHaveLength(1);
+    expect(JSON.parse(await readFile(repairedPath, "utf8")).parentSourceHash).toBe(manifest.sourceHash);
+    const repairedScene = await loadPreparedOracle(repaired);
+    expect(repairedScene.getObjectByName("Object_0")?.userData.articulationPivot).toBe("primary-pivot");
+    const repairedRegistration = verifyOracleRegistration(repairedScene, {
+      forwardAxis: "+z", upAxis: "+y", expectedScale: 2, groundY: 0,
+      requiredSemantics: ["primary"], requiredPivots: ["primary-pivot"], tolerance: 1e-6,
+    });
+    expect(repairedRegistration.rows.filter((row) => !row.passed)).toEqual([]);
+  });
+});

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Critic Review"
+  short_description: "Independently grade hash-bound evidence"
+  default_prompt: "Use $critic to review this hash-bound evidence packet without editing the candidate."

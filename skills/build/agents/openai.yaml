@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Procedural Candidate"
+  short_description: "Build or repair native procedural Three.js"
+  default_prompt: "Use $build to implement the next evidence-driven procedural candidate repair."

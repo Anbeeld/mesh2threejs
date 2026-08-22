@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reconstruct from Live Oracle"
+  short_description: "Route and resume a reconstruction task"
+  default_prompt: "Use $reconstruct to route and resume this live-oracle reconstruction."

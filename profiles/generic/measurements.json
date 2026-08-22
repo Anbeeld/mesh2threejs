@@ -1,0 +1,1 @@
+{"schemaVersion":1,"views":["side","front","plan"],"operators":["bounds","orthographic-mask","silhouette-curves","sections-x-y-z","landmarks","connectivity","articulation"]}

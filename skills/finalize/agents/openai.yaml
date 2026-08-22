@@ -1,0 +1,4 @@
+interface:
+  display_name: "Finalize Reconstruction"
+  short_description: "Certify complete hash-bound reconstruction"
+  default_prompt: "Use $finalize to verify all evidence and produce the final handoff."
