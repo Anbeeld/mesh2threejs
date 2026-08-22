@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mesh2threejs.local/schemas/reference-index.v1.json",
+  "type": "object",
+  "required": ["schemaVersion", "records"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "mode", "operationalPath", "originalPath", "sha256"],
+        "properties": {
+          "kind": { "enum": ["oracle", "image", "document"] },
+          "mode": { "enum": ["copy", "external"] },
+          "operationalPath": { "type": "string", "minLength": 1 },
+          "originalPath": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

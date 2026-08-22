@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import * as THREE from "three";
 import { canonicalJson, sha256 } from "./hashing.js";
 import type { Bounds3, Point3 } from "../types.js";
@@ -337,6 +337,9 @@ export interface OracleManifest {
   sourceHash: string;
   preparedPath: string;
   preparedHash: string;
+  sourceOriginalPath: string;
+  referenceMode: "copy" | "external";
+  portable: boolean;
   source: string;
   author: string;
   license: string;
@@ -356,8 +359,11 @@ export interface OracleManifest {
   repairHistory: Array<{ reason: string; recipeHash: string }>;
 }
 
-export interface OnboardOracleInput extends Omit<OracleManifest, "schemaVersion" | "sourceHash" | "preparedHash" | "semanticStatus" | "provenanceConfidence" | "repairHistory"> {
+export interface OnboardOracleInput extends Omit<OracleManifest, "schemaVersion" | "sourceHash" | "preparedHash" | "sourceOriginalPath" | "referenceMode" | "portable" | "semanticStatus" | "provenanceConfidence" | "repairHistory"> {
   provenanceConfidence?: "high" | "medium" | "low";
+  workspaceRoot?: string;
+  sourceOriginalPath?: string;
+  referenceMode?: "copy" | "external";
 }
 
 interface PreparedRecipe {
@@ -372,10 +378,29 @@ interface PreparedRecipe {
   preparedHash?: string;
 }
 
+function workspaceFile(path: string, workspaceRoot: string | undefined, label: string): string {
+  if (isAbsolute(path)) return resolve(path);
+  if (!workspaceRoot) throw new Error(`${label} is workspace-relative but no workspace root was provided`);
+  const root = resolve(workspaceRoot);
+  const target = resolve(root, path);
+  const relation = relative(root, target);
+  if (relation === ".." || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(relation)) throw new Error(`${label} escapes workspace root`);
+  return target;
+}
+
+function storedPath(path: string, workspaceRoot: string | undefined): string {
+  return workspaceRoot && !isAbsolute(path) ? path.replaceAll("\\", "/") : resolve(path);
+}
+
 export async function onboardOracle(input: OnboardOracleInput): Promise<OracleManifest> {
-  const sourcePath = resolve(input.sourcePath);
-  const preparedPath = resolve(input.preparedPath);
-  const bytes = await readFile(sourcePath);
+  const referenceMode = input.referenceMode ?? (isAbsolute(input.sourcePath) ? "external" : "copy");
+  if (referenceMode === "copy" && isAbsolute(input.sourcePath)) throw new Error("copy-mode oracle sourcePath must be workspace-relative");
+  if (referenceMode === "external" && !isAbsolute(input.sourcePath)) throw new Error("external oracle sourcePath must be absolute");
+  const sourceFile = workspaceFile(input.sourcePath, input.workspaceRoot, "oracle sourcePath");
+  const preparedFile = workspaceFile(input.preparedPath, input.workspaceRoot, "preparedPath");
+  const sourcePath = storedPath(input.sourcePath, input.workspaceRoot);
+  const preparedPath = storedPath(input.preparedPath, input.workspaceRoot);
+  const bytes = await readFile(sourceFile);
   const probe = probeGlb(bytes);
   const sourceHash = sha256(bytes);
   const baseRecipe: PreparedRecipe = {
@@ -388,8 +413,8 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     normalization: input.normalization,
   };
   const preparedHash = sha256(canonicalJson(baseRecipe));
-  await mkdir(dirname(preparedPath), { recursive: true });
-  await writeFile(preparedPath, `${JSON.stringify({ ...baseRecipe, preparedHash }, null, 2)}\n`, { flag: "wx" });
+  await mkdir(dirname(preparedFile), { recursive: true });
+  await writeFile(preparedFile, `${JSON.stringify({ ...baseRecipe, preparedHash }, null, 2)}\n`, { flag: "wx" });
   return {
     schemaVersion: 1,
     id: input.id,
@@ -397,6 +422,9 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     sourceHash,
     preparedPath,
     preparedHash,
+    sourceOriginalPath: input.sourceOriginalPath ? resolve(input.sourceOriginalPath) : sourceFile,
+    referenceMode,
+    portable: referenceMode === "copy",
     source: input.source,
     author: input.author,
     license: input.license,
@@ -417,14 +445,14 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
   };
 }
 
-export async function loadPreparedOracle(manifest: OracleManifest): Promise<THREE.Group> {
-  const recipeValue: unknown = JSON.parse(await readFile(manifest.preparedPath, "utf8"));
+export async function loadPreparedOracle(manifest: OracleManifest, workspaceRoot?: string): Promise<THREE.Group> {
+  const recipeValue: unknown = JSON.parse(await readFile(workspaceFile(manifest.preparedPath, workspaceRoot, "preparedPath"), "utf8"));
   const recipe = asObject(recipeValue, "prepared oracle recipe") as unknown as PreparedRecipe;
   const { preparedHash: ignored, ...baseRecipe } = recipe;
-  if (recipe.parentSourceHash !== manifest.sourceHash || sha256(canonicalJson(baseRecipe)) !== manifest.preparedHash || ignored !== manifest.preparedHash) {
+  if (recipe.parentSourceHash !== manifest.sourceHash || recipe.sourcePath !== manifest.sourcePath || sha256(canonicalJson(baseRecipe)) !== manifest.preparedHash || ignored !== manifest.preparedHash) {
     throw new Error("prepared oracle lineage/hash mismatch");
   }
-  const sourceBytes = await readFile(manifest.sourcePath);
+  const sourceBytes = await readFile(workspaceFile(manifest.sourcePath, workspaceRoot, "oracle sourcePath"));
   if (sha256(sourceBytes) !== manifest.sourceHash) throw new Error("immutable source oracle bytes changed");
   const source = loadGlbScene(sourceBytes);
   const nameCounts = new Map<string, number>();
@@ -460,11 +488,12 @@ export interface RepairPreparedOracleInput {
   normalization?: { translation: Point3; rotationEuler: Point3; scale: number };
 }
 
-export async function repairPreparedOracle(manifest: OracleManifest, input: RepairPreparedOracleInput): Promise<OracleManifest> {
+export async function repairPreparedOracle(manifest: OracleManifest, input: RepairPreparedOracleInput, workspaceRoot?: string): Promise<OracleManifest> {
   if (!input.reason.trim()) throw new Error("oracle repair requires a reason");
-  const sourceBytes = await readFile(manifest.sourcePath);
+  const sourceBytes = await readFile(workspaceFile(manifest.sourcePath, workspaceRoot, "oracle sourcePath"));
   if (sha256(sourceBytes) !== manifest.sourceHash) throw new Error("immutable source oracle bytes changed");
-  const preparedPath = resolve(input.preparedPath);
+  const preparedFile = workspaceFile(input.preparedPath, workspaceRoot, "preparedPath");
+  const preparedPath = storedPath(input.preparedPath, workspaceRoot);
   const baseRecipe: Omit<PreparedRecipe, "preparedHash"> = {
     schemaVersion: 1,
     kind: "prepared-oracle-recipe",
@@ -476,8 +505,8 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     repair: { parentPreparedHash: manifest.preparedHash, reason: input.reason.trim() },
   };
   const preparedHash = sha256(canonicalJson(baseRecipe));
-  await mkdir(dirname(preparedPath), { recursive: true });
-  await writeFile(preparedPath, `${JSON.stringify({ ...baseRecipe, preparedHash }, null, 2)}\n`, { flag: "wx" });
+  await mkdir(dirname(preparedFile), { recursive: true });
+  await writeFile(preparedFile, `${JSON.stringify({ ...baseRecipe, preparedHash }, null, 2)}\n`, { flag: "wx" });
   return {
     ...manifest,
     preparedPath,

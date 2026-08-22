@@ -1,55 +1,45 @@
 # mesh2threejs
 
-`mesh2threejs` helps a coding agent recreate a reference GLB as editable, independently authored procedural Three.js. It measures the live reference, guides construction with physical workorders, checks the result from several views and poses, and preserves durable evidence between sessions.
+`mesh2threejs` is an agent-driven pipeline for recreating a reference GLB as editable procedural Three.js code. It measures the reference, guides the agent through construction and repair, renders matched comparisons, and keeps enough evidence to resume or verify the work later.
 
-It targets rigid hard-surface subjects—tanks, vehicles, buildings, machines, and props. It is not a GLB converter: candidate code must use native Three.js primitives, procedural geometry, transforms, materials, semantic parts, and real articulation controls. Candidate code may never load or embed the reference.
+It is intended for rigid hard-surface subjects such as vehicles, tanks, buildings, machines, and props. It is not a mesh converter. The finished model is independently authored from Three.js primitives, procedural geometry, transforms, materials, named parts, and real articulation controls. It does not load or embed the source mesh.
 
 ## What to give the agent
 
-Provide:
+Give the agent:
 
-- the local path to a `.glb` reference;
-- a short description of the subject and the desired result;
-- the model's source, author, license, and redistribution terms;
-- optional authoritative dimensions and their sources, especially for real tanks;
-- important parts, moving controls, and acceptable simplifications.
+- a local `.glb` reference;
+- a short description of the subject and desired style;
+- the source, author, license, and redistribution terms for the reference;
+- any important parts, repeated-part counts, or moving controls to preserve;
+- authoritative dimensions and their sources when exact real-world scale matters;
+- optional photos or documents that clarify details the GLB does not show.
 
-For example:
+A useful request looks like this:
 
-> Use the `mesh2threejs` skill to recreate `C:\references\tank.glb` as a low-poly, procedural Three.js model. Read the actual author, source URL, license, and redistribution terms from `C:\references\license.txt` before onboarding it. Preserve the rotating turret, elevating gun, wheel count, tracks, cupola, and overall dimensions. Put the task workspace in `workspaces/tank-demo`.
+> Use the `mesh2threejs` skill to recreate `C:\references\tank.glb` as a low-poly procedural Three.js model. Attribution and license details are in `C:\references\license.txt`. Preserve the rotating turret, elevating gun, tracks, wheel count, cupola, and overall proportions. Use `workspaces/tank-demo` as the workspace.
 
-If provenance, orientation, semantic ownership, or scale cannot be established, the workspace records the unresolved issue instead of inventing an answer.
+The agent creates the workspace, copies and verifies the references by default, authors the model under `model/`, and records reports and captures under `.mesh2threejs/`. If provenance, orientation, scale, or part ownership cannot be established, it records the uncertainty instead of guessing.
 
-## What the pipeline does
+## What the pipeline produces
 
-The agent will:
+A completed workspace can contain:
 
-1. inspect the GLB, record provenance, and create an immutable source hash;
-2. prepare a hash-linked normalization and semantic map without changing the source file;
-3. author a standalone procedural candidate module;
-4. compare the candidate with the live oracle using dimensions, silhouettes, sections, landmarks, connectivity, and profile-specific gates;
-5. render matched beauty, silhouette, semantic ID, depth, normal, and material passes, including an actual Three.js WebGL path;
-6. turn failures into precise workorders and repair the candidate;
-7. lock accepted phases, reopen affected dependants explicitly after changes, and wait for genuine visual review before certification.
+- an editable module under `model/` that exports `createCandidate()`;
+- immutable source-reference hashes and a reproducible preparation recipe;
+- geometry, style, complexity, and articulation reports;
+- actionable workorders tied to failed measurements;
+- matched beauty, silhouette, semantic ID, depth, normal, and material-ID captures;
+- comparison boards, turntable frames, and a hash-bound visual-review verdict;
+- resumable state, attribution requirements, intentional simplifications, and the final candidate hash.
 
-Tank tasks use dedicated hull, turret, gun, running-gear, track, fabrication, and articulation checks. Other rigid objects use the generic three-axis profile without loading tank-specific instructions.
+Tank projects use dedicated checks for hull, turret, gun, running gear, tracks, fabrication, and articulation. Other rigid objects use a generic three-axis profile.
 
-## What you receive
-
-A completed workspace contains:
-
-- editable procedural Three.js source exporting `createCandidate()`;
-- geometry and style/complexity reports;
-- actionable workorders for any failed measurements;
-- six diagnostic capture passes, a comparison board, and turntable frames;
-- a hash-bound visual-review packet/verdict and resumable task state;
-- recorded simplifications, oracle attribution requirements, and final candidate hash.
-
-Results have explicit states: `measured`, `geometry-passed`, `awaiting-visual-review`, `visual-passed`, and `certified`. Certification is `oracle-relative` unless authoritative real-world dimensions and their sources were admitted for `exact-real`. A deterministic replay or isolated Node process does not count as visual review. The pipeline does not redistribute the reference GLB.
+Certification is `oracle-relative` unless authoritative real-world dimensions and sources support `exact-real`. Deterministic checks do not substitute for visual review, and the pipeline does not redistribute the reference GLB.
 
 ## Setup
 
-Requires Node.js 22 or newer.
+Node.js 22 or newer is required.
 
 ```sh
 npm install
@@ -57,31 +47,75 @@ npm run build
 npm run validate
 ```
 
-Open this repository in a supported coding agent and ask it to use the root `mesh2threejs` skill. The root [SKILL.md](SKILL.md) routes the task and loads only the relevant role, profile, and style instructions. See [host validation](docs/host-validation.md) for tested host capabilities and limitations.
+Open this repository in a supported coding agent and ask it to use the root `mesh2threejs` skill. [SKILL.md](SKILL.md) routes the work to the relevant role, profile, and style instructions. [Host validation](docs/host-validation.md) lists tested host capabilities and limitations.
 
-## CLI for manual or scripted use
+## Starting a workspace
 
-The agent uses the same host-neutral CLI that is available to developers:
+The usual path is to let the CLI copy references into a portable workspace:
 
 ```sh
-node dist/cli.js route "reconstruct this tracked armored vehicle"
-node dist/cli.js init --workspace workspaces/demo --id demo --goal "reconstruct oracle" --profile tank --oracle oracle/manifest.json --candidate candidate/candidate.mjs
-node dist/cli.js probe path/to/source.glb
-node dist/cli.js onboard --config path/to/onboard.json --out workspaces/demo/oracle/manifest.json
-node dist/cli.js audit-candidate workspaces/demo/candidate/candidate.mjs
-node dist/cli.js gate --oracle workspaces/demo/oracle/manifest.json --candidate workspaces/demo/candidate/candidate.mjs --profile tank --out workspaces/demo/reports/gate.json
-node dist/cli.js status workspaces/demo/state.json
-node dist/cli.js next workspaces/demo/state.json
-node dist/cli.js reopen workspaces/demo/state.json --phase hull --reason "station regression"
-node dist/cli.js finalize workspaces/demo/state.json
+node dist/cli.js init workspaces/demo \
+  --id demo \
+  --goal "reconstruct the reference as procedural Three.js" \
+  --profile generic \
+  --oracle C:/references/object.glb \
+  --image-ref C:/references/front.jpg \
+  --doc-ref C:/references/notes.txt
 ```
 
-Run `node dist/cli.js help` for all commands. The [architecture guide](docs/architecture.md) explains the engine, and the `examples/` directory contains complete generic and tank candidate modules.
+You can also place files in `workspaces/demo/refs/oracle`, `refs/images`, or `refs/docs` before initialization. A single GLB in `refs/oracle` is adopted automatically:
 
-## Credits and provenance
+```sh
+node dist/cli.js init workspaces/demo \
+  --id demo \
+  --goal "reconstruct the staged reference" \
+  --profile generic
+```
 
-Tank measurement and construction ideas are credited to [Claude-of-Tanks by Kevin B. Liu](https://github.com/Kevin-Liu-01/Claude-of-Tanks/tree/f389f13f829451d64cf780c5f14473527b45f7f4), under its [MIT License](https://github.com/Kevin-Liu-01/Claude-of-Tanks/blob/f389f13f829451d64cf780c5f14473527b45f7f4/LICENSE).
+If references must remain outside the workspace, opt in explicitly. External paths are absolute and hash-bound, so the workspace is not portable and resume fails if a file is missing or changed:
 
-GLB intake, semantic readiness, durable state, and shared rendering concepts are credited to [img2threejs](https://github.com/img2threejs/img2threejs/tree/d6673386f89673a58736f8d398dd16ece67874f5), under its [Apache License 2.0](https://github.com/img2threejs/img2threejs/blob/d6673386f89673a58736f8d398dd16ece67874f5/LICENSE).
+```sh
+node dist/cli.js init workspaces/demo \
+  --id demo \
+  --goal "reconstruct without copying the source assets" \
+  --profile generic \
+  --oracle C:/large-assets/object.glb \
+  --reference-mode external
+```
 
-This repository is MIT-licensed. See [NOTICE](NOTICE) and the detailed [upstream source map](docs/upstream-map.md) for file-level attribution and adaptation notes. Third-party oracle assets retain their own licenses.
+The stable project configuration lives in `project.json`. Operational state, oracle preparation, evidence, reports, and captures live under `.mesh2threejs/`. Copied workspaces can be moved and resumed from their new location.
+
+## Common commands
+
+Workspace-root commands are the normal interface:
+
+```sh
+node dist/cli.js status workspaces/demo
+node dist/cli.js next workspaces/demo
+node dist/cli.js onboard workspaces/demo --config path/to/onboard.json
+node dist/cli.js register workspaces/demo --config path/to/registration.json
+node dist/cli.js gate workspaces/demo
+node dist/cli.js render workspaces/demo
+node dist/cli.js reopen workspaces/demo --phase primary-mass --reason "proportion regression"
+node dist/cli.js finalize workspaces/demo
+```
+
+The `onboard` configuration supplies provenance, coordinate-frame, normalization, and semantic-map facts. Workspace paths for the source, prepared recipe, candidate, reports, and captures are resolved automatically. Low-level manifest, module, and state-file arguments remain available for scripts; run `node dist/cli.js help` for the complete command list.
+
+Existing workspaces from the previous root-level layout can be upgraded with:
+
+```sh
+node dist/cli.js migrate path/to/workspace
+```
+
+Migration keeps the old layout under `.mesh2threejs/legacy`, retains its history, and invalidates prior oracle-bound evidence so the imported reference is checked again.
+
+See the [architecture guide](docs/architecture.md) for the engine design. The `examples/` directory contains generic and tank candidate modules.
+
+## Credits
+
+Tank measurement, construction, and comparison ideas were adapted from [Kevin B. Liu's Claude-of-Tanks](https://github.com/Kevin-Liu-01/Claude-of-Tanks), licensed under MIT.
+
+GLB intake, semantic-readiness, durable-state, and shared-rendering ideas were adapted from [img2threejs](https://github.com/img2threejs/img2threejs), licensed under Apache-2.0.
+
+This repository is MIT-licensed. [NOTICE](NOTICE) and the [upstream source map](docs/upstream-map.md) record exact audited revisions, licenses, and file-level adaptation details. Third-party reference assets keep their own licenses.

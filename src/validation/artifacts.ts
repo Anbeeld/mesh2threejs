@@ -20,7 +20,7 @@ export async function validateRepositoryArtifacts(root: string): Promise<Artifac
   const base = resolve(root);
   const errors: string[] = [];
   let validated = 0;
-  const schemaNames = ["task-manifest.v1.json", "oracle-manifest.v1.json", "render-profile.v1.json"];
+  const schemaNames = ["project-manifest.v1.json", "reference-index.v1.json", "oracle-manifest.v1.json", "render-profile.v1.json"];
   for (const name of schemaNames) {
     try {
       new Ajv2020({ strict: true }).compile(await jsonFile(join(base, "schemas", name)) as AnySchema);

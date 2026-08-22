@@ -1,5 +1,6 @@
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { ErrorObject } from "ajv";
+import { isAbsolute } from "node:path";
 
 const ajv = new Ajv2020({ allErrors: true, strict: true });
 
@@ -65,20 +66,24 @@ export const styleContractSchema = {
   additionalProperties: false,
 } as const;
 
-export const taskManifestSchema = {
+export const projectManifestSchema = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
-  $id: "https://mesh2threejs.local/schemas/task-manifest.v1.json",
+  $id: "https://mesh2threejs.local/schemas/project-manifest.v1.json",
   type: "object",
-  required: ["schemaVersion", "id", "goal", "profile", "style", "oracleManifest", "candidateModule", "certification"],
+  required: ["schemaVersion", "id", "goal", "profile", "style", "oracle", "images", "documents", "model", "certification", "referenceMode", "portable"],
   properties: {
     schemaVersion: { const: 1 },
     id: { type: "string", minLength: 1, pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$" },
     goal: { type: "string", minLength: 1 },
     profile: { enum: ["tank", "generic"] },
     style: { type: "string", minLength: 1 },
-    oracleManifest: { type: "string", minLength: 1 },
-    candidateModule: { type: "string", minLength: 1 },
+    oracle: { type: ["string", "null"] },
+    images: { type: "array", items: { type: "string", minLength: 1 }, uniqueItems: true },
+    documents: { type: "array", items: { type: "string", minLength: 1 }, uniqueItems: true },
+    model: { type: "string", minLength: 1 },
     certification: { enum: ["exact-real", "oracle-relative"] },
+    referenceMode: { enum: ["copy", "external"] },
+    portable: { type: "boolean" },
     subjectContract: { type: "string", minLength: 1 },
   },
   additionalProperties: false,
@@ -88,7 +93,7 @@ export const oracleManifestSchema = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
   $id: "https://mesh2threejs.local/schemas/oracle-manifest.v1.json",
   type: "object",
-  required: ["schemaVersion", "id", "sourcePath", "sourceHash", "preparedPath", "preparedHash", "source", "author", "license", "redistribution", "provenanceConfidence", "coordinateFrame", "upAxis", "forwardAxis", "grounding", "scale", "semanticStatus", "semanticMap", "articulationMap", "normalization", "authoritativeDimensions", "dimensionSources", "repairHistory"],
+  required: ["schemaVersion", "id", "sourcePath", "sourceHash", "preparedPath", "preparedHash", "sourceOriginalPath", "referenceMode", "portable", "source", "author", "license", "redistribution", "provenanceConfidence", "coordinateFrame", "upAxis", "forwardAxis", "grounding", "scale", "semanticStatus", "semanticMap", "articulationMap", "normalization", "authoritativeDimensions", "dimensionSources", "repairHistory"],
   properties: {
     schemaVersion: { const: 1 },
     id: { type: "string", minLength: 1 },
@@ -96,6 +101,9 @@ export const oracleManifestSchema = {
     sourceHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
     preparedPath: { type: "string", minLength: 1 },
     preparedHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
+    sourceOriginalPath: { type: "string", minLength: 1 },
+    referenceMode: { enum: ["copy", "external"] },
+    portable: { type: "boolean" },
     source: { type: "string", minLength: 1 },
     author: { type: "string", minLength: 1 },
     license: { type: "string", minLength: 1 },
@@ -123,6 +131,36 @@ export const oracleManifestSchema = {
     dimensionSources: { type: "array", items: { type: "string" } },
     repairHistory: { type: "array", items: { type: "object" } },
   },
+  allOf: [
+    { if: { properties: { referenceMode: { const: "copy" } }, required: ["referenceMode"] }, then: { properties: { portable: { const: true } } } },
+    { if: { properties: { referenceMode: { const: "external" } }, required: ["referenceMode"] }, then: { properties: { portable: { const: false } } } },
+  ],
+  additionalProperties: false,
+} as const;
+
+export const referenceIndexSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "https://mesh2threejs.local/schemas/reference-index.v1.json",
+  type: "object",
+  required: ["schemaVersion", "records"],
+  properties: {
+    schemaVersion: { const: 1 },
+    records: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["kind", "mode", "operationalPath", "originalPath", "sha256"],
+        properties: {
+          kind: { enum: ["oracle", "image", "document"] },
+          mode: { enum: ["copy", "external"] },
+          operationalPath: { type: "string", minLength: 1 },
+          originalPath: { type: "string", minLength: 1 },
+          sha256: { type: "string", pattern: "^[a-f0-9]{64}$" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
   additionalProperties: false,
 } as const;
 
@@ -143,8 +181,9 @@ export const renderProfileSchema = {
 } as const;
 
 const validateStyle = ajv.compile(styleContractSchema);
-const validateTask = ajv.compile(taskManifestSchema);
+const validateProject = ajv.compile(projectManifestSchema);
 const validateOracle = ajv.compile(oracleManifestSchema);
+const validateReferences = ajv.compile(referenceIndexSchema);
 const validateRender = ajv.compile(renderProfileSchema);
 
 export interface ValidationResult {
@@ -160,12 +199,25 @@ export function validateStyleContract(value: unknown): ValidationResult {
   return result(validateStyle(value), validateStyle.errors);
 }
 
-export function validateTaskManifest(value: unknown): ValidationResult {
-  return result(validateTask(value), validateTask.errors);
+export function validateProjectManifest(value: unknown): ValidationResult {
+  return result(validateProject(value), validateProject.errors);
 }
 
 export function validateOracleManifest(value: unknown): ValidationResult {
-  return result(validateOracle(value), validateOracle.errors);
+  const base = result(validateOracle(value), validateOracle.errors);
+  if (!base.valid) return base;
+  const manifest = value as { referenceMode: "copy" | "external"; portable: boolean; sourcePath: string };
+  const modeIsValid = manifest.referenceMode === "copy"
+    ? manifest.portable && !isAbsolute(manifest.sourcePath)
+    : !manifest.portable && isAbsolute(manifest.sourcePath);
+  return modeIsValid ? base : {
+    valid: false,
+    errors: [{ instancePath: "/sourcePath", schemaPath: "#/referenceMode", keyword: "referenceMode", params: { referenceMode: manifest.referenceMode }, message: "source path and portability must match reference mode" }],
+  };
+}
+
+export function validateReferenceIndex(value: unknown): ValidationResult {
+  return result(validateReferences(value), validateReferences.errors);
 }
 
 export function validateRenderProfile(value: unknown): ValidationResult {

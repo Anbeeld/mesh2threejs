@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -7,7 +7,8 @@ import {
   runCli,
   scoreSilhouetteCurves,
   validateStyleContract,
-  validateTaskManifest,
+  validateProjectManifest,
+  validateReferenceIndex,
   validateOracleManifest,
   validateRenderProfile,
   standardRenderProfile,
@@ -52,18 +53,27 @@ describe("machine-readable contracts", () => {
     expect(validateStyleContract({ ...lowPolyFaithful, preserve: { ...lowPolyFaithful.preserve, macroGeometry: false } }).valid).toBe(false);
   });
 
-  test("requires explicit certification status in task manifests", () => {
-    expect(validateTaskManifest({
+  test("validates stable project configuration without accepting volatile task fields", () => {
+    expect(validateProjectManifest({
       schemaVersion: 1,
       id: "x",
       goal: "reconstruct",
       profile: "generic",
       style: "low-poly-faithful",
-      oracleManifest: "oracle/manifest.json",
-      candidateModule: "candidate/candidate.mjs",
+      oracle: "refs/oracle/source.glb",
+      images: [],
+      documents: [],
+      model: "model/model.mjs",
       certification: "oracle-relative",
+      referenceMode: "copy",
+      portable: true,
     }).valid).toBe(true);
-    expect(validateTaskManifest({ schemaVersion: 1, id: "x" }).valid).toBe(false);
+    expect(validateProjectManifest({ schemaVersion: 1, id: "x", attempts: [] }).valid).toBe(false);
+    expect(validateReferenceIndex({
+      schemaVersion: 1,
+      records: [{ kind: "oracle", mode: "copy", operationalPath: "refs/oracle/source.glb", originalPath: "C:/source.glb", sha256: "a".repeat(64) }],
+    }).valid).toBe(true);
+    expect(validateReferenceIndex({ schemaVersion: 1, records: [{ kind: "oracle", operationalPath: "../source.glb" }] }).valid).toBe(false);
   });
 
   test("validates oracle and six-pass render contracts", () => {
@@ -80,19 +90,24 @@ describe("machine-readable contracts", () => {
 describe("CLI", () => {
   test("initializes a resumable workspace", async () => {
     const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-cli-"));
+    const workspace = join(directory, "workspace");
+    const oracle = join(directory, "fixture.glb");
+    const image = join(directory, "front.png");
+    await writeFile(oracle, "oracle");
+    await writeFile(image, "image");
     const output: string[] = [];
     const code = await runCli([
-      "init", "--workspace", directory, "--id", "cli-fixture", "--goal", "reconstruct",
-      "--profile", "generic", "--oracle", "oracle/manifest.json", "--candidate", "candidate/candidate.mjs",
+      "init", workspace, "--id", "cli-fixture", "--goal", "reconstruct",
+      "--profile", "generic", "--ref", oracle, "--ref", image,
     ], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) });
     expect(code).toBe(0);
-    expect(JSON.parse(await readFile(join(directory, "task.json"), "utf8")).id).toBe("cli-fixture");
+    expect(JSON.parse(await readFile(join(workspace, "project.json"), "utf8"))).toMatchObject({ id: "cli-fixture", oracle: "refs/oracle/fixture.glb", images: ["refs/images/front.png"] });
     expect(output.join("\n")).toContain("cli-fixture");
     output.length = 0;
-    expect(await runCli(["status", join(directory, "state.json")], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(0);
+    expect(await runCli(["status", workspace], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(0);
     expect(JSON.parse(output[0]!).activePhase).toBe("oracle-registration");
     output.length = 0;
-    expect(await runCli(["next", join(directory, "state.json")], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(0);
+    expect(await runCli(["next", workspace], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(0);
     expect(JSON.parse(output[0]!).route).toBe("onboard-oracle");
   });
 

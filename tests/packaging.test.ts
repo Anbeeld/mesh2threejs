@@ -3,6 +3,12 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 
 describe("host packaging and progressive disclosure", () => {
+  test("ignores every repository-local workspace as one boundary", async () => {
+    const ignore = await readFile(".gitignore", "utf8");
+    expect(ignore).toContain("/workspaces/");
+    expect(ignore).not.toMatch(/workspaces\/\*\//u);
+  });
+
   test.each(["reconstruct", "onboard-oracle", "repair-oracle", "build", "visual-review", "diagnose", "finalize"])("packages valid %s role metadata", async (role) => {
     const root = process.cwd();
     const skill = await readFile(join(root, "skills", role, "SKILL.md"), "utf8");

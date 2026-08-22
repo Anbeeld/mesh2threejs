@@ -5,7 +5,7 @@ description: Judge immutable matched reference/candidate captures with genuine v
 
 # Visual review
 
-Read `state.json`, the selected profile rubric, and the hash-bound visual-review packet. Verify packet and capture hashes before inspection.
+Read the workspace `.mesh2threejs/state.json`, the selected profile rubric, and the hash-bound visual-review packet. Verify packet and capture hashes before inspection.
 
 Inspect beauty, alpha, semantic-ID, depth, normal, and material-ID passes, matched comparison boards, turntable views, and sampled articulation evidence. Report concrete region/view findings with severity, expected correction, and the earliest phase to reopen.
 

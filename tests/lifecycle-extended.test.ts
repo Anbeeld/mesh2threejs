@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as THREE from "three";
@@ -41,19 +41,20 @@ const io = () => {
 describe("extended durable CLI", () => {
   test("binds, records, locks, reopens, tracks attempts, groups workorders, and replays rows", async () => {
     const root = await mkdtemp(join(tmpdir(), "mesh2threejs-lifecycle-"));
-    const statePath = join(root, "state.json");
+    const statePath = join(root, ".mesh2threejs", "state.json");
     const init = io();
-    expect(await runCli(["init", "--workspace", root, "--id", "life", "--goal", "fixture", "--profile", "generic", "--oracle", "oracle.json", "--candidate", "candidate.mjs"], init.sink)).toBe(0);
-    expect(await runCli(["bind-oracle", statePath, "--hash", "oracle"], io().sink)).toBe(0);
-    expect(await runCli(["bind-candidate", statePath, "--hash", "candidate"], io().sink)).toBe(0);
+    expect(await runCli(["init", "--workspace", root, "--id", "life", "--goal", "fixture", "--profile", "generic"], init.sink)).toBe(0);
+    expect(await runCli(["bind-oracle", root, "--hash", "oracle"], io().sink)).toBe(0);
+    expect(await runCli(["bind-candidate", root, "--hash", "candidate"], io().sink)).toBe(0);
     let state = await loadTaskState(statePath);
     const registration = createEvidenceArtifact({ id: "registration", kind: "registration", phase: "oracle-registration", oracleHash: "oracle", candidateHash: null, profileContractHash: state.profileContractHash, configHash: "config", result: { passed: true, summary: "registered" } });
-    const artifactPath = join(root, "evidence", "registration.json");
+    const artifactPath = join(root, ".mesh2threejs", "evidence", "registration.json");
+    await mkdir(join(root, ".mesh2threejs", "evidence"), { recursive: true });
     await writeFile(artifactPath, `${JSON.stringify(registration)}\n`);
-    expect(await runCli(["record-evidence", statePath, "--artifact", artifactPath], io().sink)).toBe(0);
-    expect(await runCli(["lock", statePath, "--phase", "oracle-registration", "--geometry-hash", "oracle", "--evidence", "registration"], io().sink)).toBe(0);
-    expect(await runCli(["reopen", statePath, "--phase", "oracle-registration", "--reason", "fixture correction"], io().sink)).toBe(0);
-    expect(await runCli(["attempt", statePath, "--action", "repair", "--evidence-hash", "same", "--score", "42"], io().sink)).toBe(0);
+    expect(await runCli(["record-evidence", root, "--artifact", ".mesh2threejs/evidence/registration.json"], io().sink)).toBe(0);
+    expect(await runCli(["lock", root, "--phase", "oracle-registration", "--geometry-hash", "oracle", "--evidence", "registration"], io().sink)).toBe(0);
+    expect(await runCli(["reopen", root, "--phase", "oracle-registration", "--reason", "fixture correction"], io().sink)).toBe(0);
+    expect(await runCli(["attempt", root, "--action", "repair", "--evidence-hash", "same", "--score", "42"], io().sink)).toBe(0);
     expect(await runCli(["bind-config", statePath, "--kind", "registration", "--hash", "config-b", "--reason", "registration tolerance changed"], io().sink)).toBe(0);
     expect(await runCli(["bind-config", statePath, "--kind", "unknown", "--hash", "x", "--reason", "fixture"], io().sink)).toBe(2);
 
@@ -70,10 +71,10 @@ describe("extended durable CLI", () => {
 
   test("prepares and records a genuine external visual verdict", async () => {
     const root = await mkdtemp(join(tmpdir(), "mesh2threejs-review-"));
-    const statePath = join(root, "state.json");
-    await runCli(["init", "--workspace", root, "--id", "review", "--goal", "fixture", "--profile", "generic", "--oracle", "oracle.json", "--candidate", "candidate.mjs"], io().sink);
-    await runCli(["bind-oracle", statePath, "--hash", "oracle"], io().sink);
-    await runCli(["bind-candidate", statePath, "--hash", "candidate"], io().sink);
+    const statePath = join(root, ".mesh2threejs", "state.json");
+    await runCli(["init", "--workspace", root, "--id", "review", "--goal", "fixture", "--profile", "generic"], io().sink);
+    await runCli(["bind-oracle", root, "--hash", "oracle"], io().sink);
+    await runCli(["bind-candidate", root, "--hash", "candidate"], io().sink);
     const state = await loadTaskState(statePath);
     const hash = "a".repeat(64);
     const config = { oracleHash: "oracle", candidateHash: "candidate", profile: "generic" as const, profileContractHash: state.profileContractHash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "beauty.png", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "available" as const, semanticArtifactHash: hash } };

@@ -5,7 +5,7 @@ description: Route, initialize, and resume a live-oracle procedural Three.js rec
 
 # Reconstruct
 
-1. Read root `SKILL.md`, then hydrate the workspace `task.json` and `state.json`.
+1. Read root `SKILL.md`, then hydrate the workspace `project.json` and `.mesh2threejs/state.json`.
 2. If no workspace exists, route the subject with `mesh2threejs route`, initialize it, and record the selected profile/style as decisions.
 3. Choose `tank` only for explicit or unmistakable tanks/tracked armored vehicles. Use `generic` otherwise.
 4. Follow `determineNextAction(state)` and load only the resulting role skill.

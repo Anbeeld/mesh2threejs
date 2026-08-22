@@ -47,13 +47,8 @@ describe("diagnostic render and workspace contract", () => {
       id: "fixture",
       goal: "reconstruct fixture",
       profile: "generic",
-      style: "low-poly-faithful",
-      oracleManifest: "oracle/manifest.json",
-      candidateModule: "candidate/candidate.mjs",
-      certification: "oracle-relative",
     });
-    expect(result.directories).toEqual(expect.arrayContaining(["oracle", "candidate", "evidence", "visual-review"]));
-    expect(result.directories).not.toContain("critic");
-    expect(JSON.parse(await readFile(join(directory, "task.json"), "utf8")).id).toBe("fixture");
+    expect(result.directories).toEqual(expect.arrayContaining(["refs/oracle", "model", ".mesh2threejs/evidence", ".mesh2threejs/visual-review"]));
+    expect(JSON.parse(await readFile(join(directory, "project.json"), "utf8")).id).toBe("fixture");
   });
 });

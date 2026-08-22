@@ -5,7 +5,7 @@ description: Reconstruct rigid hard-surface live GLB references as independently
 
 # Mesh2Threejs Router
 
-Hydrate `task.json` and `state.json` before acting. Never rely on chat memory when durable state exists.
+Hydrate `project.json` and `.mesh2threejs/state.json` before acting. Never rely on chat memory when durable state exists.
 
 Non-negotiable invariants:
 
@@ -19,4 +19,4 @@ Route with `mesh2threejs route <task>` and load exactly one role skill from `ski
 
 Select `profiles/tank/` only for explicit or unmistakable tanks/tracked armored vehicles; otherwise use `profiles/generic/`. Load that profile's executable `contract.json` and `styles/low-poly-faithful.json` unless the task names another validated style.
 
-Completion means `mesh2threejs finalize <workspace/state.json>` succeeds for the exact final hashes and the handoff includes source, reports, board, turntable, provenance, and intentional simplifications.
+Completion means `mesh2threejs finalize <workspace>` succeeds for the exact final hashes and the handoff includes source, reports, board, turntable, provenance, and intentional simplifications.

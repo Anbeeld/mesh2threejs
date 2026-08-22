@@ -16,6 +16,7 @@ The repository now uses executable profile contracts, durable phase authority, p
 - Rendering did not prove Three.js material/light behavior. The CPU diagnostic path remains deterministic and a separate `WebGLRenderer` six-pass path accepts browser/headless surfaces.
 - Candidate and reference boundaries were narrow. Candidate audits follow local imports and reject dense payloads; GLB world bounds honor transforms; stable node identities resolve duplicate names; normalized/sparse accessors are decoded and required unsupported compression fails closed.
 - CLI progress depended on conversational context. Status, next action, bind, record-evidence, lock, reopen, attempt, drift, and artifact-derived finalize operations persist atomically.
+- Workspace behavior depended on the current directory and split user configuration from runtime files poorly. `project.json`, `refs/`, and `model/` now form the stable surface; `.mesh2threejs/` owns state and generated artifacts. A single resolver handles copied, external, relocated, and migrated references with recorded hashes and provenance.
 
 ## Source synthesis
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mesh2threejs.local/schemas/oracle-manifest.v1.json",
   "type": "object",
-  "required": ["schemaVersion", "id", "sourcePath", "sourceHash", "preparedPath", "preparedHash", "source", "author", "license", "redistribution", "provenanceConfidence", "coordinateFrame", "upAxis", "forwardAxis", "grounding", "scale", "semanticStatus", "semanticMap", "articulationMap", "normalization", "authoritativeDimensions", "dimensionSources", "repairHistory"],
+  "required": ["schemaVersion", "id", "sourcePath", "sourceHash", "preparedPath", "preparedHash", "sourceOriginalPath", "referenceMode", "portable", "source", "author", "license", "redistribution", "provenanceConfidence", "coordinateFrame", "upAxis", "forwardAxis", "grounding", "scale", "semanticStatus", "semanticMap", "articulationMap", "normalization", "authoritativeDimensions", "dimensionSources", "repairHistory"],
   "properties": {
     "schemaVersion": { "const": 1 },
     "id": { "type": "string", "minLength": 1 },
@@ -10,6 +10,9 @@
     "sourceHash": { "$ref": "#/$defs/hash" },
     "preparedPath": { "type": "string", "minLength": 1 },
     "preparedHash": { "$ref": "#/$defs/hash" },
+    "sourceOriginalPath": { "type": "string", "minLength": 1 },
+    "referenceMode": { "enum": ["copy", "external"] },
+    "portable": { "type": "boolean" },
     "source": { "type": "string", "minLength": 1 },
     "author": { "type": "string", "minLength": 1 },
     "license": { "type": "string", "minLength": 1 },
@@ -33,5 +36,15 @@
     "point3": { "type": "array", "prefixItems": [{"type":"number"},{"type":"number"},{"type":"number"}], "minItems": 3, "maxItems": 3 },
     "normalization": { "type": "object", "required": ["translation", "rotationEuler", "scale"], "properties": { "translation": { "$ref": "#/$defs/point3" }, "rotationEuler": { "$ref": "#/$defs/point3" }, "scale": { "type": "number", "exclusiveMinimum": 0 } }, "additionalProperties": false }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "referenceMode": { "const": "copy" } }, "required": ["referenceMode"] },
+      "then": { "properties": { "portable": { "const": true } } }
+    },
+    {
+      "if": { "properties": { "referenceMode": { "const": "external" } }, "required": ["referenceMode"] },
+      "then": { "properties": { "portable": { "const": false } } }
+    }
+  ],
   "additionalProperties": false
 }

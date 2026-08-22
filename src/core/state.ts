@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import type { CertificationLevel, ProfileId } from "../types.js";
 import type { Route } from "./routing.js";
 import { canonicalJson, sha256 } from "./hashing.js";
@@ -394,16 +394,17 @@ export function certifyState(state: TaskState): TaskState {
   return next;
 }
 
-export async function certifyStateFromArtifacts(state: TaskState): Promise<TaskState> {
+export async function certifyStateFromArtifacts(state: TaskState, artifactRoot?: string): Promise<TaskState> {
+  const artifactPath = (path: string): string => artifactRoot && !isAbsolute(path) ? resolve(artifactRoot, path) : path;
   for (const lock of Object.values(state.locks)) {
     for (const binding of lock.evidence) {
-      const artifact = JSON.parse(await readFile(binding.artifact, "utf8")) as EvidenceArtifact;
+      const artifact = JSON.parse(await readFile(artifactPath(binding.artifact), "utf8")) as EvidenceArtifact;
       verifyEvidenceArtifact(artifact);
       if (artifact.artifactHash !== binding.artifactHash || artifact.id !== binding.id || artifact.phase !== lock.phase || !artifact.result.passed) throw new Error(`phase lock evidence is stale or contradictory: ${lock.phase}/${binding.id}`);
     }
   }
   for (const evidence of Object.values(state.evidence).filter((item) => item.valid && item.verified)) {
-    const artifact = JSON.parse(await readFile(evidence.artifact, "utf8")) as EvidenceArtifact;
+    const artifact = JSON.parse(await readFile(artifactPath(evidence.artifact), "utf8")) as EvidenceArtifact;
     verifyEvidenceArtifact(artifact);
     if (artifact.artifactHash !== evidence.artifactHash || artifact.id !== evidence.id || artifact.result.passed !== evidence.passed) {
       throw new Error(`evidence artifact contradicts state: ${evidence.id}`);

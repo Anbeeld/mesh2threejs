@@ -1,9 +1,9 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import * as THREE from "three";
-import { loadPreparedOracle, onboardOracle, probeGlb, repairPreparedOracle, verifyOracleRegistration } from "../src/index.js";
+import { loadPreparedOracle, onboardOracle, probeGlb, repairPreparedOracle, runCli, validateOracleManifest, verifyOracleRegistration } from "../src/index.js";
 
 function minimalGlb(options: { multipart?: boolean; translated?: boolean } = {}): Buffer {
   const positions = new Float32Array([
@@ -44,6 +44,40 @@ function minimalGlb(options: { multipart?: boolean; translated?: boolean } = {})
 }
 
 describe("source and prepared oracle lifecycle", () => {
+  test("runs onboarding, gates, and renders from only a workspace root", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-workspace-cli-"));
+    const root = join(parent, "workspace");
+    const source = join(parent, "source.glb");
+    await writeFile(source, minimalGlb());
+    const sink = { stdout: () => undefined, stderr: () => undefined };
+    expect(await runCli(["init", root, "--id", "root-cli", "--goal", "reconstruct", "--profile", "generic", "--oracle", source], sink)).toBe(0);
+    const config = join(parent, "onboard.json");
+    await writeFile(config, JSON.stringify({
+      id: "root-cli", sourcePath: "ignored.glb", preparedPath: "ignored.json", source: "fixture", author: "fixture", license: "MIT", redistribution: "allowed",
+      coordinateFrame: "right-handed", upAxis: "+y", forwardAxis: "+z", grounding: "min-y=0", scale: 1,
+      semanticMap: { "node:0": "primary" }, articulationMap: {}, normalization: { translation: [0, 1, 0], rotationEuler: [0, 0, 0], scale: 1 },
+      authoritativeDimensions: null, dimensionSources: [],
+    }));
+    expect(await runCli(["onboard", root, "--config", config], sink)).toBe(0);
+    const manifest = JSON.parse(await readFile(join(root, ".mesh2threejs", "oracle", "manifest.json"), "utf8"));
+    expect(manifest).toMatchObject({ sourcePath: "refs/oracle/source.glb", preparedPath: ".mesh2threejs/oracle/prepared.json", portable: true });
+    const repair = join(parent, "repair.json");
+    await writeFile(repair, JSON.stringify({ reason: "confirm explicit semantic mapping", preparedPath: "ignored.json" }));
+    expect(await runCli(["repair-oracle", root, "--config", repair], sink)).toBe(0);
+    expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "oracle", "manifest.json"), "utf8")).preparedPath).toBe(".mesh2threejs/oracle/prepared-repair-1.json");
+    const registration = join(parent, "registration.json");
+    await writeFile(registration, JSON.stringify({ forwardAxis: "+z", upAxis: "+y", expectedScale: 1, groundY: 0, requiredSemantics: ["primary"], requiredPivots: [], tolerance: 1e-6 }));
+    expect(await runCli(["register", root, "--config", registration], sink)).toBe(0);
+    expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "reports", "registration.json"), "utf8")).passed).toBe(true);
+    await writeFile(join(root, "model", "model.mjs"), `import * as THREE from "three";\nexport function createCandidate(){ const root=new THREE.Group(); const mesh=new THREE.Mesh(new THREE.BoxGeometry(2,2,0.1),new THREE.MeshStandardMaterial()); mesh.name="primary"; mesh.userData.semanticId="primary"; root.add(mesh); return root; }\n`);
+    expect([0, 4]).toContain(await runCli(["gate", root], sink));
+    expect(await readFile(join(root, ".mesh2threejs", "reports", "evaluation.json"), "utf8")).toContain("oracleHash");
+    await writeFile(join(root, ".mesh2threejs", "captures", "render-manifest.json"), "stale output\n");
+    expect(await runCli(["render", root], sink)).toBe(0);
+    expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "captures", "render-manifest.json"), "utf8"))).toMatchObject({ schemaVersion: 1 });
+    expect([0, 4]).toContain(await runCli(["gate", root], sink));
+  }, 15_000);
+
   test("probes GLB inventory, bounds, provenance, and conservative semantics", () => {
     const fused = probeGlb(minimalGlb());
     const multipart = probeGlb(minimalGlb({ multipart: true }));
@@ -118,5 +152,48 @@ describe("source and prepared oracle lifecycle", () => {
       requiredSemantics: ["primary"], requiredPivots: ["primary-pivot"], tolerance: 1e-6,
     });
     expect(repairedRegistration.rows.filter((row) => !row.passed)).toEqual([]);
+  });
+
+  test("persists workspace-relative oracle lineage that survives relocation", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-oracle-portable-"));
+    const root = join(parent, "original");
+    await mkdir(join(root, "refs", "oracle"), { recursive: true });
+    await writeFile(join(root, "refs", "oracle", "source.glb"), minimalGlb({ multipart: true }));
+    const manifest = await onboardOracle({
+      id: "portable",
+      workspaceRoot: root,
+      referenceMode: "copy",
+      sourceOriginalPath: "D:\\incoming\\source.glb",
+      sourcePath: "refs/oracle/source.glb",
+      preparedPath: ".mesh2threejs/oracle/prepared.json",
+      source: "fixture",
+      author: "fixture",
+      license: "MIT",
+      redistribution: "allowed",
+      coordinateFrame: "right-handed",
+      upAxis: "+y",
+      forwardAxis: "+z",
+      grounding: "min-y=0",
+      scale: 1,
+      semanticMap: { "node:0": "primary", "node:1": "attachment" },
+      articulationMap: {},
+      normalization: { translation: [0, 1, 0], rotationEuler: [0, 0, 0], scale: 1 },
+      authoritativeDimensions: null,
+      dimensionSources: [],
+    });
+    expect(manifest).toMatchObject({
+      sourcePath: "refs/oracle/source.glb",
+      preparedPath: ".mesh2threejs/oracle/prepared.json",
+      sourceOriginalPath: "D:\\incoming\\source.glb",
+      referenceMode: "copy",
+      portable: true,
+    });
+    expect(validateOracleManifest(manifest).valid).toBe(true);
+    expect(JSON.parse(await readFile(join(root, manifest.preparedPath), "utf8")).sourcePath).toBe("refs/oracle/source.glb");
+    expect((await loadPreparedOracle(manifest, root)).getObjectByName("hull")).toBeDefined();
+
+    const relocated = join(parent, "relocated");
+    await cp(root, relocated, { recursive: true });
+    expect((await loadPreparedOracle(manifest, relocated)).getObjectByName("turret")).toBeDefined();
   });
 });
