@@ -88,21 +88,27 @@ export function repeatParts<T extends THREE.Object3D>(count: number, spacing: nu
 
 export function createTrackCourseGeometry(length: number, height: number, width: number, wrapRadius: number): THREE.ExtrudeGeometry {
   if ([length, height, width, wrapRadius].some((value) => !Number.isFinite(value) || value <= 0) || wrapRadius * 2 >= Math.min(length, height)) throw new Error("track course parameters are invalid");
+  const roundedRectangle = (target: THREE.Path, inset: number, radius: number): void => {
+    const left = -length / 2 + inset; const right = length / 2 - inset;
+    const bottom = -height / 2 + inset; const top = height / 2 - inset;
+    target.moveTo(left + radius, bottom);
+    target.lineTo(right - radius, bottom);
+    target.absarc(right - radius, bottom + radius, radius, -Math.PI / 2, 0, false);
+    target.lineTo(right, top - radius);
+    target.absarc(right - radius, top - radius, radius, 0, Math.PI / 2, false);
+    target.lineTo(left + radius, top);
+    target.absarc(left + radius, top - radius, radius, Math.PI / 2, Math.PI, false);
+    target.lineTo(left, bottom + radius);
+    target.absarc(left + radius, bottom + radius, radius, Math.PI, Math.PI * 1.5, false);
+    target.closePath();
+  };
   const outer = new THREE.Shape();
-  outer.moveTo(-length / 2, -height / 2);
-  outer.lineTo(length / 2, -height / 2);
-  outer.lineTo(length / 2, height / 2);
-  outer.lineTo(-length / 2, height / 2);
-  outer.closePath();
+  roundedRectangle(outer, 0, wrapRadius);
   const inner = new THREE.Path();
   const inset = Math.min(width, wrapRadius * 0.6);
-  inner.moveTo(-length / 2 + inset, -height / 2 + inset);
-  inner.lineTo(-length / 2 + inset, height / 2 - inset);
-  inner.lineTo(length / 2 - inset, height / 2 - inset);
-  inner.lineTo(length / 2 - inset, -height / 2 + inset);
-  inner.closePath();
+  roundedRectangle(inner, inset, Math.max(wrapRadius - inset, 0.01));
   outer.holes.push(inner);
-  const geometry = new THREE.ExtrudeGeometry(outer, { depth: width, bevelEnabled: false, curveSegments: 4, steps: 1 });
+  const geometry = new THREE.ExtrudeGeometry(outer, { depth: width, bevelEnabled: false, curveSegments: 8, steps: 1 });
   geometry.translate(0, 0, -width / 2);
   geometry.rotateY(Math.PI / 2);
   return geometry;

@@ -55,6 +55,8 @@ async function main(): Promise<void> {
         oracleHash: evaluation.oracleHash,
         profile: item.profile,
         profileContractHash: sha256(item.profile),
+        styleContractHash: sha256("low-poly-faithful"),
+        evaluationIdentityHash: evaluation.candidateHash,
         styleHash: byRole.style!.sha256,
         deterministicArtifactHash: byRole.deterministic!.sha256,
         captures,

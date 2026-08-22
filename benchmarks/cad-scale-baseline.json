@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-22",
+  "workload": "CPU-only analytical tank operators plus 3,500,000-triangle synthetic complete generic evaluation",
+  "expectedGateOutcome": "The synthetic mesh intentionally exceeds low-poly complexity and is not a fidelity fixture; this benchmark requires evaluator completion within the resource ceilings, not gate acceptance.",
+  "environment": {
+    "node": "v22.14.0",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logicalCpuCount": 32,
+    "totalMemoryBytes": 100579684352
+  },
+  "syntheticTriangles": 3500000,
+  "snapshotBytes": 350000000,
+  "peakObservedRssBytes": 1537736704,
+  "ceilings": {
+    "cadElapsedMs": 180000,
+    "peakObservedRssBytes": 2684354560
+  },
+  "operators": [
+    { "operator": "glb-load-preparation", "elapsedMs": 3.772 },
+    { "operator": "prepared-oracle-load", "elapsedMs": 1.55 },
+    { "operator": "oracle-snapshot-construction", "elapsedMs": 6.131 },
+    { "operator": "candidate-snapshot-construction", "elapsedMs": 2.967 },
+    { "operator": "whole-hull-turret-silhouette", "elapsedMs": 130.082 },
+    { "operator": "fourteen-hull-stations", "elapsedMs": 19.284 },
+    { "operator": "running-gear-matching", "elapsedMs": 0.398 },
+    { "operator": "watertightness-connected-islands", "elapsedMs": 1.439 },
+    { "operator": "track-diagnostics", "elapsedMs": 4.624 },
+    { "operator": "neutral-style-evaluation", "elapsedMs": 1.029 },
+    { "operator": "articulation.turretYaw.sample-0", "elapsedMs": 1.798 },
+    { "operator": "articulation.turretYaw.sample-1", "elapsedMs": 1.558 },
+    { "operator": "articulation.turretYaw.sample-3", "elapsedMs": 1.552 },
+    { "operator": "articulation.turretYaw.sample-4", "elapsedMs": 1.974 },
+    { "operator": "articulation.gunElevation.sample-0", "elapsedMs": 1.545 },
+    { "operator": "articulation.gunElevation.sample-2", "elapsedMs": 1.5 },
+    { "operator": "cad-snapshot-construction", "elapsedMs": 317.279 },
+    { "operator": "cad-fingerprinting", "elapsedMs": 112.944 },
+    { "operator": "cad-complete-deterministic-evaluator", "elapsedMs": 9029.159 },
+    { "operator": "cad-neutral-style-evaluation", "elapsedMs": 0.104 },
+    { "operator": "cad-contract-evaluation", "elapsedMs": 0.434 },
+    { "operator": "visual-render-preparation", "elapsedMs": 211.029 }
+  ]
+}

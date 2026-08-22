@@ -8,16 +8,18 @@ export const EXECUTABLE_OPERATORS = [
   "adaptive-orthographic-curves", "articulation-poses", "attachments", "bounds-robust",
   "connectivity", "critical-semantics", "fabrication", "hull-pinned-registration",
   "landmarks", "physical-orientation", "repeated-instances", "sections", "track-course",
+  "style-contract", "complexity-budget",
 ] as const;
 
 export type ExecutableOperator = typeof EXECUTABLE_OPERATORS[number];
 
 interface RuntimeGateBinding {
   operator: ExecutableOperator;
-  source: "deterministic" | "articulation" | "workflow";
+  source: "deterministic" | "articulation" | "style" | "workflow";
   exact?: string[];
   prefixes?: string[];
   allowEmpty?: boolean;
+  excludePrefixes?: string[];
 }
 
 const RUNTIME_GATE_BINDINGS: Record<string, RuntimeGateBinding> = {
@@ -42,6 +44,8 @@ const RUNTIME_GATE_BINDINGS: Record<string, RuntimeGateBinding> = {
   "attachments.contract": { operator: "attachments", source: "deterministic", prefixes: ["attachment."], allowEmpty: true },
   "semantics.critical": { operator: "critical-semantics", source: "deterministic", prefixes: ["semantic.", "critical-feature."] },
   "connectivity.contract": { operator: "connectivity", source: "deterministic", prefixes: ["connectivity."] },
+  "style.contract": { operator: "style-contract", source: "style", prefixes: ["style."], excludePrefixes: ["style.complexity."] },
+  "style.complexity": { operator: "complexity-budget", source: "style", prefixes: ["style.complexity."] },
 };
 
 export interface ProfilePhaseContract {
@@ -134,20 +138,20 @@ export function validateProfileContract(value: unknown): ContractValidation {
 
 export function evaluateProfileContractGates(
   contract: ProfileContract,
-  input: { deterministic?: GateRow[]; articulation?: GateRow[] },
+  input: { deterministic?: GateRow[]; articulation?: GateRow[]; style?: GateRow[] },
 ): GateReport {
   const rows: GateRow[] = [];
   for (const gate of contract.gates) {
     const binding = RUNTIME_GATE_BINDINGS[gate.code];
     if (!binding || binding.source === "workflow") continue;
-    const available = binding.source === "deterministic" ? input.deterministic : input.articulation;
+    const available = binding.source === "deterministic" ? input.deterministic : binding.source === "articulation" ? input.articulation : input.style;
     if (!available) continue;
-    const selected = available.filter((row) => binding.exact?.includes(row.code) || binding.prefixes?.some((prefix) => row.code.startsWith(prefix)));
+    const selected = available.filter((row) => (binding.exact?.includes(row.code) || binding.prefixes?.some((prefix) => row.code.startsWith(prefix))) && !binding.excludePrefixes?.some((prefix) => row.code.startsWith(prefix)));
     const evaluatedViews = new Set(selected.flatMap((row) => row.viewsEvaluated ?? (row.view ? [row.view] : [])));
     const missingViews = (gate.views ?? []).filter((view) => !evaluatedViews.has(view));
     const hasEvidence = selected.length > 0 || binding.allowEmpty === true;
     const score = selected.length ? Math.min(...selected.map((row) => row.score)) : hasEvidence ? 100 : 0;
-    const passed = hasEvidence && score >= gate.threshold && missingViews.length === 0;
+    const passed = hasEvidence && selected.every((row) => row.passed) && score >= gate.threshold && missingViews.length === 0;
     rows.push({
       code: gate.code,
       phase: gate.phase,

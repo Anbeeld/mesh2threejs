@@ -2,13 +2,13 @@
   "schemaVersion": 2,
   "id": "generic",
   "semantics": {"required":["primary"],"optional":["attachment"],"critical":["primary"]},
-  "operators": ["adaptive-orthographic-curves","attachments","bounds-robust","connectivity","critical-semantics","physical-orientation"],
+  "operators": ["adaptive-orthographic-curves","attachments","bounds-robust","connectivity","critical-semantics","physical-orientation","style-contract","complexity-budget"],
   "phases": [
     {"id":"oracle-registration","dependsOn":[],"owner":"oracle","requiredGates":["registration.complete"]},
     {"id":"primary-mass","dependsOn":["oracle-registration"],"owner":"builder","requiredGates":["dimensions.robust","orientation.physical","silhouette.views"]},
     {"id":"attachments","dependsOn":["primary-mass"],"owner":"builder","requiredGates":["attachments.contract"]},
     {"id":"identity-features","dependsOn":["attachments"],"owner":"builder","requiredGates":["semantics.critical"]},
-    {"id":"style-complexity","dependsOn":["identity-features"],"owner":"builder","requiredGates":["connectivity.contract"]},
+    {"id":"style-complexity","dependsOn":["identity-features"],"owner":"builder","requiredGates":["connectivity.contract","style.contract","style.complexity"]},
     {"id":"visual-review","dependsOn":["style-complexity"],"owner":"reviewer","requiredGates":["visual.review"]},
     {"id":"final","dependsOn":["visual-review"],"owner":"finalizer","requiredGates":[]}
   ],
@@ -20,6 +20,8 @@
     {"code":"attachments.contract","phase":"attachments","operator":"attachments","required":true,"threshold":100},
     {"code":"semantics.critical","phase":"identity-features","operator":"critical-semantics","required":true,"threshold":100},
     {"code":"connectivity.contract","phase":"style-complexity","operator":"connectivity","required":true,"threshold":100},
+      {"code":"style.contract","phase":"style-complexity","operator":"style-contract","required":true,"threshold":0},
+      {"code":"style.complexity","phase":"style-complexity","operator":"complexity-budget","required":true,"threshold":0},
     {"code":"visual.review","phase":"visual-review","operator":"critical-semantics","required":true,"threshold":100}
   ],
   "dimensions":["width","height","depth"],

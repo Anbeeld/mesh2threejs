@@ -5,9 +5,11 @@ import type { Route } from "./routing.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
 import { verifyVisualReviewPacketFiles, type VisualReviewPacket } from "./review.js";
+import { getStyleContract } from "../styles/low-poly.js";
+import { evaluationIdentityHash, type EvaluationIdentity } from "./identity.js";
 
 export type SourceStatus = "supports" | "does-not-support" | "not-retrieved" | "contradicted" | "superseded";
-export const EVIDENCE_GENERATOR_VERSION = "0.3.0";
+export const EVIDENCE_GENERATOR_VERSION = "0.4.0";
 
 export interface StateFact {
   id: string;
@@ -34,6 +36,8 @@ export interface EvidenceRecord {
   gateResults?: GateEvidenceResult[];
   authority?: EvidenceAuthority;
   generatorVersion?: string;
+  styleContractHash?: string;
+  evaluationIdentityHash?: string | null;
 }
 
 export type EvidenceAuthority = "declared" | "runtime-gate-evaluation" | "runtime-render-capture" | "oracle-registration" | "external-visual-review";
@@ -52,6 +56,8 @@ export interface EvidenceArtifact {
   oracleHash: string;
   candidateHash: string | null;
   profileContractHash: string;
+  styleContractHash: string;
+  evaluationIdentityHash: string | null;
   configHash: string;
   generator: { name: "mesh2threejs"; version: string };
   createdAt: string;
@@ -108,6 +114,12 @@ export interface TaskState {
   attempts: AttemptRecord[];
   phaseStatus: Record<string, "pending" | "active" | "passed" | "skipped" | "invalidated">;
   profileContractHash: string;
+  styleContractHash: string;
+  projectConfigurationHash: string | null;
+  subjectContractHash: string | null;
+  articulationRequired: boolean;
+  evaluationIdentity: EvaluationIdentity | null;
+  evaluationIdentityHash: string | null;
   activePhase: string;
   locks: Record<string, PhaseLock>;
   reopens: PhaseReopen[];
@@ -145,8 +157,9 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-export function createTaskState(input: { taskId: string; profile: ProfileId; style: string; certification?: CertificationLevel }): TaskState {
+export function createTaskState(input: { taskId: string; profile: ProfileId; style: string; certification?: CertificationLevel; styleContractHash?: string; projectConfigurationHash?: string; subjectContractHash?: string | null; articulationRequired?: boolean }): TaskState {
   const contract = getProfileContract(input.profile);
+  const styleContractHash = input.styleContractHash ?? getStyleContract(input.style).hash;
   const phases = contract.phases.map((phase) => phase.id);
   return {
     schemaVersion: 1,
@@ -171,6 +184,12 @@ export function createTaskState(input: { taskId: string; profile: ProfileId; sty
     attempts: [],
     phaseStatus: Object.fromEntries(phases.map((phase, index) => [phase, index === 0 ? "active" : "pending"])),
     profileContractHash: profileContractHash(contract),
+    styleContractHash,
+    projectConfigurationHash: input.projectConfigurationHash ?? null,
+    subjectContractHash: input.subjectContractHash ?? null,
+    articulationRequired: input.articulationRequired ?? contract.articulation.length > 0,
+    evaluationIdentity: null,
+    evaluationIdentityHash: null,
     activePhase: phases[0]!,
     locks: {},
     reopens: [],
@@ -231,7 +250,7 @@ export function bindCandidate(state: TaskState, candidateHash: string): TaskStat
   return next;
 }
 
-export function bindCandidatePhases(state: TaskState, candidateHash: string, phaseHashes: Record<string, string>): TaskState {
+export function bindCandidatePhases(state: TaskState, candidateHash: string, phaseHashes: Record<string, string>, evaluationIdentity?: EvaluationIdentity): TaskState {
   const next = clone(state);
   for (const [phase, lock] of Object.entries(next.locks)) {
     if (phase === "oracle-registration") continue;
@@ -244,6 +263,12 @@ export function bindCandidatePhases(state: TaskState, candidateHash: string, pha
   }
   next.candidateHash = candidateHash;
   next.phaseGeometryHashes = { ...phaseHashes };
+  if (evaluationIdentity) {
+    const identityHash = evaluationIdentityHash(evaluationIdentity);
+    if (candidateHash !== sha256(canonicalJson({ neutralSceneHash: evaluationIdentity.candidateNeutralHash, sourceHash: evaluationIdentity.candidateSourceHash }))) throw new Error("evaluation identity contradicts the candidate hash");
+    next.evaluationIdentity = clone(evaluationIdentity);
+    next.evaluationIdentityHash = identityHash;
+  }
   return next;
 }
 
@@ -268,11 +293,14 @@ export function recordEvidence(state: TaskState, evidence: Omit<EvidenceRecord, 
 }
 
 type UnsealedEvidence = Omit<EvidenceArtifact, "schemaVersion" | "generator" | "createdAt" | "artifactHash" | "authority">;
+type UnsealedEvidenceInput = Omit<UnsealedEvidence, "styleContractHash" | "evaluationIdentityHash"> & Partial<Pick<UnsealedEvidence, "styleContractHash" | "evaluationIdentityHash">>;
 
-function sealEvidenceArtifact(input: UnsealedEvidence, authority: EvidenceAuthority): EvidenceArtifact {
+function sealEvidenceArtifact(input: UnsealedEvidenceInput, authority: EvidenceAuthority): EvidenceArtifact {
   const payload = {
     schemaVersion: 3 as const,
     ...input,
+    styleContractHash: input.styleContractHash ?? getStyleContract("low-poly-faithful").hash,
+    evaluationIdentityHash: input.evaluationIdentityHash ?? (input.kind === "registration" ? null : input.configHash),
     authority,
     generator: { name: "mesh2threejs" as const, version: EVIDENCE_GENERATOR_VERSION },
     createdAt: new Date().toISOString(),
@@ -280,11 +308,11 @@ function sealEvidenceArtifact(input: UnsealedEvidence, authority: EvidenceAuthor
   return { ...payload, artifactHash: sha256(canonicalJson(payload)) };
 }
 
-export function createEvidenceArtifact(input: UnsealedEvidence): EvidenceArtifact {
+export function createEvidenceArtifact(input: UnsealedEvidenceInput): EvidenceArtifact {
   return sealEvidenceArtifact(input, "declared");
 }
 
-export function createRuntimeGateEvidenceArtifact(input: Omit<UnsealedEvidence, "kind" | "gateResults" | "result"> & { report: GateReport }): EvidenceArtifact {
+export function createRuntimeGateEvidenceArtifact(input: Omit<UnsealedEvidenceInput, "kind" | "gateResults" | "result"> & { report: GateReport }): EvidenceArtifact {
   if (!input.report.rows.length || input.report.rows.some((row) => row.phase !== input.phase)) throw new Error(`runtime gate report is empty or contains rows outside phase ${input.phase}`);
   const { report, ...artifact } = input;
   return sealEvidenceArtifact({
@@ -295,19 +323,19 @@ export function createRuntimeGateEvidenceArtifact(input: Omit<UnsealedEvidence, 
   }, "runtime-gate-evaluation");
 }
 
-export function createRuntimeEvaluationEvidenceArtifact(input: Omit<UnsealedEvidence, "kind" | "gateResults" | "result"> & { kind: "style" | "complexity" | "articulation"; report: GateReport }): EvidenceArtifact {
+export function createRuntimeEvaluationEvidenceArtifact(input: Omit<UnsealedEvidenceInput, "kind" | "gateResults" | "result"> & { kind: "style" | "complexity" | "articulation"; report: GateReport }): EvidenceArtifact {
   if (!input.report.rows.length) throw new Error(`${input.kind} runtime report is empty`);
   const { report, ...artifact } = input;
   return sealEvidenceArtifact({ ...artifact, result: { passed: report.passed, summary: `${input.kind} runtime score ${report.score}`, details: report } }, "runtime-gate-evaluation");
 }
 
-export function createRenderEvidenceArtifact(input: Omit<UnsealedEvidence, "kind" | "gateResults" | "result"> & { manifest: { turntable: Array<{ path: string; sha256: string }>; [key: string]: unknown } }): EvidenceArtifact {
+export function createRenderEvidenceArtifact(input: Omit<UnsealedEvidenceInput, "kind" | "gateResults" | "result"> & { manifest: { turntable: Array<{ path: string; sha256: string }>; [key: string]: unknown } }): EvidenceArtifact {
   if (!input.manifest.turntable.length || input.manifest.turntable.some((item) => !item.path.trim() || !/^[a-f0-9]{64}$/u.test(item.sha256))) throw new Error("render evidence requires valid turntable files");
   const { manifest, ...artifact } = input;
   return sealEvidenceArtifact({ ...artifact, kind: "turntable", result: { passed: true, summary: `${manifest.turntable.length} create-only turntable frames`, details: manifest } }, "runtime-render-capture");
 }
 
-export function createWorkflowGateEvidenceArtifact(input: Omit<UnsealedEvidence, "gateResults" | "result"> & { gateCode: "registration.complete" | "visual.review"; passed: boolean; summary: string; details?: unknown }): EvidenceArtifact {
+export function createWorkflowGateEvidenceArtifact(input: Omit<UnsealedEvidenceInput, "gateResults" | "result"> & { gateCode: "registration.complete" | "visual.review"; passed: boolean; summary: string; details?: unknown }): EvidenceArtifact {
   const { gateCode, passed, summary, details, ...artifact } = input;
   const expectedKind = gateCode === "registration.complete" ? "registration" : "visual-review";
   if (artifact.kind !== expectedKind) throw new Error(`${gateCode} evidence must use kind ${expectedKind}`);
@@ -318,6 +346,8 @@ export function verifyEvidenceArtifact(artifact: EvidenceArtifact): void {
   const { artifactHash, ...payload } = artifact;
   if (artifact.schemaVersion !== 3 || artifact.generator?.name !== "mesh2threejs" || artifact.generator.version !== EVIDENCE_GENERATOR_VERSION) throw new Error("evidence artifact schema/generator is invalid or unsupported");
   if (!["declared", "runtime-gate-evaluation", "runtime-render-capture", "oracle-registration", "external-visual-review"].includes(artifact.authority)) throw new Error("evidence artifact authority is invalid");
+  if (!artifact.styleContractHash) throw new Error("evidence artifact style contract hash is missing");
+  if (artifact.kind !== "registration" && !artifact.evaluationIdentityHash) throw new Error("candidate-bound evidence lacks an evaluation identity");
   if (sha256(canonicalJson(payload)) !== artifactHash) throw new Error(`evidence artifact hash is invalid: ${artifact.id}`);
   const gateCodes = new Set<string>();
   for (const gate of artifact.gateResults ?? []) {
@@ -330,6 +360,8 @@ export function recordEvidenceArtifact(state: TaskState, artifactPath: string, a
   verifyEvidenceArtifact(artifact);
   if (state.oracleHash !== artifact.oracleHash || (artifact.kind !== "registration" && state.candidateHash !== artifact.candidateHash)) throw new Error("evidence artifact is bound to stale geometry");
   if (state.profileContractHash !== artifact.profileContractHash) throw new Error("evidence artifact profile contract is stale");
+  if (state.styleContractHash !== artifact.styleContractHash) throw new Error("evidence artifact style contract is stale");
+  if (artifact.kind !== "registration" && state.evaluationIdentityHash && state.evaluationIdentityHash !== artifact.evaluationIdentityHash) throw new Error("evidence artifact evaluation identity is stale");
   const configured = state.evidenceConfigHashes[artifact.kind];
   if (configured && configured !== artifact.configHash) throw new Error(`evidence artifact ${artifact.kind} config is stale; explicitly bind the new config first`);
   if (state.evidence[artifact.id]) throw new Error(`evidence id already exists and cannot be overwritten: ${artifact.id}`);
@@ -351,6 +383,8 @@ export function recordEvidenceArtifact(state: TaskState, artifactPath: string, a
     verified: true,
     authority: artifact.authority,
     generatorVersion: artifact.generator.version,
+    styleContractHash: artifact.styleContractHash,
+    evaluationIdentityHash: artifact.evaluationIdentityHash,
     ...(artifact.gateResults ? { gateResults: artifact.gateResults.map((gate) => ({ ...gate })) } : {}),
   };
   if (artifact.kind === "visual-review") next.visualReviewStatus = artifact.result.passed ? "passed" : "failed";
@@ -460,7 +494,8 @@ export function determineNextAction(state: TaskState): { route: Route; reason: s
   if (!state.locks["oracle-registration"]) return { route: "onboard-oracle", reason: "registration evidence is ready but the oracle-registration phase is not locked" };
   const unlockedBuildPhases = contract.phases.filter((phase) => phase.owner === "builder" && !state.locks[phase.id]).map((phase) => phase.id);
   if (unlockedBuildPhases.length) return { route: "build", reason: `builder phases remain unlocked: ${unlockedBuildPhases.join(", ")}` };
-  const buildEvidence = contract.completion.requiredEvidence.filter((kind): kind is EvidenceRecord["kind"] => kind !== "registration" && kind !== "visual-review");
+  const effectiveRequiredEvidence = [...contract.completion.requiredEvidence, ...(state.articulationRequired && !contract.completion.requiredEvidence.includes("articulation") ? ["articulation"] : [])];
+  const buildEvidence = effectiveRequiredEvidence.filter((kind): kind is EvidenceRecord["kind"] => kind !== "registration" && kind !== "visual-review");
   const missingBuildEvidence = buildEvidence.filter((kind) => !valid.some((evidence) => evidence.kind === kind && evidence.verified && evidence.passed && isAuthoritativeEvidence(evidence)));
   if (missingBuildEvidence.length) return { route: "build", reason: `current build evidence is missing or failing: ${missingBuildEvidence.join(", ")}` };
   const visual = valid.find((evidence) => evidence.kind === "visual-review" && evidence.passed && evidence.verified && isAuthoritativeEvidence(evidence));
@@ -473,6 +508,8 @@ export function certifyState(state: TaskState): TaskState {
   if (!state.oracleHash || !state.candidateHash) throw new Error("certification evidence requires oracle and candidate hashes");
   const contract = getProfileContract(state.profile);
   if (state.profileContractHash !== profileContractHash(contract)) throw new Error("certification requires the current executable profile contract");
+  if (state.styleContractHash !== getStyleContract(state.style).hash) throw new Error("certification requires the current executable style contract");
+  if (!state.evaluationIdentity || state.evaluationIdentityHash !== evaluationIdentityHash(state.evaluationIdentity)) throw new Error("certification requires a current canonical evaluation identity");
   if (state.certification === "exact-real" && state.authoritativeDimensions.status !== "admitted") {
     throw new Error("exact-real certification requires admitted authoritative dimensions");
   }
@@ -501,9 +538,9 @@ export function certifyState(state: TaskState): TaskState {
     return !validGateResults.some((gate) => gate.code === code && gate.passed && gate.score >= threshold);
   });
   if (finalMissing.length) throw new Error(`certification final gates are missing or failing: ${finalMissing.join(", ")}`);
-  const requiredEvidence = contract.completion.requiredEvidence as EvidenceRecord["kind"][];
+  const requiredEvidence = [...contract.completion.requiredEvidence, ...(state.articulationRequired && !contract.completion.requiredEvidence.includes("articulation") ? ["articulation"] : [])] as EvidenceRecord["kind"][];
   const missing = requiredEvidence.filter((kind) => !Object.values(state.evidence).some((evidence) =>
-    evidence.kind === kind && evidence.valid && evidence.verified === true && evidence.passed && isAuthoritativeEvidence(evidence) && evidence.oracleHash === state.oracleHash && evidence.configHash === state.evidenceConfigHashes[kind] && (kind === "registration" || evidence.candidateHash === state.candidateHash)));
+    evidence.kind === kind && evidence.valid && evidence.verified === true && evidence.passed && isAuthoritativeEvidence(evidence) && evidence.oracleHash === state.oracleHash && evidence.styleContractHash === state.styleContractHash && evidence.configHash === state.evidenceConfigHashes[kind] && (kind === "registration" || (evidence.candidateHash === state.candidateHash && evidence.evaluationIdentityHash === state.evaluationIdentityHash))));
   if (missing.length) throw new Error(`certification evidence missing or stale: ${missing.join(", ")}`);
   if (state.unresolvedItems.some((item) => item.blocking)) throw new Error("certification has unresolved blocking items");
   const next = clone(state);
@@ -591,6 +628,12 @@ export async function loadTaskState(path: string): Promise<TaskState> {
     throw new Error("task state schema is invalid");
   }
   if (!state.profileContractHash || !state.locks || !state.reopens || !state.visualReviewStatus || !state.evidenceConfigHashes || !state.phaseGeometryHashes) throw new Error("task state lacks durable phase/review/config fields");
+  state.styleContractHash ??= getStyleContract(state.style).hash;
+  state.projectConfigurationHash ??= null;
+  state.subjectContractHash ??= null;
+  state.articulationRequired ??= getProfileContract(state.profile).articulation.length > 0;
+  state.evaluationIdentity ??= null;
+  state.evaluationIdentityHash ??= null;
   const lacksEvidenceAuthority = Object.values(state.evidence).some((evidence) => evidence.valid && evidence.verified && (!evidence.authority || !evidence.generatorVersion));
   if (lacksEvidenceAuthority) {
     const contract = getProfileContract(state.profile);

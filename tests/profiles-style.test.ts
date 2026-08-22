@@ -1,11 +1,17 @@
 import * as THREE from "three";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   evaluateGenericProfile,
+  evaluateCandidate,
   evaluateLowPolyStyle,
   evaluateTankProfile,
   lowPolyFaithful,
   regularPolygonFacetingCorridor,
+  getProfileContract,
+  runCli,
   snapshotScene,
 } from "../src/index.js";
 import { createGenericFixture, createTankFixture, semanticMesh } from "./helpers/scenes.js";
@@ -193,5 +199,35 @@ describe("low-poly-faithful anti-gaming gate", () => {
       passed: false,
       oracleValue: 0.05,
     });
+  });
+
+  test("assigns style work to the executable style phase", () => {
+    const oracle = createGenericFixture();
+    const contract = { ...lowPolyFaithful, complexity: { ...lowPolyFaithful.complexity, segmentRange: [6, 6] as [number, number] } };
+    const evaluation = evaluateCandidate({ oracle, candidate: createGenericFixture(), profile: "generic", style: contract });
+    expect(evaluation.style.rows.every((row) => row.phase === "style-complexity")).toBe(true);
+    expect(evaluation.style.workorders.every((item) => item.phase === "style-complexity")).toBe(true);
+    expect(evaluation.phaseGates["style-complexity"]?.passed).toBe(false);
+    expect(evaluation.phaseGates["style-complexity"]?.rows.map((row) => row.code)).toEqual(expect.arrayContaining(["style.contract", "style.complexity"]));
+  });
+
+  test("makes segment and triangle limits prevent style-phase acceptance", () => {
+    const oracle = createGenericFixture();
+    const segments = evaluateCandidate({ oracle, candidate: createGenericFixture(), profile: "generic", style: { ...lowPolyFaithful, complexity: { ...lowPolyFaithful.complexity, segmentRange: [3, 3] } } });
+    const triangles = evaluateCandidate({ oracle, candidate: createGenericFixture(), profile: "generic", style: { ...lowPolyFaithful, complexity: { ...lowPolyFaithful.complexity, triangleTarget: 1, triangleMax: 1 } } });
+    expect(segments.phaseGates["style-complexity"]?.passed).toBe(false);
+    expect(triangles.phaseGates["style-complexity"]?.passed).toBe(false);
+    expect(getProfileContract("generic").phases.find((phase) => phase.id === "style-complexity")?.requiredGates).toEqual(expect.arrayContaining(["style.contract", "style.complexity"]));
+    expect(getProfileContract("tank").phases.find((phase) => phase.id === "style-fabrication")?.requiredGates).toEqual(expect.arrayContaining(["fabrication.profile", "style.contract", "style.complexity"]));
+  });
+
+  test("returns style-derived workorders through the CLI for the active style phase", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-style-workorders-"));
+    const reportPath = join(directory, "gate.json");
+    const evaluation = evaluateCandidate({ oracle: createGenericFixture(), candidate: createGenericFixture(), profile: "generic", style: { ...lowPolyFaithful, complexity: { ...lowPolyFaithful.complexity, triangleTarget: 1, triangleMax: 1 } } });
+    await writeFile(reportPath, JSON.stringify(evaluation));
+    const output: string[] = [];
+    expect(await runCli(["workorders", reportPath, "--phase", "style-complexity"], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(0);
+    expect(JSON.parse(output[0]!).workorders).toEqual(expect.arrayContaining([expect.objectContaining({ errorKind: "style.complexity.triangles", phase: "style-complexity" })]));
   });
 });

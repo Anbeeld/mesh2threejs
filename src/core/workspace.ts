@@ -3,8 +3,14 @@ import { constants } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import type { CertificationLevel, ProfileId } from "../types.js";
 import { determineNextAction, loadTaskState, saveTaskState, createTaskState, type TaskState } from "./state.js";
-import { sha256 } from "./hashing.js";
+import { canonicalJson, sha256 } from "./hashing.js";
 import { validateProjectManifest, validateReferenceIndex } from "./schema.js";
+import { loadStyleContract, type StyleContract } from "../styles/low-poly.js";
+import { getProfileContract, profileContractHash } from "./contracts.js";
+import { inspectCandidateIdentity, type CandidateIdentity } from "./candidate.js";
+import { neutralPoseForProfile } from "./orchestration.js";
+import type { GenericSubjectContract } from "../profiles/generic.js";
+import { optionalContractHash } from "./identity.js";
 
 export type ReferenceMode = "copy" | "external";
 export type ReferenceKind = "oracle" | "image" | "document";
@@ -36,6 +42,38 @@ export interface ReferenceRecord {
 export interface ReferenceIndex {
   schemaVersion: 1;
   records: ReferenceRecord[];
+}
+
+export interface ProjectConfigurationIdentity {
+  schemaVersion: 1;
+  profile: ProfileId;
+  style: string;
+  certification: CertificationLevel;
+  model: string;
+  oracle: { path: string; sha256: string; mode: ReferenceMode } | null;
+  subjectContract: { path: string; sha256: string; mode: ReferenceMode } | null;
+}
+
+export function projectConfigurationIdentity(project: ProjectManifest, references: ReferenceIndex): ProjectConfigurationIdentity {
+  const selected = (path: string | null | undefined, kind: ReferenceKind): { path: string; sha256: string; mode: ReferenceMode } | null => {
+    if (!path) return null;
+    const record = references.records.find((item) => item.kind === kind && item.operationalPath === path);
+    if (!record) throw new Error(`project ${kind} selection is absent from the reference index: ${path}`);
+    return { path: record.operationalPath, sha256: record.sha256, mode: record.mode };
+  };
+  return {
+    schemaVersion: 1,
+    profile: project.profile,
+    style: project.style,
+    certification: project.certification,
+    model: project.model,
+    oracle: selected(project.oracle, "oracle"),
+    subjectContract: selected(project.subjectContract, "document"),
+  };
+}
+
+export function projectConfigurationHash(project: ProjectManifest, references: ReferenceIndex): string {
+  return sha256(canonicalJson(projectConfigurationIdentity(project, references)));
 }
 
 export interface InitializeWorkspaceInput {
@@ -292,6 +330,11 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
     ...(subjectContractRecord ? { subjectContract: subjectContractRecord.operationalPath } : {}),
   };
   const referenceIndex: ReferenceIndex = { schemaVersion: 1, records: records.map(({ source: _source, destination: _destination, ...record }) => record) };
+  const style = await loadStyleContract(project.style);
+  const configurationHash = projectConfigurationHash(project, referenceIndex);
+  const subjectContractValue = subjectContractRecord ? JSON.parse(await readFile(subjectContractRecord.source, "utf8")) as GenericSubjectContract : undefined;
+  const subjectContractHash = optionalContractHash(subjectContractValue);
+  const articulationRequired = getProfileContract(project.profile).articulation.length > 0 || Boolean(subjectContractValue?.articulation?.length);
   const directories = ["refs/oracle", "refs/images", "refs/docs", "model", ".mesh2threejs/oracle/cache", ".mesh2threejs/evidence", ".mesh2threejs/reports", ".mesh2threejs/captures", ".mesh2threejs/visual-review", ".mesh2threejs/locks"];
   const created: string[] = [];
   try {
@@ -306,7 +349,7 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
     }
     if (!await pathExists(modelPath)) { await mkdir(dirname(modelPath), { recursive: true }); await writeFile(modelPath, MODEL_SCAFFOLD, { flag: "wx" }); created.push(modelPath); }
     await writeFile(layout.internal.references, `${JSON.stringify(referenceIndex, null, 2)}\n`, { flag: "wx" }); created.push(layout.internal.references);
-    await saveTaskState(layout.internal.state, createTaskState({ taskId: project.id, profile: project.profile, style: project.style, certification: project.certification })); created.push(layout.internal.state);
+    await saveTaskState(layout.internal.state, createTaskState({ taskId: project.id, profile: project.profile, style: project.style, certification: project.certification, styleContractHash: style.hash, projectConfigurationHash: configurationHash, subjectContractHash, articulationRequired })); created.push(layout.internal.state);
     await writeFile(layout.project, `${JSON.stringify(project, null, 2)}\n`, { flag: "wx" }); created.push(layout.project);
   } catch (error) {
     for (const path of created.reverse()) await rm(path, { force: true });
@@ -336,7 +379,19 @@ export async function resolveStateTarget(input: string): Promise<{ statePath: st
   }
 }
 
-export async function resumeWorkspace(input: string): Promise<{ root: string; layout: WorkspaceLayout; project: ProjectManifest; references: ReferenceIndex; state: TaskState; resolved: { oracle: string | null; model: string; images: string[]; documents: string[]; subjectContract?: string }; nextAction: ReturnType<typeof determineNextAction> }> {
+export interface ResumedWorkspace {
+  root: string;
+  layout: WorkspaceLayout;
+  project: ProjectManifest;
+  references: ReferenceIndex;
+  state: TaskState;
+  styleContract: StyleContract;
+  styleContractHash: string;
+  resolved: { oracle: string | null; model: string; images: string[]; documents: string[]; subjectContract?: string };
+  nextAction: ReturnType<typeof determineNextAction>;
+}
+
+export async function resumeWorkspace(input: string): Promise<ResumedWorkspace> {
   const root = await locateWorkspaceRoot(input);
   const resolver = createWorkspaceResolver(root);
   const project = await readProject(resolver.layout.project);
@@ -361,7 +416,65 @@ export async function resumeWorkspace(input: string): Promise<{ root: string; la
   if (!await pathExists(model)) throw new Error(`authored model is missing: ${project.model}`);
   const state = await loadTaskState(resolver.layout.internal.state);
   const subjectContract = project.subjectContract ? resolveListed([project.subjectContract], "document")[0] : undefined;
-  return { root, layout: resolver.layout, project, references: referenceIndex, state, resolved: { oracle, model, images: resolveListed(project.images, "image"), documents: resolveListed(project.documents, "document"), ...(subjectContract ? { subjectContract } : {}) }, nextAction: determineNextAction(state) };
+  const subjectContractValue = subjectContract ? JSON.parse(await readFile(subjectContract, "utf8")) as GenericSubjectContract : undefined;
+  const subjectContractHash = optionalContractHash(subjectContractValue);
+  const style = await loadStyleContract(project.style);
+  const currentProjectHash = projectConfigurationHash(project, referenceIndex);
+  if (!state.projectConfigurationHash) throw new Error("workspace state has no bound project configuration; run an explicit migration or rebind");
+  if (state.projectConfigurationHash !== currentProjectHash || state.profile !== project.profile || state.style !== project.style || state.certification !== project.certification) throw new Error("project configuration differs from state; run an explicit migration or rebind");
+  if (state.profileContractHash !== profileContractHash(getProfileContract(project.profile))) throw new Error("profile contract differs from state; rebind before continuing");
+  if (state.styleContractHash !== style.hash) throw new Error("style contract differs from state; rebind before continuing");
+  if (state.subjectContractHash !== subjectContractHash || state.articulationRequired !== (getProfileContract(project.profile).articulation.length > 0 || Boolean(subjectContractValue?.articulation?.length))) throw new Error("subject articulation contract differs from state; rebind before continuing");
+  return { root, layout: resolver.layout, project, references: referenceIndex, state, styleContract: style.contract, styleContractHash: style.hash, resolved: { oracle, model, images: resolveListed(project.images, "image"), documents: resolveListed(project.documents, "document"), ...(subjectContract ? { subjectContract } : {}) }, nextAction: determineNextAction(state) };
+}
+
+export async function verifyWorkspaceCandidateIdentity(workspace: ResumedWorkspace): Promise<CandidateIdentity> {
+  const subjectContract = workspace.resolved.subjectContract
+    ? JSON.parse(await readFile(workspace.resolved.subjectContract, "utf8")) as GenericSubjectContract
+    : undefined;
+  return inspectCandidateIdentity(workspace.resolved.model, neutralPoseForProfile(workspace.project.profile, subjectContract));
+}
+
+/** Explicitly starts a new evidence chain for the current project and reference bytes. */
+export async function rebindWorkspace(input: string): Promise<ResumedWorkspace> {
+  const root = await locateWorkspaceRoot(input);
+  const resolver = createWorkspaceResolver(root);
+  const project = await readProject(resolver.layout.project);
+  const referenceValue: unknown = JSON.parse(await readFile(resolver.layout.internal.references, "utf8"));
+  const validation = validateReferenceIndex(referenceValue);
+  if (!validation.valid) throw new Error(`reference index is invalid: ${JSON.stringify(validation.errors)}`);
+  const references = referenceValue as ReferenceIndex;
+  const reboundReferences: ReferenceIndex = {
+    schemaVersion: 1,
+    records: await Promise.all(references.records.map(async (record) => {
+      const path = resolver.resolveReferencePath(record.operationalPath, record.mode);
+      if (!await pathExists(path)) throw new Error(`missing reference: ${record.operationalPath}`);
+      return { ...record, sha256: sha256(await readFile(path)) };
+    })),
+  };
+  const style = await loadStyleContract(project.style);
+  const subjectRecord = project.subjectContract
+    ? reboundReferences.records.find((record) => record.kind === "document" && record.operationalPath === project.subjectContract)
+    : undefined;
+  if (project.subjectContract && !subjectRecord) throw new Error(`project subject contract is absent from the reference index: ${project.subjectContract}`);
+  const subjectPath = subjectRecord ? resolver.resolveReferencePath(subjectRecord.operationalPath, subjectRecord.mode) : undefined;
+  const subjectContract = subjectPath ? JSON.parse(await readFile(subjectPath, "utf8")) as GenericSubjectContract : undefined;
+  const next = createTaskState({
+    taskId: project.id,
+    profile: project.profile,
+    style: project.style,
+    certification: project.certification,
+    styleContractHash: style.hash,
+    projectConfigurationHash: projectConfigurationHash(project, reboundReferences),
+    subjectContractHash: optionalContractHash(subjectContract),
+    articulationRequired: getProfileContract(project.profile).articulation.length > 0 || Boolean(subjectContract?.articulation?.length),
+  });
+  next.systemDecisions.push({ id: "workspace-rebind", value: next.projectConfigurationHash, reason: "explicit rebind started a new evidence chain for current project configuration and reference bytes" });
+  const referencesTemporary = `${resolver.layout.internal.references}.${process.pid}.tmp`;
+  await writeFile(referencesTemporary, `${JSON.stringify(reboundReferences, null, 2)}\n`, { flag: "wx" });
+  await rename(referencesTemporary, resolver.layout.internal.references);
+  await saveTaskState(resolver.layout.internal.state, next);
+  return resumeWorkspace(root);
 }
 
 interface LegacyTaskManifest {
@@ -428,6 +541,13 @@ export async function migrateWorkspace(directory: string, options: { oracle?: st
   legacyState.phaseGeometryHashes = {};
   legacyState.evidenceConfigHashes = {};
   legacyState.visualReviewStatus = "awaiting";
+  const initializedState = await loadTaskState(resolver.layout.internal.state);
+  legacyState.profile = initializedState.profile;
+  legacyState.style = initializedState.style;
+  legacyState.certification = initializedState.certification;
+  legacyState.profileContractHash = initializedState.profileContractHash;
+  legacyState.styleContractHash = initializedState.styleContractHash;
+  legacyState.projectConfigurationHash = initializedState.projectConfigurationHash;
   legacyState.systemDecisions.push({ id: "workspace-layout-migration", value: "oracle-revalidation-required", reason: "reference paths changed during migration; historical evidence was retained but invalidated" });
   await saveTaskState(resolver.layout.internal.state, legacyState);
   for (const name of ["evidence", "reports", "captures", "visual-review"] as const) {

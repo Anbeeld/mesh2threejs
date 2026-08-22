@@ -20,7 +20,7 @@ A useful request looks like this:
 
 > Use the `mesh2threejs` skill to recreate `C:\references\tank.glb` as a low-poly procedural Three.js model. Attribution and license details are in `C:\references\license.txt`. Preserve the rotating turret, elevating gun, tracks, wheel count, cupola, and overall proportions. Use `workspaces/tank-demo` as the workspace.
 
-The agent creates the workspace, copies and verifies the references by default, authors the model under `model/`, and records reports and captures under `.mesh2threejs/`. Each gate and render run gets a new numbered directory, so rerunning a check does not overwrite evidence that an accepted phase already references. If provenance, orientation, scale, or part ownership cannot be established, the agent records the uncertainty instead of guessing.
+The agent creates the workspace, copies and verifies the references by default, authors the model under `model/`, and records reports and captures under `.mesh2threejs/`. Each gate and render run gets a new numbered directory, so rerunning a check does not overwrite accepted evidence. If provenance, orientation, scale, or part ownership cannot be established, the agent records the uncertainty instead of guessing.
 
 ## What the pipeline produces
 
@@ -36,7 +36,7 @@ A completed workspace can contain:
 
 Tank projects use dedicated checks for hull, turret, gun, running gear, tracks, fabrication, and articulation. Other rigid objects use a generic three-axis profile.
 
-Certification is `oracle-relative` unless authoritative real-world dimensions and sources support `exact-real`. Deterministic checks do not substitute for visual review, and the pipeline does not redistribute the reference GLB.
+Certification is `oracle-relative` unless authoritative real-world dimensions and sources support `exact-real`. Generic subject contracts can include or exclude named semantic parts from each dimension, such as excluding an antenna from structural height. Deterministic checks do not substitute for visual review, and the pipeline does not redistribute the reference GLB.
 
 The built-in loader admits uncompressed glTF 2.0 triangle geometry in GLB containers. It decodes normalized and sparse accessors and applies node transforms, but it does not reproduce skinning or animation. Required Draco or meshopt compression fails with an explicit error. The Node.js CLI uses the deterministic CPU renderer; callers that provide a browser or headless WebGL surface can use the integrated Three.js `WebGLRenderer` path.
 
@@ -98,6 +98,7 @@ node dist/cli.js next workspaces/demo
 node dist/cli.js onboard workspaces/demo --config path/to/onboard.json
 node dist/cli.js register workspaces/demo --config path/to/registration.json
 node dist/cli.js gate workspaces/demo
+node dist/cli.js gate workspaces/demo --global
 node dist/cli.js workorders workspaces/demo
 node dist/cli.js lock workspaces/demo
 node dist/cli.js render workspaces/demo
@@ -108,7 +109,9 @@ node dist/cli.js reopen workspaces/demo --phase primary-mass --reason "proportio
 node dist/cli.js finalize workspaces/demo
 ```
 
-The `onboard` configuration supplies provenance, coordinate-frame, normalization, and semantic-map facts. `gate` evaluates every phase independently, `workorders` selects the next repair group for the active phase, and `lock` uses that phase's measured geometry and authoritative evidence by default. `render` records captures, region diagnostics, and turntable evidence. `prepare-review` builds a packet from the current workspace and checks every referenced file before an external reviewer inspects it. Low-level manifest, module, and state-file arguments remain available for scripts; run `node dist/cli.js help` for the complete command list.
+The `onboard` configuration supplies provenance, coordinate-frame, normalization, and semantic-map facts. `gate` evaluates every phase independently, reports active-phase and global status separately, and normally exits according to the active phase. Use `--global` when the process exit must reflect the complete evaluation. `workorders` selects the next repair group for the active phase, and `lock` uses that phase's measured geometry and authoritative evidence by default. `render` records captures, region diagnostics, and turntable evidence. `prepare-review` builds a packet from the current workspace and checks every referenced file before an external reviewer inspects it. Low-level manifest, module, and state-file arguments remain available for scripts; run `node dist/cli.js help` for the complete command list.
+
+`project.json`, profile contracts, style contracts, and subject contracts are hash-bound to state. After an intentional configuration or referenced-contract change, run `node dist/cli.js rebind workspaces/demo`; this discards prior authority and starts a clean evidence chain. Ordinary candidate edits use the normal gate/reopen lifecycle and do not require project rebinding.
 
 Existing workspaces from the previous root-level layout can be upgraded with:
 
@@ -119,6 +122,8 @@ node dist/cli.js migrate path/to/workspace
 Migration keeps the old layout under `.mesh2threejs/legacy`, retains its history, and invalidates prior oracle-bound evidence so the imported reference is checked again.
 
 See the [architecture guide](docs/architecture.md) for the engine design. The `examples/` directory contains generic and tank candidate modules.
+
+This repository is development-validated through its protected regression suite and analytical/synthetic workloads. Production certification of a reconstruction still depends on its admitted reference, complete evidence chain, and genuine external visual review.
 
 ## Credits
 

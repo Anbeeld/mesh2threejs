@@ -1,9 +1,13 @@
+import { readFile, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { GateReport, GateRow, SceneComponent, SceneSnapshot } from "../types.js";
 import { rowsToWorkorders } from "../core/compare.js";
+import { validateStyleContract } from "../core/schema.js";
+import { canonicalJson, sha256 } from "../core/hashing.js";
 
 export interface StyleContract {
   schemaVersion: 1;
-  id: "low-poly-faithful";
+  id: string;
   preserve: { macroGeometry: true; orientation: true; articulation: true; repeatedCounts: true };
   simplify: string[];
   omit: string[];
@@ -14,17 +18,38 @@ export interface StyleContract {
   featureSizePolicy?: { minimum: number; unit: "object-unit"; appliesTo: string[] };
 }
 
-export const lowPolyFaithful: StyleContract = {
-  schemaVersion: 1,
-  id: "low-poly-faithful",
-  preserve: { macroGeometry: true, orientation: true, articulation: true, repeatedCounts: true },
-  simplify: ["curvature tessellation", "track links", "small mechanical substructure", "surface microdetail"],
-  omit: ["micro fasteners", "sub-pixel seams", "non-critical hidden mechanisms"],
-  complexity: { triangleTarget: 25_000, triangleMax: 75_000, meshTarget: 160, meshMax: 500, materialTarget: 12, materialMax: 32, segmentRange: [6, 16] },
-  appearance: { shading: "flat-or-faceted", materialVocabulary: "simple-pbr", texturePolicy: "none-or-generated", palette: "subject-derived" },
-  macroRelativeTolerance: 0.01,
-  centerRelativeTolerance: 0.01,
-};
+function stylePath(id: string): string {
+  if (!/^[a-z0-9][a-z0-9-]*$/u.test(id)) throw new Error(`unknown style: ${id}`);
+  return fileURLToPath(new URL(`../../styles/${id}.json`, import.meta.url));
+}
+
+function parseStyleContract(id: string, source: string): { contract: StyleContract; hash: string } {
+  let value: unknown;
+  try { value = JSON.parse(source); } catch { throw new Error(`style contract ${id} is not valid JSON`); }
+  const validation = validateStyleContract(value);
+  if (!validation.valid || (value as { id?: unknown }).id !== id) throw new Error(`style contract ${id} is invalid or unknown`);
+  const contract = structuredClone(value) as StyleContract;
+  return { contract, hash: sha256(canonicalJson(contract)) };
+}
+
+export function getStyleContract(id: string): { contract: StyleContract; hash: string } {
+  try { return parseStyleContract(id, readFileSync(stylePath(id), "utf8")); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`unknown style: ${id}`);
+    throw error;
+  }
+}
+
+export async function loadStyleContract(id: string): Promise<{ contract: StyleContract; hash: string }> {
+  try {
+    const path = stylePath(id);
+    return await new Promise((resolve, reject) => readFile(path, "utf8", (error, source) => error ? reject(error) : resolve(parseStyleContract(id, source))));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`unknown style: ${id}`);
+    throw error;
+  }
+}
+
+export const lowPolyFaithful: StyleContract = getStyleContract("low-poly-faithful").contract;
 
 export function regularPolygonFacetingCorridor(radius: number, segments: number): number {
   if (radius < 0 || !Number.isFinite(radius) || !Number.isInteger(segments) || segments < 3) throw new Error("invalid regular polygon inputs");
@@ -146,7 +171,7 @@ function representationRows(oracle: SceneSnapshot, candidate: SceneSnapshot, con
   return rows;
 }
 
-export function evaluateLowPolyStyle(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: StyleContract): GateReport {
+export function evaluateLowPolyStyle(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: StyleContract, phase = oracle.metadata.name.toLowerCase().includes("tank") ? "style-fabrication" : "style-complexity"): GateReport {
   const rows = [...componentEnvelopeRows(oracle, candidate, contract), ...featureSizeRows(candidate, contract), ...representationRows(oracle, candidate, contract)];
   const complexity: Array<[string, number, number, number]> = [
     ["triangles", candidate.triangleCount, contract.complexity.triangleTarget, contract.complexity.triangleMax],
@@ -168,6 +193,7 @@ export function evaluateLowPolyStyle(oracle: SceneSnapshot, candidate: SceneSnap
       deviation: actual - target,
     });
   }
+  for (const row of rows) row.phase = phase;
   return {
     profile: oracle.metadata.name.toLowerCase().includes("tank") ? "tank" : "generic",
     passed: rows.every((row) => row.passed),

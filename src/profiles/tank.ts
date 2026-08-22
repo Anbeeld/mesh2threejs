@@ -4,10 +4,12 @@ import { checkWatertightness, countConnectedIslands, measureBounds, measureRobus
 import { deriveCanonicalFrame, rasterizeCapture, standardRenderProfile } from "../core/render.js";
 import { filterSnapshot } from "./generic.js";
 import { sceneTriangleAt } from "../core/geometry.js";
+import type { PerformanceRecorder } from "../core/performance.js";
 
 interface TankOptions {
   certification: "exact-real" | "oracle-relative";
   authoritativeDimensions?: { hullLength: number; overallLength: number; width: number; height: number };
+  performance?: PerformanceRecorder;
 }
 
 function componentsBy(snapshot: SceneSnapshot, predicate: (component: SceneComponent) => boolean): SceneComponent[] {
@@ -94,6 +96,7 @@ function hullStationRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRo
 function curve(snapshot: SceneSnapshot, camera: CaptureCamera, resolution: number, orthographicHeight: number): CurvePoint[] {
   const profile = standardRenderProfile({ width: resolution, height: resolution });
   profile.camera.orthographicHeight = orthographicHeight;
+  profile.camera.far = Math.max(profile.camera.far, orthographicHeight * 4);
   const frame = rasterizeCapture(snapshot, profile, camera, "alpha-silhouette");
   return silhouetteCurves(frame).columns.map((column, index) => column ? [index, -column.top, -column.bottom] : null);
 }
@@ -123,7 +126,8 @@ function curveRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow[] {
     const worst = entries.sort(([, a], [, b]) => a.score - b.score)[0];
     const score = worst?.[1].score ?? 0;
     const column = worst?.[1].worst[0];
-    const toObjectUnit = (value: number): number => value / frame.pixelsPerUnit;
+    const horizontalObjectUnit = (value: number): number => value / frame.horizontalPixelsPerUnit;
+    const verticalObjectUnit = (value: number): number => value / frame.verticalPixelsPerUnit;
     return {
       code,
       phase: component === "hull" ? "hull" : component === "turret" ? "turret" : "final",
@@ -131,15 +135,15 @@ function curveRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow[] {
       component,
       ...(worst?.[0] ? { view: worst[0] } : {}),
       viewsEvaluated: entries.map(([view]) => view).sort(),
-      ...(column ? { position: toObjectUnit(column.position - frame.width / 2), oracleValue: toObjectUnit(column.oracleTop), candidateValue: toObjectUnit(column.candidateTop), deviation: toObjectUnit(column.candidateTop - column.oracleTop) } : {}),
+      ...(column ? { position: horizontalObjectUnit(column.position - (frame.width - 1) / 2), oracleValue: verticalObjectUnit(column.oracleTop), candidateValue: verticalObjectUnit(column.candidateTop), deviation: verticalObjectUnit(column.candidateTop - column.oracleTop) } : {}),
       passed: score >= 90,
       score,
       severity: "critical",
       message: `${component} curve floor ${score.toFixed(1)} in ${worst?.[0] ?? "unavailable"}; required 90`,
       normalizedDeviation: (100 - score) / 100,
-      ...(worst?.[1].registration ? { registration: { dAlong: toObjectUnit(worst[1].registration.dAlong), vertical: toObjectUnit(worst[1].registration.vertical), kind: "translation-only" as const } } : {}),
+      ...(worst?.[1].registration ? { registration: { dAlong: horizontalObjectUnit(worst[1].registration.dAlong), vertical: verticalObjectUnit(worst[1].registration.vertical), kind: "translation-only" as const } } : {}),
       ...(worst ? { statistics: { mean: worst[1].meanPct / 100, p95: worst[1].p95Pct / 100, coverage: 1 - worst[1].coverPct / 100, sampleCount: worst[1].worst.length } } : {}),
-      ...(worst ? { worstLocations: worst[1].worst.slice(0, 6).map((item) => ({ position: toObjectUnit(item.position - frame.width / 2), oracleValue: toObjectUnit(item.oracleTop), candidateValue: toObjectUnit(item.candidateTop), physicalDeviation: toObjectUnit(item.candidateTop - item.oracleTop) })) } : {}),
+      ...(worst ? { worstLocations: worst[1].worst.slice(0, 6).map((item) => ({ position: horizontalObjectUnit(item.position - (frame.width - 1) / 2), oracleValue: verticalObjectUnit(item.oracleTop), candidateValue: verticalObjectUnit(item.candidateTop), physicalDeviation: verticalObjectUnit(item.candidateTop - item.oracleTop) })) } : {}),
       physicalUnit: "object-unit",
     };
   };
@@ -218,6 +222,10 @@ function floaterRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
   };
 }
 
+export function evaluateTankPoseRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow[] {
+  return [floaterRow(oracle, candidate)];
+}
+
 export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnapshot, options: TankOptions): GateReport {
   if (options.certification === "exact-real" && !options.authoritativeDimensions) {
     throw new Error("exact-real certification requires authoritative dimensions");
@@ -229,8 +237,8 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
   const measuredHullBounds = measureBounds(candidate, (component) => component.id.startsWith("hull"));
   const requiredHullLength = options.authoritativeDimensions?.hullLength ?? oracleHullBounds.size[2];
   const rows: GateRow[] = [
-    ...curveRows(oracle, candidate),
-    hullStationRow(oracle, candidate),
+    ...(options.performance?.measure("whole-hull-turret-silhouette", () => curveRows(oracle, candidate)) ?? curveRows(oracle, candidate)),
+    options.performance?.measure("fourteen-hull-stations", () => hullStationRow(oracle, candidate)) ?? hullStationRow(oracle, candidate),
     { ...comparisonRow("dimensions.hull-length", "hull", requiredHullLength, measuredHullBounds.size[2], 0.01), phase: "hull", physicalUnit: "object-unit" },
   ];
   const oracleTurret = componentsBy(oracle, (component) => component.id === "turret" || component.id === "turret-pivot");
@@ -265,6 +273,7 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
   const poseAvailable = Boolean(oracleGunPivot && candidateGunPivot && oracle.components.gun?.parentSemanticId === "gun-pivot" && candidate.components.gun?.parentSemanticId === "gun-pivot");
   rows.push({ code: "gun.pose", phase: "gun", component: "gun-pivot", passed: poseAvailable, score: poseAvailable ? 100 : 0, severity: "critical", message: poseAvailable ? "gun is owned by a physical pivot; pose sampling remains required as articulation evidence" : "gun requires a physical gun-pivot ownership chain" });
 
+  const runningGearStarted = options.performance?.start();
   const oracleWheels = componentsBy(oracle, (component) => component.role === "road-wheel" || component.id.startsWith("road-wheel-"));
   const candidateWheels = componentsBy(candidate, (component) => component.role === "road-wheel" || component.id.startsWith("road-wheel-"));
   const gearRole = (component: SceneComponent): string | undefined => component.role ?? ["road-wheel", "sprocket", "idler", "return-roller"].find((role) => component.id.startsWith(`${role}-`) || component.id === role);
@@ -317,8 +326,10 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
     deviation: spacing,
     normalizedDeviation: spacing / Math.max(measureBounds(oracle).size[2], 1),
   });
-  rows.push(fabricationRow(candidate), floaterRow(oracle, candidate));
+  if (runningGearStarted) options.performance!.recordSince("running-gear-matching", runningGearStarted);
+  rows.push(options.performance?.measure("watertightness-connected-islands", () => fabricationRow(candidate)) ?? fabricationRow(candidate), floaterRow(oracle, candidate));
 
+  const tracksStarted = options.performance?.start();
   const oracleTracks = componentsBy(oracle, (component) => component.role === "track-course" || component.id.startsWith("track-"));
   const candidateTracks = componentsBy(candidate, (component) => component.role === "track-course" || component.id.startsWith("track-"));
   const trackCountPassed = oracleTracks.length === candidateTracks.length && oracleTracks.length >= 2;
@@ -351,6 +362,10 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
     const upper = centers.filter((point) => point[1] >= track.bounds.max[1] - track.bounds.size[1] * 0.18);
     const endIndices = centers.map((point, index) => Math.abs(point[2] - track.bounds.center[2]) >= track.bounds.size[2] * 0.38 ? index : -1).filter((index) => index >= 0);
     const diagonalWrapRatio = endIndices.length ? endIndices.filter((index) => Math.abs(triangles[index]!.normal[1]) > 0.15 && Math.abs(triangles[index]!.normal[2]) > 0.15).length / endIndices.length : 0;
+    const wrapNormalBins = new Set(endIndices.map((index) => {
+      const normal = triangles[index]!.normal;
+      return Math.round(Math.atan2(Math.abs(normal[1]), Math.abs(normal[2])) / (Math.PI / 24));
+    })).size;
     const penetration = centers.length ? centers.filter((point) => [0, 1, 2].every((axis) => point[axis]! >= hull.min[axis]! && point[axis]! <= hull.max[axis]!)).length / centers.length : 1;
     const sameSide = gear.filter((item) => Math.sign(item.bounds.center[0]) === Math.sign(track.bounds.center[0]));
     const gearZ = sameSide.map((item) => item.bounds.center[2]);
@@ -359,6 +374,7 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
       lowerRun: span(lower.map((point) => point[2])) / Math.max(track.bounds.size[2], 1e-9),
       upperRun: span(upper.map((point) => point[2])) / Math.max(track.bounds.size[2], 1e-9),
       diagonalWrapRatio,
+      wrapNormalBins,
       penetration,
       frontClearance: gearZ.length ? track.bounds.max[2] - Math.max(...gearZ) : Number.NaN,
       rearClearance: gearZ.length ? Math.min(...gearZ) - track.bounds.min[2] : Number.NaN,
@@ -377,7 +393,8 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
     if (actualMetrics.lowerRun < expectedMetrics.lowerRun - 0.05) courseDiagnosticFailures.push(`${expected.id}:ground-run`);
     if (actualMetrics.upperRun < expectedMetrics.upperRun - 0.05) courseDiagnosticFailures.push(`${expected.id}:upper-run`);
     if (actualMetrics.diagonalWrapRatio + 0.01 < expectedMetrics.diagonalWrapRatio * 0.8) courseDiagnosticFailures.push(`${expected.id}:curved-wrap`);
-    if (actualMetrics.penetration > expectedMetrics.penetration + 0.05) courseDiagnosticFailures.push(`${expected.id}:3d-hull-penetration`);
+    if (actualMetrics.wrapNormalBins < Math.max(3, Math.floor(expectedMetrics.wrapNormalBins * 0.8))) courseDiagnosticFailures.push(`${expected.id}:curved-wrap-normal-diversity`);
+    if (actualMetrics.penetration > expectedMetrics.penetration + 0.05) courseDiagnosticFailures.push(`${expected.id}:3d-hull-envelope-penetration`);
     for (const key of ["frontClearance", "rearClearance", "lateralOffset"] as const) if (!Number.isFinite(actualMetrics[key]) || Math.abs(actualMetrics[key] - expectedMetrics[key]) / clearanceScale > 0.05) courseDiagnosticFailures.push(`${expected.id}:${key}`);
   }
   const trackEnvelopeError = Math.max(...trackErrors, 0);
@@ -390,12 +407,13 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
     passed: trackPassed,
     score: trackPassed ? 100 : Math.max(0, 100 - trackEnvelopeError * 1000),
     severity: "critical",
-    message: `track count ${candidateTracks.length}/${oracleTracks.length}; envelope error ${trackEnvelopeError.toFixed(4)}; wrap void ${courseTopologyPassed ? "present" : "missing"}; continuous ${courseContinuityPassed}; 3D hull penetration ${(hullPenetration * 100).toFixed(1)}%; course diagnostics ${courseDiagnosticFailures.join(", ") || "passed"}`,
+    message: `track count ${candidateTracks.length}/${oracleTracks.length}; envelope error ${trackEnvelopeError.toFixed(4)}; wrap void ${courseTopologyPassed ? "present" : "missing"}; continuous ${courseContinuityPassed}; 3D AABB hull-envelope penetration ${(hullPenetration * 100).toFixed(1)}%; course diagnostics ${courseDiagnosticFailures.join(", ") || "passed"}`,
     oracleValue: oracleTracks.length,
     candidateValue: candidateTracks.length,
     normalizedDeviation: trackEnvelopeError,
     physicalUnit: "object-unit",
   });
+  if (tracksStarted) options.performance!.recordSince("track-diagnostics", tracksStarted);
 
   for (const feature of Object.values(oracle.components).filter((component) => component.critical)) {
     const present = Boolean(candidate.components[feature.id]);

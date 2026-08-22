@@ -4,13 +4,14 @@ import { PNG } from "pngjs";
 import * as THREE from "three";
 import type { CaptureCamera, CaptureFrame, CapturePass, Point3, RenderProfile, SceneSnapshot, SceneTriangle } from "../types.js";
 import { canonicalJson, sha256 } from "./hashing.js";
-import { forEachSceneTriangle, selectSnapshotComponents } from "./geometry.js";
+import { forEachSceneTriangleReusable, selectSnapshotComponents } from "./geometry.js";
 import { compareMasks } from "./measurement.js";
 
 export interface CanonicalFrame {
   width: number;
   height: number;
-  pixelsPerUnit: number;
+  horizontalPixelsPerUnit: number;
+  verticalPixelsPerUnit: number;
   orthographicHeight: number;
   minFeatureSize: number;
   cameras: Record<"side" | "front" | "plan" | "hero", CaptureCamera>;
@@ -25,10 +26,12 @@ export function deriveCanonicalFrame(bounds: { min: Point3; max: Point3; size: P
   const resolution = Math.max(128, Math.min(768, Math.ceil(orthographicHeight * pixelsPerUnit / 16) * 16));
   const distance = span * 2.5 + 1;
   const [x, y, z] = bounds.center;
+  const aspect = resolution / resolution;
   const payload = {
     width: resolution,
     height: resolution,
-    pixelsPerUnit,
+    horizontalPixelsPerUnit: (resolution - 1) / (orthographicHeight * aspect),
+    verticalPixelsPerUnit: (resolution - 1) / orthographicHeight,
     orthographicHeight,
     minFeatureSize,
     cameras: {
@@ -89,11 +92,11 @@ function cameraBasis(camera: CaptureCamera): { position: THREE.Vector3; right: T
   return { position, right, up, forward };
 }
 
-function project(point: Point3, profile: RenderProfile, camera: CaptureCamera, basis: ReturnType<typeof cameraBasis>): ProjectedPoint {
-  const relative = new THREE.Vector3(...point).sub(basis.position);
-  const x = relative.dot(basis.right);
-  const y = relative.dot(basis.up);
-  const depth = relative.dot(basis.forward);
+function projectInto(point: Point3, profile: RenderProfile, camera: CaptureCamera, basis: ReturnType<typeof cameraBasis>, output: ProjectedPoint): void {
+  const rx = point[0] - basis.position.x; const ry = point[1] - basis.position.y; const rz = point[2] - basis.position.z;
+  const x = rx * basis.right.x + ry * basis.right.y + rz * basis.right.z;
+  const y = rx * basis.up.x + ry * basis.up.y + rz * basis.up.z;
+  const depth = rx * basis.forward.x + ry * basis.forward.y + rz * basis.forward.z;
   const aspect = profile.renderer.width / profile.renderer.height;
   let ndcX: number;
   let ndcY: number;
@@ -105,12 +108,10 @@ function project(point: Point3, profile: RenderProfile, camera: CaptureCamera, b
     ndcX = x / ((profile.camera.orthographicHeight * aspect) / 2);
     ndcY = y / (profile.camera.orthographicHeight / 2);
   }
-  return {
-    x: (ndcX * 0.5 + 0.5) * (profile.renderer.width - 1),
-    y: (0.5 - ndcY * 0.5) * (profile.renderer.height - 1),
-    depth,
-    valid: depth >= profile.camera.near && depth <= profile.camera.far && Number.isFinite(ndcX) && Number.isFinite(ndcY),
-  };
+  output.x = (ndcX * 0.5 + 0.5) * (profile.renderer.width - 1);
+  output.y = (0.5 - ndcY * 0.5) * (profile.renderer.height - 1);
+  output.depth = depth;
+  output.valid = depth >= profile.camera.near && depth <= profile.camera.far && Number.isFinite(ndcX) && Number.isFinite(ndcY);
 }
 
 function hashColor(value: string): [number, number, number] {
@@ -187,8 +188,9 @@ export function rasterizeCapture(snapshot: SceneSnapshot, profile: RenderProfile
   zbuffer.fill(Number.POSITIVE_INFINITY);
   const basis = cameraBasis(camera);
 
-  forEachSceneTriangle(snapshot, (triangle) => {
-    const projected = triangle.points.map((point) => project(point, profile, camera, basis)) as [ProjectedPoint, ProjectedPoint, ProjectedPoint];
+  const projected: [ProjectedPoint, ProjectedPoint, ProjectedPoint] = [{ x: 0, y: 0, depth: 0, valid: false }, { x: 0, y: 0, depth: 0, valid: false }, { x: 0, y: 0, depth: 0, valid: false }];
+  forEachSceneTriangleReusable(snapshot, (triangle) => {
+    projectInto(triangle.points[0], profile, camera, basis, projected[0]); projectInto(triangle.points[1], profile, camera, basis, projected[1]); projectInto(triangle.points[2], profile, camera, basis, projected[2]);
     if (!projected.every((point) => point.valid)) return;
     const [a, b, c] = projected;
     const area = edge(a.x, a.y, b.x, b.y, c.x, c.y);

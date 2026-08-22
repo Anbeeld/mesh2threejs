@@ -68,6 +68,7 @@ describe("source and prepared oracle lifecycle", () => {
     const registration = join(parent, "registration.json");
     await writeFile(registration, JSON.stringify({ forwardAxis: "+z", upAxis: "+y", expectedScale: 1, groundY: 0, requiredSemantics: ["primary"], requiredPivots: [], tolerance: 1e-6 }));
     expect(await runCli(["register", root, "--config", registration], sink)).toBe(0);
+    expect(await runCli(["lock", root], sink)).toBe(0);
     expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "reports", "registration-0001.json"), "utf8")).passed).toBe(true);
     await writeFile(join(root, "model", "model.mjs"), `import * as THREE from "three";\nexport function createCandidate(){ const root=new THREE.Group(); const mesh=new THREE.Mesh(new THREE.PlaneGeometry(2,2),new THREE.MeshStandardMaterial({color:new THREE.Color(0.5,0.5,0.5),roughness:0.7,metalness:0})); mesh.position.set(0,1,-1); mesh.name="primary"; mesh.userData.semanticId="primary"; root.add(mesh); return root; }\n`);
     expect(await runCli(["gate", root], sink)).toBe(0);
@@ -77,7 +78,7 @@ describe("source and prepared oracle lifecycle", () => {
     expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "captures", "render-0001", "render-manifest.json"), "utf8"))).toMatchObject({ schemaVersion: 1 });
     expect(await runCli(["prepare-review", root], sink)).toBe(0);
     expect(await runCli(["review-status", root], sink)).toBe(0);
-    expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "visual-review", "review-0001", "packet.json"), "utf8"))).toMatchObject({ schemaVersion: 3 });
+    expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "visual-review", "review-0001", "packet.json"), "utf8"))).toMatchObject({ schemaVersion: 4 });
     const firstGateArtifact = await readFile(join(root, ".mesh2threejs", "evidence", "gate-0001", "gate-0001-primary-mass.json"), "utf8");
     expect(await runCli(["gate", root], sink)).toBe(0);
     expect(await readFile(join(root, ".mesh2threejs", "evidence", "gate-0001", "gate-0001-primary-mass.json"), "utf8")).toBe(firstGateArtifact);

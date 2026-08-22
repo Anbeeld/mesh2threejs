@@ -18,11 +18,30 @@ export interface GenericSubjectContract {
   orientation?:
     | { kind: "landmark-direction"; from: string; to: string; toleranceDegrees: number }
     | { kind: "signed-volume"; minimumAbsoluteVolume?: number };
+  dimensions?: Partial<Record<"width" | "height" | "depth", { include?: string[]; exclude?: string[] }>>;
 }
 
 export interface GenericProfileOptions {
   certification?: "exact-real" | "oracle-relative";
   authoritativeDimensions?: { width: number; height: number; depth: number };
+}
+
+function semanticPatternMatches(value: string, pattern: string): boolean {
+  if (!pattern.includes("*")) return value === pattern;
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/gu, "\\$&").replace(/\*/gu, ".*");
+  return new RegExp(`^${escaped}$`, "u").test(value);
+}
+
+function dimensionBounds(snapshot: SceneSnapshot, policy?: { include?: string[]; exclude?: string[] }) {
+  if (!policy?.include?.length && !policy?.exclude?.length) return measureRobustBounds(snapshot);
+  const included = Object.values(snapshot.components).filter((component) => {
+    const include = !policy.include?.length || policy.include.some((pattern) => semanticPatternMatches(component.id, pattern));
+    const exclude = policy.exclude?.some((pattern) => semanticPatternMatches(component.id, pattern)) ?? false;
+    return include && !exclude;
+  });
+  if (!included.length) throw new Error("generic dimension policy selected no semantic components");
+  const selected = new Set(included.map((component) => component.id));
+  return measureBounds(snapshot, (component) => selected.has(component.id));
 }
 
 function metricRow(code: string, component: string, oracle: number, candidate: number, tolerance: number, severity: "critical" | "major" = "critical"): GateRow {
@@ -45,6 +64,7 @@ function metricRow(code: string, component: string, oracle: number, candidate: n
 function frameCurve(snapshot: SceneSnapshot, camera: CaptureCamera, resolution: number, orthographicHeight: number): CurvePoint[] {
   const profile = standardRenderProfile({ width: resolution, height: resolution });
   profile.camera.orthographicHeight = orthographicHeight;
+  profile.camera.far = Math.max(profile.camera.far, orthographicHeight * 4);
   const frame = rasterizeCapture(snapshot, profile, camera, "alpha-silhouette");
   return silhouetteCurves(frame).columns.map((column, index) => column ? [index, -column.top, -column.bottom] : null);
 }
@@ -100,6 +120,18 @@ function primaryAttachment(snapshot: SceneSnapshot): Array<{ child: string; pare
     : [];
 }
 
+export function evaluateGenericPoseRows(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: GenericSubjectContract = {}): GateRow[] {
+  const attachments = checkAttachments(candidate, contract.attachments ?? primaryAttachment(oracle)).map((check): GateRow => ({
+    code: "attachment.contiguity", component: check.child, passed: check.passed, score: check.passed ? 100 : 0, severity: "critical",
+    message: `${check.child} to ${check.parent} gap ${check.gap.toFixed(4)}; max ${check.maxGap}`,
+  }));
+  const connectivity = (contract.connectivity ?? []).map((item): GateRow => {
+    const islands = countConnectedIslands(candidate, item.semanticId);
+    return { code: `connectivity.${item.semanticId}`, component: item.semanticId, passed: islands > 0 && islands <= item.maxIslands, score: islands > 0 && islands <= item.maxIslands ? 100 : 0, severity: "critical", message: `${item.semanticId} has ${islands} connected islands; max ${item.maxIslands}` };
+  });
+  return [...attachments, ...connectivity];
+}
+
 function semanticRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow[] {
   const semantics = getProfileContract("generic").semantics;
   return [...semantics.required, ...semantics.optional].filter((id) => Boolean(oracle.components[id])).map((id) => {
@@ -119,16 +151,17 @@ function semanticRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow[
 
 export function evaluateGenericProfile(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: GenericSubjectContract = {}, options: GenericProfileOptions = {}): GateReport {
   const oracleBounds = measureRobustBounds(oracle);
-  const candidateBounds = measureRobustBounds(candidate);
   if (options.certification === "exact-real" && !options.authoritativeDimensions) throw new Error("exact-real generic certification requires authoritative width, height, and depth");
   const dimensionKeys = ["width", "height", "depth"] as const;
   if (options.authoritativeDimensions && !dimensionKeys.every((key) => Number.isFinite(options.authoritativeDimensions?.[key]) && options.authoritativeDimensions![key] > 0)) throw new Error(`authoritative generic dimensions require ${dimensionKeys.join(", ")}`);
   if (options.authoritativeDimensions && Object.values(options.authoritativeDimensions).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("authoritative generic dimensions must be positive finite values");
-  const expectedDimensions = options.authoritativeDimensions ?? { width: oracleBounds.size[0], height: oracleBounds.size[1], depth: oracleBounds.size[2] };
+  const dimensionAxes = { width: 0, height: 1, depth: 2 } as const;
+  const measuredDimensions = Object.fromEntries(dimensionKeys.map((key) => [key, dimensionBounds(candidate, contract.dimensions?.[key]).size[dimensionAxes[key]]])) as Record<typeof dimensionKeys[number], number>;
+  const expectedDimensions = options.authoritativeDimensions ?? Object.fromEntries(dimensionKeys.map((key) => [key, dimensionBounds(oracle, contract.dimensions?.[key]).size[dimensionAxes[key]]])) as Record<typeof dimensionKeys[number], number>;
   const dimensions = [
-    metricRow("dimensions.width", "whole-object", expectedDimensions.width, candidateBounds.size[0], 0.01),
-    metricRow("dimensions.height", "whole-object", expectedDimensions.height, candidateBounds.size[1], 0.01),
-    metricRow("dimensions.depth", "whole-object", expectedDimensions.depth, candidateBounds.size[2], 0.01),
+    metricRow("dimensions.width", "whole-object", expectedDimensions.width, measuredDimensions.width, 0.01),
+    metricRow("dimensions.height", "whole-object", expectedDimensions.height, measuredDimensions.height, 0.01),
+    metricRow("dimensions.depth", "whole-object", expectedDimensions.depth, measuredDimensions.depth, 0.01),
   ];
   const orientationMeasurement = (): { passed: boolean; expected: number; actual: number; message: string } => {
     if (contract.orientation?.kind === "signed-volume") {

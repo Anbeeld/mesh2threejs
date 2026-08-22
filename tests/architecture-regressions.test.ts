@@ -152,34 +152,60 @@ describe("scale-independent physical evaluation", () => {
     expect(fine.cameras.side.target).toEqual([0, 2, 0]);
   });
 
-  test("rejects metadata-only reversal, opposite wheel errors, and box-shaped fake tracks", () => {
-    const oracle = createTankFixture();
-    const mirrored = createTankFixture();
-    mirrored.userData.forwardAxis = "+z";
-    mirrored.scale.z = -1;
-    const mirroredReport = evaluateCandidate({ oracle, candidate: mirrored, profile: "tank" }).deterministic;
-    expect(mirroredReport.rows.find((row) => row.code === "orientation.physical")?.passed).toBe(false);
+  test("rejects metadata-only physical reversal", () => {
+    const candidate = createTankFixture();
+    candidate.userData.forwardAxis = "+z";
+    candidate.scale.z = -1;
+    const report = evaluateCandidate({ oracle: createTankFixture(), candidate, profile: "tank" }).deterministic;
+    expect(report.rows.find((row) => row.code === "orientation.physical")?.passed).toBe(false);
+  });
 
-    const wheels = createTankFixture();
-    const left = wheels.getObjectByName("road-wheel--1-0") as THREE.Mesh;
-    const right = wheels.getObjectByName("road-wheel-1-0") as THREE.Mesh;
-    left.scale.setScalar(0.8);
-    right.scale.setScalar(1.2);
-    const wheelReport = evaluateCandidate({ oracle, candidate: wheels, profile: "tank" }).deterministic;
-    expect(wheelReport.rows.some((row) => row.code.startsWith("running-gear.instance") && !row.passed)).toBe(true);
+  test("rejects opposite wheel scale errors", () => {
+    const candidate = createTankFixture();
+    (candidate.getObjectByName("road-wheel--1-0") as THREE.Mesh).scale.setScalar(0.8);
+    (candidate.getObjectByName("road-wheel-1-0") as THREE.Mesh).scale.setScalar(1.2);
+    const report = evaluateCandidate({ oracle: createTankFixture(), candidate, profile: "tank" }).deterministic;
+    expect(report.rows.some((row) => row.code.startsWith("running-gear.instance") && !row.passed)).toBe(true);
+  });
 
-    const tracks = createTankFixture();
-    const track = tracks.getObjectByName("track-1") as THREE.Mesh;
-    track.position.y += 1;
-    const trackReport = evaluateCandidate({ oracle, candidate: tracks, profile: "tank" }).deterministic;
-    expect(trackReport.rows.find((row) => row.code === "track.course")?.passed).toBe(false);
+  test.each([
+    ["displaced", (candidate: THREE.Object3D) => { (candidate.getObjectByName("track-1") as THREE.Mesh).position.y += 1; }],
+    ["box-shaped", (candidate: THREE.Object3D) => {
+      for (const side of [-1, 1]) (candidate.getObjectByName(`track-${side}`) as THREE.Mesh).geometry = new THREE.BoxGeometry(0.25, 1.25, 5.5);
+    }],
+    ["chamfer-spoofed", (candidate: THREE.Object3D) => {
+      for (const side of [-1, 1]) {
+        const shape = new THREE.Shape();
+        const points: Array<[number, number]> = [[-2.4, -0.625], [2.4, -0.625], [2.75, -0.275], [2.75, 0.275], [2.4, 0.625], [-2.4, 0.625], [-2.75, 0.275], [-2.75, -0.275]];
+        shape.moveTo(...points[0]!); for (const point of points.slice(1)) shape.lineTo(...point); shape.closePath();
+        const hole = new THREE.Path();
+        const inner: Array<[number, number]> = [[-2.19, -0.415], [2.19, -0.415], [2.54, -0.065], [2.54, 0.065], [2.19, 0.415], [-2.19, 0.415], [-2.54, 0.065], [-2.54, -0.065]];
+        hole.moveTo(...inner[0]!); for (const point of inner.slice(1)) hole.lineTo(...point); hole.closePath(); shape.holes.push(hole);
+        const geometry = new THREE.ExtrudeGeometry(shape, { depth: 0.25, bevelEnabled: false, curveSegments: 1, steps: 1 });
+        geometry.translate(0, 0, -0.125); geometry.rotateY(Math.PI / 2);
+        (candidate.getObjectByName(`track-${side}`) as THREE.Mesh).geometry = geometry;
+      }
+    }],
+    ["missing-upper-run", (candidate: THREE.Object3D) => {
+      for (const side of [-1, 1]) {
+        const position = (candidate.getObjectByName(`track-${side}`) as THREE.Mesh).geometry.getAttribute("position");
+        for (let index = 0; index < position.count; index += 1) if (position.getY(index) > 0) position.setY(index, 0);
+        position.needsUpdate = true;
+      }
+    }],
+  ] as const)("rejects %s fake track courses", (_label, mutate) => {
+    const candidate = createTankFixture();
+    mutate(candidate);
+    const report = evaluateCandidate({ oracle: createTankFixture(), candidate, profile: "tank" }).deterministic;
+    expect(report.rows.find((row) => row.code === "track.course")?.passed).toBe(false);
+  });
 
-    const boxes = createTankFixture();
-    for (const side of [-1, 1]) {
-      const old = boxes.getObjectByName(`track-${side}`) as THREE.Mesh;
-      old.geometry = new THREE.BoxGeometry(0.25, 1.25, 5.5);
-    }
-    expect(evaluateCandidate({ oracle, candidate: boxes, profile: "tank" }).deterministic.rows.find((row) => row.code === "track.course")?.passed).toBe(false);
+  test("rejects track penetration into the 3D hull envelope", () => {
+    const candidate = createTankFixture();
+    (candidate.getObjectByName("track-1") as THREE.Mesh).position.x = 1;
+    const row = evaluateCandidate({ oracle: createTankFixture(), candidate, profile: "tank" }).deterministic.rows.find((item) => item.code === "track.course");
+    expect(row?.passed).toBe(false);
+    expect(row?.message).toMatch(/AABB hull-envelope penetration/);
   });
 });
 

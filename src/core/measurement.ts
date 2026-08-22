@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { Axis, Bounds3, CaptureFrame, Point3, SceneComponent, SceneSnapshot } from "../types.js";
-import { boundsFromPoints, forEachSceneTriangle, sceneTriangleAt } from "./geometry.js";
+import { boundsFromPoints, forEachSceneTriangle, forEachSceneTriangleReusable, sceneTriangleAt } from "./geometry.js";
 
 const axisIndex: Record<Axis, 0 | 1 | 2> = { x: 0, y: 1, z: 2 };
 
@@ -235,32 +235,45 @@ export function measureLandmarks(snapshot: SceneSnapshot, request: { semanticPat
 export function measureSignedVolume(snapshot: SceneSnapshot): number {
   const origin = measureBounds(snapshot).center;
   let volume = 0;
-  forEachSceneTriangle(snapshot, (triangle) => {
-    const points = triangle.points.map((point) => new THREE.Vector3(point[0] - origin[0], point[1] - origin[1], point[2] - origin[2])) as [THREE.Vector3, THREE.Vector3, THREE.Vector3];
-    volume += points[0].dot(points[1].clone().cross(points[2])) / 6;
+  forEachSceneTriangleReusable(snapshot, (triangle) => {
+    const [a, b, c] = triangle.points;
+    const ax = a[0] - origin[0]; const ay = a[1] - origin[1]; const az = a[2] - origin[2];
+    const bx = b[0] - origin[0]; const by = b[1] - origin[1]; const bz = b[2] - origin[2];
+    const cx = c[0] - origin[0]; const cy = c[1] - origin[1]; const cz = c[2] - origin[2];
+    volume += (ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx)) / 6;
   });
   return volume;
 }
 
 export function countConnectedIslands(snapshot: SceneSnapshot, semanticId: string): number {
   const component = snapshot.components[semanticId];
-  const triangles = component ? Array.from(component.triangleIndices, (index) => sceneTriangleAt(snapshot, index)!) : [];
-  if (!triangles.length) return 0;
-  const vertices = triangles.map((triangle) => new Set(triangle.points.map(roundedPoint)));
-  const parent = triangles.map((_, index) => index);
-  const find = (value: number): number => parent[value] === value ? value : (parent[value] = find(parent[value]!));
+  if (!component?.triangleIndices.length) return 0;
+  const parent = new Int32Array(component.triangleIndices.length);
+  for (let index = 0; index < parent.length; index += 1) parent[index] = index;
+  const find = (value: number): number => {
+    let root = value;
+    while (parent[root] !== root) root = parent[root]!;
+    while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; }
+    return root;
+  };
   const union = (a: number, b: number): void => {
     const rootA = find(a);
     const rootB = find(b);
     if (rootA !== rootB) parent[rootB] = rootA;
   };
   const owners = new Map<string, number>();
-  vertices.forEach((set, triangleIndex) => {
-    for (const vertex of set) {
+  for (let triangleIndex = 0; triangleIndex < component.triangleIndices.length; triangleIndex += 1) {
+    const localTriangle = component.triangleIndices[triangleIndex]!;
+    const physicalTriangle = snapshot.triangleSelection?.[localTriangle] ?? localTriangle;
+    for (let vertexIndex = 0; vertexIndex < 3; vertexIndex += 1) {
+      const offset = physicalTriangle * 9 + vertexIndex * 3;
+      const vertex = `${snapshot.triangleData.positions[offset]!.toFixed(7)},${snapshot.triangleData.positions[offset + 1]!.toFixed(7)},${snapshot.triangleData.positions[offset + 2]!.toFixed(7)}`;
       const owner = owners.get(vertex);
       if (owner === undefined) owners.set(vertex, triangleIndex);
       else union(owner, triangleIndex);
     }
-  });
-  return new Set(parent.map((_, index) => find(index))).size;
+  }
+  let islands = 0;
+  for (let index = 0; index < parent.length; index += 1) if (find(index) === index) islands += 1;
+  return islands;
 }

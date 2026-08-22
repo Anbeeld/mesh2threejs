@@ -91,9 +91,9 @@ function materialRecord(
 }
 
 function geometrySegments(geometry: THREE.BufferGeometry): number[] {
-  const parameters = (geometry as THREE.BufferGeometry & { parameters?: Record<string, unknown> }).parameters;
+  const parameters = (geometry as THREE.BufferGeometry & { parameters?: Record<string, unknown> & { options?: Record<string, unknown> } }).parameters;
   if (!parameters) return [];
-  return [parameters.radialSegments, parameters.tubularSegments, parameters.widthSegments]
+  return [parameters.radialSegments, parameters.tubularSegments, parameters.widthSegments, parameters.options?.curveSegments]
     .filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value >= 3);
 }
 
@@ -294,6 +294,24 @@ export function sceneTriangleAt(snapshot: SceneSnapshot, index: number): SceneTr
 
 export function forEachSceneTriangle(snapshot: SceneSnapshot, visit: (triangle: SceneTriangle, index: number) => void): void {
   for (let index = 0; index < snapshot.triangleCount; index += 1) visit(sceneTriangleAt(snapshot, index)!, index);
+}
+
+/** Allocation-free traversal. The triangle and point arrays are reused and must not be retained by the visitor. */
+export function forEachSceneTriangleReusable(snapshot: SceneSnapshot, visit: (triangle: SceneTriangle, index: number) => void): void {
+  const triangle: SceneTriangle = { points: [[0, 0, 0], [0, 0, 0], [0, 0, 0]], normal: [0, 0, 0], componentId: "", materialId: "", color: 0, roughness: 0 };
+  for (let selectionIndex = 0; selectionIndex < snapshot.triangleCount; selectionIndex += 1) {
+    const index = snapshot.triangleSelection?.[selectionIndex] ?? selectionIndex;
+    for (let vertex = 0; vertex < 3; vertex += 1) {
+      const offset = index * 9 + vertex * 3; const point = triangle.points[vertex]!;
+      point[0] = snapshot.triangleData.positions[offset]!; point[1] = snapshot.triangleData.positions[offset + 1]!; point[2] = snapshot.triangleData.positions[offset + 2]!;
+    }
+    const normalOffset = index * 3;
+    triangle.normal[0] = snapshot.triangleData.normals[normalOffset]!; triangle.normal[1] = snapshot.triangleData.normals[normalOffset + 1]!; triangle.normal[2] = snapshot.triangleData.normals[normalOffset + 2]!;
+    triangle.componentId = snapshot.triangleData.componentIds[snapshot.triangleData.componentIndices[index]!]!;
+    triangle.materialId = snapshot.triangleData.materialIds[snapshot.triangleData.materialIndices[index]!]!;
+    triangle.color = snapshot.triangleData.colors[index]!; triangle.roughness = snapshot.triangleData.roughness[index]!;
+    visit(triangle, selectionIndex);
+  }
 }
 
 export function selectSnapshotComponents(snapshot: SceneSnapshot, filter: (component: SceneComponent) => boolean): SceneSnapshot {

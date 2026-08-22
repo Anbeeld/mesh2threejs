@@ -5,6 +5,8 @@ import {
   checkArticulation,
   checkAttachments,
   compareMasks,
+  deriveCanonicalFrame,
+  evaluateGenericProfile,
   fingerprintScene,
   measureBounds,
   measureSection,
@@ -49,6 +51,24 @@ describe("live scene geometry", () => {
     expect(comparison.missingRatio + comparison.excessRatio).toBeGreaterThan(0);
     const curves = silhouetteCurves(a);
     expect(curves.columns.some((column) => column !== null)).toBe(true);
+  });
+
+  test("records exact post-rounding horizontal and vertical raster scales", () => {
+    const frame = deriveCanonicalFrame({ min: [-2, -1, -3], max: [2, 1, 3], size: [4, 2, 6], center: [0, 0, 0] }, 0.037);
+    expect(frame.horizontalPixelsPerUnit).toBeCloseTo((frame.width - 1) / frame.orthographicHeight, 12);
+    expect(frame.verticalPixelsPerUnit).toBeCloseTo((frame.height - 1) / frame.orthographicHeight, 12);
+    expect(17 / frame.horizontalPixelsPerUnit * frame.horizontalPixelsPerUnit).toBeCloseTo(17, 12);
+  });
+
+  test("applies explicit semantic dimension inclusion policies", () => {
+    const oracle = createGenericFixture();
+    const candidate = createGenericFixture();
+    oracle.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(0.1, 10, 0.1)), { name: "antenna" }));
+    candidate.add(Object.assign(new THREE.Mesh(new THREE.BoxGeometry(0.1, 20, 0.1)), { name: "antenna" }));
+    oracle.children.at(-1)!.userData.semanticId = "antenna-whip";
+    candidate.children.at(-1)!.userData.semanticId = "antenna-whip";
+    const report = evaluateGenericProfile(snapshotScene(oracle), snapshotScene(candidate), { dimensions: { width: { include: ["primary"] }, height: { include: ["primary"] }, depth: { include: ["primary"] } } }, { certification: "exact-real", authoritativeDimensions: { width: 4, height: 2, depth: 3 } });
+    expect(report.rows.filter((row) => row.code.startsWith("dimensions.")).every((row) => row.passed)).toBe(true);
   });
 
   test("detects detached attachments", () => {

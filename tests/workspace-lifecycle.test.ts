@@ -65,17 +65,17 @@ describe("self-contained workspace lifecycle", () => {
     const sources = join(parent, "sources");
     const oracle = await writeReference(sources, "subject.glb", "oracle-bytes");
     const image = await writeReference(sources, "front.png", "image-bytes");
-    const document = await writeReference(sources, "dimensions.md", "height: 2m");
+    const document = await writeReference(sources, "dimensions.json", JSON.stringify({ dimensions: { height: { exclude: ["antenna*"] } } }));
     const root = join(parent, "workspace");
     const result = await initializeWorkspace(root, { ...baseProject, references: [oracle, image], subjectContract: document });
     expect(result.project).toMatchObject({
       oracle: "refs/oracle/subject.glb",
       images: ["refs/images/front.png"],
-      documents: ["refs/docs/dimensions.md"],
-      subjectContract: "refs/docs/dimensions.md",
+      documents: ["refs/docs/dimensions.json"],
+      subjectContract: "refs/docs/dimensions.json",
       portable: true,
     });
-    expect((await resumeWorkspace(root)).resolved.subjectContract).toBe(join(root, "refs", "docs", "dimensions.md"));
+    expect((await resumeWorkspace(root)).resolved.subjectContract).toBe(join(root, "refs", "docs", "dimensions.json"));
     const index = JSON.parse(await readFile(join(root, ".mesh2threejs", "references.json"), "utf8")) as { records: Array<{ operationalPath: string; originalPath: string; sha256: string }> };
     expect(index.records).toHaveLength(3);
     for (const record of index.records) {

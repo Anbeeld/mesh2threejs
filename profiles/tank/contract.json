@@ -6,7 +6,7 @@
     "optional": ["hull-upper", "cupola", "sprocket", "idler", "return-roller"],
     "critical": ["hull", "turret", "gun", "turret-pivot", "gun-pivot"]
   },
-  "operators": ["adaptive-orthographic-curves", "articulation-poses", "bounds-robust", "connectivity", "critical-semantics", "fabrication", "landmarks", "physical-orientation", "repeated-instances", "sections", "track-course"],
+  "operators": ["adaptive-orthographic-curves", "articulation-poses", "bounds-robust", "connectivity", "critical-semantics", "fabrication", "landmarks", "physical-orientation", "repeated-instances", "sections", "track-course", "style-contract", "complexity-budget"],
   "phases": [
     {"id":"oracle-registration","dependsOn":[],"owner":"oracle","requiredGates":["registration.complete"]},
     {"id":"hull","dependsOn":["oracle-registration"],"owner":"builder","requiredGates":["curves.hull","hull.stations","dimensions.hull-length","orientation.physical"]},
@@ -15,7 +15,7 @@
     {"id":"running-gear","dependsOn":["hull"],"owner":"builder","requiredGates":["running-gear.instances"]},
     {"id":"tracks","dependsOn":["running-gear"],"owner":"builder","requiredGates":["track.course"]},
     {"id":"fittings-articulation","dependsOn":["gun","tracks"],"owner":"builder","requiredGates":["articulation.poses","ownership.seating"]},
-    {"id":"style-fabrication","dependsOn":["fittings-articulation"],"owner":"builder","requiredGates":["fabrication.profile"]},
+    {"id":"style-fabrication","dependsOn":["fittings-articulation"],"owner":"builder","requiredGates":["fabrication.profile","style.contract","style.complexity"]},
     {"id":"visual-review","dependsOn":["style-fabrication"],"owner":"reviewer","requiredGates":["visual.review"]},
     {"id":"final","dependsOn":["visual-review"],"owner":"finalizer","requiredGates":["curves.whole"]}
   ],
@@ -34,6 +34,8 @@
     {"code":"articulation.poses","phase":"fittings-articulation","operator":"articulation-poses","required":true,"threshold":100},
     {"code":"ownership.seating","phase":"fittings-articulation","operator":"connectivity","required":true,"threshold":100},
     {"code":"fabrication.profile","phase":"style-fabrication","operator":"fabrication","required":true,"threshold":100},
+      {"code":"style.contract","phase":"style-fabrication","operator":"style-contract","required":true,"threshold":0},
+      {"code":"style.complexity","phase":"style-fabrication","operator":"complexity-budget","required":true,"threshold":0},
     {"code":"visual.review","phase":"visual-review","operator":"critical-semantics","required":true,"threshold":100},
     {"code":"curves.whole","phase":"final","operator":"adaptive-orthographic-curves","required":true,"threshold":90,"views":["side","plan","front"]}
   ],

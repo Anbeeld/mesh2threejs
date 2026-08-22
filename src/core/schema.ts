@@ -11,7 +11,7 @@ export const styleContractSchema = {
   required: ["schemaVersion", "id", "preserve", "simplify", "omit", "complexity", "appearance", "macroRelativeTolerance", "centerRelativeTolerance"],
   properties: {
     schemaVersion: { const: 1 },
-    id: { const: "low-poly-faithful" },
+    id: { type: "string", pattern: "^[a-z0-9][a-z0-9-]*$" },
     preserve: {
       type: "object",
       required: ["macroGeometry", "orientation", "articulation", "repeatedCounts"],

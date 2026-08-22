@@ -1,6 +1,9 @@
 ---
 name: mesh2threejs
 description: Reconstruct rigid hard-surface live GLB references as independently authored procedural Three.js, with executable profile contracts, deterministic gates, durable phase locks, and genuine visual review. Use for tank or generic reconstruction tasks in this repository.
+metadata:
+  version: '0.4.0'
+  prompting-standard: 'PROMPTING.md v1.1.0'
 ---
 
 # Mesh2Threejs Router

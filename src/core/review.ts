@@ -17,11 +17,13 @@ export interface ReviewFileReference {
 }
 
 export interface VisualReviewPacket {
-  schemaVersion: 3;
+  schemaVersion: 4;
   oracleHash: string;
   candidateHash: string;
   profile: ProfileId;
   profileContractHash: string;
+  styleContractHash: string;
+  evaluationIdentityHash: string;
   styleHash: string;
   deterministicArtifactHash: string;
   captures: CaptureReference[];
@@ -70,7 +72,7 @@ function assertVisualReviewPacketContents(input: Omit<VisualReviewPacket, "packe
 
 export function createVisualReviewPacket(input: Omit<VisualReviewPacket, "schemaVersion" | "packetHash">): VisualReviewPacket {
   assertVisualReviewPacketContents(input);
-  const payload = { schemaVersion: 3 as const, ...input };
+  const payload = { schemaVersion: 4 as const, ...input };
   return { ...payload, packetHash: sha256(canonicalJson(payload)) };
 }
 
@@ -89,7 +91,7 @@ export async function verifyVisualReviewPacketFiles(packet: VisualReviewPacket, 
 }
 
 export function verifyVisualReviewPacket(packet: VisualReviewPacket): void {
-  if (packet.schemaVersion !== 3) throw new Error("visual review packet schema is invalid");
+  if (packet.schemaVersion !== 4 || !packet.styleContractHash || !packet.evaluationIdentityHash) throw new Error("visual review packet schema or evaluation identity is invalid");
   const { packetHash, ...payload } = packet;
   if (sha256(canonicalJson(payload)) !== packetHash) throw new Error("visual review packet hash is invalid");
   assertVisualReviewPacketContents(packet);

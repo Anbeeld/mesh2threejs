@@ -9,4 +9,6 @@ Read the selected profile standard and StyleContract. Execute one coherent repai
 
 Use native Three.js primitives, lofts, transforms, materials, semantic IDs, and explicit pivots. Tank candidates expose `setPose({turretYaw, gunElevation})`; fittings must live under the pivot that owns them. Never load oracle files or paste dense topology/vertex dumps. Preserve macro truth before detail. Run the transitive candidate audit and profile/style gates; execute only the active phase's first coherent repair group.
 
+For a first build in an active phase, finish the smallest complete candidate for that phase before running its audit-and-repair cycle. Do not interleave evaluator verdicts into construction of one incomplete component.
+
 Candidate changes invalidate dependent evidence. If three equivalent attempts add no evidence and do not move a metric, route to diagnosis; there is no arbitrary attempt cap.

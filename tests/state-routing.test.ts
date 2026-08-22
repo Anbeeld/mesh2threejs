@@ -10,6 +10,7 @@ import {
   bindOracle,
   certifyState,
   createEvidenceArtifact,
+  createEvaluationIdentity,
   createRenderEvidenceArtifact,
   createRuntimeEvaluationEvidenceArtifact,
   createRuntimeGateEvidenceArtifact,
@@ -19,6 +20,7 @@ import {
   loadProfileContract,
   profileContractHash,
   determineNextAction,
+  evaluationIdentityHash,
   recordAttempt,
   recordEvidence,
   recordEvidenceArtifact,
@@ -44,6 +46,12 @@ describe("durable workflow state", () => {
     state = recordEvidence(state, { id: "review", kind: "visual-review", phase: "visual-review", artifact: "review.json", passed: true, oracleHash: "oracle-a", candidateHash: "candidate-a" });
     state = bindCandidate(state, "candidate-b");
     expect(state.evidence.review?.valid).toBe(false);
+  });
+
+  test("rejects passing evidence from a different style contract", () => {
+    const state = bindCandidate(bindOracle(createTaskState({ taskId: "style-drift", profile: "generic", style: "low-poly-faithful" }), "oracle"), "candidate");
+    const artifact = createRuntimeEvaluationEvidenceArtifact({ id: "wrong-style", kind: "style", phase: "style-complexity", oracleHash: "oracle", candidateHash: "candidate", profileContractHash: state.profileContractHash, styleContractHash: "different-style-contract", evaluationIdentityHash: "evaluation", configHash: "evaluation", report: { profile: "generic", passed: true, score: 100, rows: [{ code: "style.fixture", phase: "style-complexity", component: "fixture", passed: true, score: 100, severity: "major", message: "fixture" }], workorders: [] } });
+    expect(() => recordEvidenceArtifact(state, "wrong-style.json", artifact)).toThrow(/style contract is stale/);
   });
 
   test("oracle edits invalidate all comparison evidence", () => {
@@ -145,22 +153,26 @@ describe("durable workflow state", () => {
   test("certifies only a complete set bound to the final hashes", async () => {
     let state = bindCandidatePhases(bindOracle(createTaskState({ taskId: "complete", profile: "generic", style: "low-poly-faithful" }), "oracle-final"), "candidate-final", { "primary-mass": "primary-mass", attachments: "attachments", "identity-features": "identity-features", "style-complexity": "style-complexity", "visual-review": "visual-review" });
     state.profileContractHash = profileContractHash(await loadProfileContract("generic"));
+    const identity = createEvaluationIdentity({ evaluatorVersion: "fixture", measurementVersion: "fixture", profile: "generic", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, subjectContractHash: null, certification: "oracle-relative", preparedOracleHash: "oracle-final", authoritativeDimensionsHash: null, candidateSourceHash: "source", candidateNeutralHash: "neutral" });
+    const identityHash = evaluationIdentityHash(identity);
+    state.evaluationIdentity = identity;
+    state.evaluationIdentityHash = identityHash;
     const phaseEvidence = [["oracle-registration", "registration"], ["primary-mass", "deterministic-gate"], ["attachments", "articulation"], ["identity-features", "complexity"], ["style-complexity", "style"], ["visual-review", "visual-review"]] as const;
     const gatesByPhase: Record<string, string[]> = {
-      "oracle-registration": ["registration.complete"], "primary-mass": ["dimensions.robust", "orientation.physical", "silhouette.views"], attachments: ["attachments.contract"], "identity-features": ["semantics.critical"], "style-complexity": ["connectivity.contract"], "visual-review": ["visual.review"],
+      "oracle-registration": ["registration.complete"], "primary-mass": ["dimensions.robust", "orientation.physical", "silhouette.views"], attachments: ["attachments.contract"], "identity-features": ["semantics.critical"], "style-complexity": ["connectivity.contract", "style.contract", "style.complexity"], "visual-review": ["visual.review"],
     };
     for (const [phase, kind] of phaseEvidence) {
       const gateResults = gatesByPhase[phase]!.map((code) => ({ code, passed: true, score: 100 }));
       const artifact = phase === "oracle-registration" || phase === "visual-review"
-        ? createWorkflowGateEvidenceArtifact({ id: kind, kind: kind as "registration" | "visual-review", phase, oracleHash: "oracle-final", candidateHash: "candidate-final", profileContractHash: state.profileContractHash, configHash: "fixture", gateCode: phase === "oracle-registration" ? "registration.complete" : "visual.review", passed: true, summary: "fixture" })
-        : createRuntimeGateEvidenceArtifact({ id: kind, phase, oracleHash: "oracle-final", candidateHash: "candidate-final", profileContractHash: state.profileContractHash, configHash: "fixture", report: { profile: "generic", passed: true, score: 100, rows: gateResults.map((gate) => ({ ...gate, phase, component: "fixture", severity: "critical", message: "fixture" })), workorders: [] } });
+        ? createWorkflowGateEvidenceArtifact({ id: kind, kind: kind as "registration" | "visual-review", phase, oracleHash: "oracle-final", candidateHash: "candidate-final", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: phase === "oracle-registration" ? null : identityHash, configHash: "fixture", gateCode: phase === "oracle-registration" ? "registration.complete" : "visual.review", passed: true, summary: "fixture" })
+        : createRuntimeGateEvidenceArtifact({ id: kind, phase, oracleHash: "oracle-final", candidateHash: "candidate-final", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: identityHash, configHash: identityHash, report: { profile: "generic", passed: true, score: 100, rows: gateResults.map((gate) => ({ ...gate, phase, component: "fixture", severity: "critical", message: "fixture" })), workorders: [] } });
       state = recordEvidenceArtifact(state, `${kind}.json`, artifact);
       state = acceptPhase(state, phase, { geometryHash: phase, evidenceIds: [kind], contractHash: state.profileContractHash });
     }
     for (const kind of ["style", "complexity"] as const) {
-      state = recordEvidenceArtifact(state, `${kind}-summary.json`, createRuntimeEvaluationEvidenceArtifact({ id: `${kind}-summary`, kind, phase: "style-complexity", oracleHash: "oracle-final", candidateHash: "candidate-final", profileContractHash: state.profileContractHash, configHash: "fixture", report: { profile: "generic", passed: true, score: 100, rows: [{ code: `${kind}.fixture`, phase: "style-complexity", component: "fixture", passed: true, score: 100, severity: "major", message: "fixture" }], workorders: [] } }));
+      state = recordEvidenceArtifact(state, `${kind}-summary.json`, createRuntimeEvaluationEvidenceArtifact({ id: `${kind}-summary`, kind, phase: "style-complexity", oracleHash: "oracle-final", candidateHash: "candidate-final", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: identityHash, configHash: identityHash, report: { profile: "generic", passed: true, score: 100, rows: [{ code: `${kind}.fixture`, phase: "style-complexity", component: "fixture", passed: true, score: 100, severity: "major", message: "fixture" }], workorders: [] } }));
     }
-    state = recordEvidenceArtifact(state, "turntable.json", createRenderEvidenceArtifact({ id: "turntable", phase: "visual-review", oracleHash: "oracle-final", candidateHash: "candidate-final", profileContractHash: state.profileContractHash, configHash: "fixture", manifest: { turntable: [{ path: "turntable.png", sha256: "a".repeat(64) }] } }));
+    state = recordEvidenceArtifact(state, "turntable.json", createRenderEvidenceArtifact({ id: "turntable", phase: "visual-review", oracleHash: "oracle-final", candidateHash: "candidate-final", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: identityHash, configHash: identityHash, manifest: { turntable: [{ path: "turntable.png", sha256: "a".repeat(64) }] } }));
     expect(certifyState(state).status).toBe("certified");
   });
 
@@ -179,7 +191,10 @@ describe("durable workflow state", () => {
     for (const kind of ["style", "complexity", "articulation", "turntable"] as const) {
       state = recordEvidenceArtifact(state, `${kind}.json`, createEvidenceArtifact({ id: kind, kind, phase: "style-fabrication", oracleHash: "oracle", candidateHash: "candidate", profileContractHash: state.profileContractHash, configHash: "fixture", result: { passed: true, summary: "fixture" } }));
     }
-    state = recordEvidenceArtifact(state, "claimed-final.json", createEvidenceArtifact({ id: "claimed-final", kind: "deterministic-gate", phase: "final", oracleHash: "oracle", candidateHash: "candidate", profileContractHash: state.profileContractHash, configHash: "fixture", gateResults: [{ code: "curves.whole", passed: true, score: 100 }], result: { passed: true, summary: "claimed final pass" } }));
+    const identity = createEvaluationIdentity({ evaluatorVersion: "fixture", measurementVersion: "fixture", profile: "tank", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, subjectContractHash: null, certification: "oracle-relative", preparedOracleHash: "oracle", authoritativeDimensionsHash: null, candidateSourceHash: "source", candidateNeutralHash: "neutral" });
+    state.evaluationIdentity = identity;
+    state.evaluationIdentityHash = evaluationIdentityHash(identity);
+    state = recordEvidenceArtifact(state, "claimed-final.json", createEvidenceArtifact({ id: "claimed-final", kind: "deterministic-gate", phase: "final", oracleHash: "oracle", candidateHash: "candidate", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash, configHash: "fixture", gateResults: [{ code: "curves.whole", passed: true, score: 100 }], result: { passed: true, summary: "claimed final pass" } }));
     expect(() => certifyState(state)).toThrow(/final gates/);
   });
 });

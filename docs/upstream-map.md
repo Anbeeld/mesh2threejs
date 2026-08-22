@@ -20,10 +20,10 @@ Excluded CoT baggage: fleet manifests, spawning, collision/physics, gameplay wea
 
 ## Drift snapshot
 
-Remote heads inspected on 2026-08-22:
+Remote heads inspected on 2026-08-22. The audited pins above remain unchanged:
 
-- Claude-of-Tanks: `93a801bfad338748ea8901a6dcb12722dbc8b52b` (pin is behind). Relevant changed paths include `src/vehicles/suspensionPatterns.js`, `src/vehicles/profiles/leopard.js`, `tools/track-system-audit.mjs`, and `tools/track-system-audit.html`. Review found fleet/gameplay suspension-link receipts and an axle-gap audit, not a change to the adapted curve/station formulas. No code was auto-merged; task-specific generic connectivity can declare suspension links when they are reference-critical.
+- Claude-of-Tanks remote HEAD: `3e868fb2fad7fee9b013dd562f8f961880bdbcb4`, 14 commits beyond the audited pin. The reviewed drift adds world/gameplay work, suspension linkages, vehicle profiles, and track-shoe alignment. Within the adapted geometry-gate path, `docs/geometry-gate/ledger.json` only adds a Leopard evaluation row and updated generated counts. No adapted curve or station formula changed, so no code was auto-merged.
 - img2threejs: still `d6673386f89673a58736f8d398dd16ece67874f5`.
-- PROMPTING.md: still `ea8c5e7e22134ac57984d67a2cdc7c29c7c4ba90`.
+- PROMPTING.md remote HEAD and `v1.1.0`: `069bb48508e0d7f83546770d3b04d9eebed5158b`, one commit beyond the audited pin. The instruction audit applied the relevant changes: first-build versus later audit separation, mechanically derived volatile identity, lifecycle enforcement in runtime controls, maintenance metadata, and evaluation-claim discipline. The audited attribution pin remains the earlier revision because no text or code was recopied.
 
 `mesh2threejs upstream-drift` rechecks remote heads and reports changed relevant paths without modifying this repository.

@@ -55,6 +55,8 @@ describe("deterministic replay and visual authority", () => {
       oracleHash: "oracle-a",
       profile: "generic",
       profileContractHash: hash,
+      styleContractHash: hash,
+      evaluationIdentityHash: hash,
       styleHash: hash,
       deterministicArtifactHash: hash,
       captures: [{ path: "beauty-front.png", sha256: hash, pass: "beauty", cameraId: "front" }],
@@ -79,7 +81,7 @@ describe("deterministic replay and visual authority", () => {
     await writeFile(path, bytes);
     const hash = sha256(bytes);
     const packet = createVisualReviewPacket({
-      candidateHash: "candidate-a", oracleHash: "oracle-a", profile: "generic", profileContractHash: hash,
+      candidateHash: "candidate-a", oracleHash: "oracle-a", profile: "generic", profileContractHash: hash, styleContractHash: hash, evaluationIdentityHash: hash,
       styleHash: hash, deterministicArtifactHash: hash,
       captures: [{ path, sha256: hash, pass: "beauty", cameraId: "front" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash,
       regionEvidence: { status: "available", semanticArtifactHash: hash },

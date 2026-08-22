@@ -26,6 +26,7 @@ import {
   evaluateGenericProfile,
   inspectAllUpstreamDrift,
   loadTaskState,
+  saveTaskState,
   materialDiagnosticKey,
   validateProfileContract,
   verifyVisualReviewVerdict,
@@ -50,7 +51,7 @@ describe("extended durable CLI", () => {
     expect(await runCli(["bind-oracle", root, "--hash", "oracle"], io().sink)).toBe(0);
     expect(await runCli(["bind-candidate", root, "--hash", "candidate"], io().sink)).toBe(0);
     let state = await loadTaskState(statePath);
-    const registration = createWorkflowGateEvidenceArtifact({ id: "registration", kind: "registration", phase: "oracle-registration", oracleHash: "oracle", candidateHash: null, profileContractHash: state.profileContractHash, configHash: "config", gateCode: "registration.complete", passed: true, summary: "registered" });
+    const registration = createWorkflowGateEvidenceArtifact({ id: "registration", kind: "registration", phase: "oracle-registration", oracleHash: "oracle", candidateHash: null, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: null, configHash: "config", gateCode: "registration.complete", passed: true, summary: "registered" });
     const artifactPath = join(root, ".mesh2threejs", "evidence", "registration.json");
     await mkdir(join(root, ".mesh2threejs", "evidence"), { recursive: true });
     await writeFile(artifactPath, `${JSON.stringify(registration)}\n`);
@@ -82,7 +83,11 @@ describe("extended durable CLI", () => {
     const imageBytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
     await writeFile(join(root, "beauty.png"), imageBytes);
     const hash = sha256(imageBytes);
-    const config = { oracleHash: "oracle", candidateHash: "candidate", profile: "generic" as const, profileContractHash: state.profileContractHash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "beauty.png", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "available" as const, semanticArtifactHash: hash }, files: ["capture", "comparison-board", "turntable", "deterministic", "style", "articulation", "region"].map((role) => ({ path: "beauty.png", sha256: hash, role })) as never };
+    state.evaluationIdentityHash = hash;
+    const manualStatePath = join(root, "low-level", "state.json");
+    await mkdir(join(root, "low-level"), { recursive: true });
+    await saveTaskState(manualStatePath, state);
+    const config = { oracleHash: "oracle", candidateHash: "candidate", profile: "generic" as const, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: hash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "beauty.png", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "available" as const, semanticArtifactHash: hash }, files: ["capture", "comparison-board", "turntable", "deterministic", "style", "articulation", "region"].map((role) => ({ path: "beauty.png", sha256: hash, role })) as never };
     const configPath = join(root, "review-config.json"); const packetPath = join(root, "review-packet.json");
     await writeFile(configPath, JSON.stringify(config));
     expect(await runCli(["prepare-review", configPath, "--out", packetPath], io().sink)).toBe(0);
@@ -91,8 +96,9 @@ describe("extended durable CLI", () => {
     const verdict = createVisualReviewVerdict({ packetHash: packet.packetHash, reviewer: { kind: "external-vision", id: "fixture-reviewer" }, verdict: "PASS", findings: [] });
     await writeFile(packetPath, `${JSON.stringify(packet)}\n`);
     const verdictPath = join(root, "verdict.json"); await writeFile(verdictPath, JSON.stringify(verdict));
-    expect(await runCli(["record-review", statePath, "--packet", packetPath, "--verdict", verdictPath, "--artifact", join(root, "evidence", "visual.json")], io().sink)).toBe(0);
-    expect((await loadTaskState(statePath)).visualReviewStatus).toBe("passed");
+    const recording = io();
+    expect(await runCli(["record-review", manualStatePath, "--packet", packetPath, "--verdict", verdictPath, "--artifact", join(root, "evidence", "visual.json")], recording.sink), recording.output.join("\n")).toBe(0);
+    expect((await loadTaskState(manualStatePath)).visualReviewStatus).toBe("passed");
   });
 
   test("does not reinterpret an invalid workspace as a low-level input file", async () => {
@@ -201,11 +207,11 @@ describe("fail-closed validation branches", () => {
     expect(createDerivativeCacheEntry({ sourceHash: "s", preparedHash: "p", profileContractHash: "c", measurementVersion: "v", cameraFrameHash: "f", renderConfigHash: "r" }, 1).value).toBe(1);
     expect(validateProfileContract(null).valid).toBe(false);
     expect(validateProfileContract({ schemaVersion: 1, id: "bad", phases: [], gates: [], operators: [] }).errors.length).toBeGreaterThan(2);
-    expect(() => createVisualReviewPacket({ oracleHash: "o", candidateHash: "c", profile: "generic", profileContractHash: "h", styleHash: "h", deterministicArtifactHash: "h", captures: [], comparisonBoardHashes: [], turntableHashes: [], articulationArtifactHash: "h", regionEvidence: { status: "unavailable", reason: "semantic IDs invalid" }, files: [] })).toThrow(/requires/);
+    expect(() => createVisualReviewPacket({ oracleHash: "o", candidateHash: "c", profile: "generic", profileContractHash: "h", styleContractHash: "h", evaluationIdentityHash: "h", styleHash: "h", deterministicArtifactHash: "h", captures: [], comparisonBoardHashes: [], turntableHashes: [], articulationArtifactHash: "h", regionEvidence: { status: "unavailable", reason: "semantic IDs invalid" }, files: [] })).toThrow(/requires/);
     expect(() => createVisualReviewVerdict({ packetHash: "x", reviewer: { kind: "external-vision", id: "" }, verdict: "PASS", findings: [] })).toThrow(/identity/);
     expect(() => createVisualReviewVerdict({ packetHash: "x", reviewer: { kind: "external-vision", id: "reviewer" }, verdict: "PASS", findings: [{ criterion: "x", evidence: "x", severity: "major", regionView: "hero", expectedCorrection: "fix", reopenPhase: "primary-mass" }] })).toThrow(/contradicts/);
     const hash = "a".repeat(64);
-    const packet = createVisualReviewPacket({ oracleHash: "o", candidateHash: "c", profile: "generic", profileContractHash: hash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "x", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "unavailable", reason: "semantic IDs invalid" }, files: ["capture", "comparison-board", "turntable", "deterministic", "style", "articulation"].map((role) => ({ path: "x", sha256: hash, role })) as never });
+    const packet = createVisualReviewPacket({ oracleHash: "o", candidateHash: "c", profile: "generic", profileContractHash: hash, styleContractHash: hash, evaluationIdentityHash: hash, styleHash: hash, deterministicArtifactHash: hash, captures: [{ path: "x", sha256: hash, pass: "beauty", cameraId: "hero" }], comparisonBoardHashes: [hash], turntableHashes: [hash], articulationArtifactHash: hash, regionEvidence: { status: "unavailable", reason: "semantic IDs invalid" }, files: ["capture", "comparison-board", "turntable", "deterministic", "style", "articulation"].map((role) => ({ path: "x", sha256: hash, role })) as never });
     const verdict = createVisualReviewVerdict({ packetHash: "stale", reviewer: { kind: "external-vision", id: "reviewer" }, verdict: "PASS", findings: [] });
     expect(() => verifyVisualReviewVerdict(packet, verdict)).toThrow(/stale/);
     const contradictory = createVisualReviewVerdict({ packetHash: packet.packetHash, reviewer: { kind: "external-vision", id: "reviewer" }, verdict: "PASS", findings: [] });

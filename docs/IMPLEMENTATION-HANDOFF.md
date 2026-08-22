@@ -15,13 +15,13 @@ The repository now uses executable profile contracts, durable phase authority, p
 - Deterministic replay was mislabeled as review. Visual packets and external-vision verdicts are separate; packet preparation, review recording, and finalization reopen every referenced file, while unavailable vision leaves an explicit waiting state.
 - Rendering did not prove Three.js material/light behavior. One backend selector now uses `WebGLRenderer` when a caller supplies a browser/headless surface, reports the CPU fallback under `auto`, and rejects an explicit WebGL request without a surface.
 - Candidate and reference boundaries were narrow. Candidate audits follow local imports and reject dense payloads; GLB world bounds honor transforms; stable node identities resolve duplicate names; normalized/sparse accessors are decoded and required unsupported compression fails closed.
-- CLI progress depended on conversational context. Gate and render runs use create-only numbered directories; workspace commands derive active-phase workorders and lock inputs, record turntable evidence, assemble review packets, and finalize from reopened artifacts. A file-stamp cache reuses unchanged gate evaluations without adding another hash-derived naming scheme.
-- Large snapshots amplified memory through per-triangle objects and copied filtered scenes. Geometry now uses typed structure-of-arrays storage, filtered views share those buffers, fingerprints stream over the compact data, and the benchmark snapshots, fingerprints, and captures a 3.5-million-triangle synthetic scene.
+- CLI progress depended on conversational context. Gate and render runs use create-only numbered directories; workspace commands derive active-phase workorders and lock inputs, record turntable evidence, assemble review packets, and finalize from reopened artifacts. Gate cache reuse is bound to the canonical evaluation identity and transitive file-content hashes.
+- Large snapshots amplified memory through per-triangle objects and copied filtered scenes. Geometry now uses typed structure-of-arrays storage, filtered views share those buffers, fingerprints stream over the compact data, posed checks avoid full-profile reevaluation, and the benchmark runs a complete 3.5-million-triangle synthetic evaluation with per-operator timing and observed RSS.
 - Workspace behavior depended on the current directory and split user configuration from runtime files poorly. `project.json`, `refs/`, and `model/` now form the stable surface; `.mesh2threejs/` owns state and generated artifacts. A single resolver handles copied, external, relocated, and migrated references with recorded hashes and provenance.
 
 ## Source synthesis
 
-Exact credits and pins remain in [upstream-map.md](upstream-map.md). Claude-of-Tanks has newer suspension and track-audit changes; inspection found fleet/gameplay linkage receipts and axle-gap checks rather than changes to the adapted measurement formulas, so nothing was auto-merged. The img2threejs and PROMPTING.md pins still match their remote heads as of 2026-08-22.
+Exact credits, audited pins, current remote heads, and reviewed drift remain in [upstream-map.md](upstream-map.md). The audited code pins were not moved merely to match upstream HEAD.
 
 ## Development checks
 
