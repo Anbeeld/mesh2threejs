@@ -1,0 +1,160 @@
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import * as THREE from "three";
+import { describe, expect, test } from "vitest";
+import {
+  acceptPhase,
+  bindCandidate,
+  bindCandidatePhases,
+  bindEvidenceConfig,
+  bindOracle,
+  auditCandidateModule,
+  certifyStateFromArtifacts,
+  createEvidenceArtifact,
+  createTaskState,
+  deriveCanonicalFrame,
+  createDerivativeCacheEntry,
+  evaluateCandidate,
+  evaluateProfileContractGates,
+  loadProfileContract,
+  profileContractHash,
+  recordEvidenceArtifact,
+  readDerivativeCache,
+  reopenPhase,
+  validateProfileContract,
+} from "../src/index.js";
+import { createTankFixture } from "./helpers/scenes.js";
+
+describe("executable profile contracts", () => {
+  test("loads one contract per profile and rejects declarations the runtime cannot execute", async () => {
+    const contract = await loadProfileContract("tank");
+    expect(contract.phases.map((phase) => phase.id)).toEqual([
+      "oracle-registration", "hull", "turret", "gun", "running-gear", "tracks",
+      "fittings-articulation", "style-fabrication", "visual-review", "final",
+    ]);
+    expect(validateProfileContract({ ...contract, operators: [...contract.operators, "imaginary-operator"] }).valid).toBe(false);
+    expect(validateProfileContract({ ...contract, gates: contract.gates.filter((gate) => gate.code !== "gun.pose") }).valid).toBe(false);
+  });
+
+  test("derives new task lifecycle authority directly from the bundled profile contract", async () => {
+    const contract = await loadProfileContract("generic");
+    const state = createTaskState({ taskId: "contract-state", profile: "generic", style: "low-poly-faithful" });
+    expect(Object.keys(state.phaseStatus)).toEqual(contract.phases.map((phase) => phase.id));
+    expect(state.profileContractHash).toBe(profileContractHash(contract));
+  });
+
+  test("fails contract execution when a declared required view was not evaluated", async () => {
+    const contract = await loadProfileContract("tank");
+    const changed = structuredClone(contract);
+    changed.gates.find((gate) => gate.code === "curves.hull")!.views!.push("rear");
+    const evaluation = evaluateCandidate({ oracle: createTankFixture(), candidate: createTankFixture(), profile: "tank" });
+    const report = evaluateProfileContractGates(changed, { deterministic: evaluation.deterministic.rows });
+    expect(report.rows.find((row) => row.code === "curves.hull")).toMatchObject({ passed: false });
+    expect(report.rows.find((row) => row.code === "curves.hull")?.message).toMatch(/rear/);
+  });
+});
+
+describe("phase locks and artifact authority", () => {
+  test("prevents silent changes to accepted geometry and invalidates dependants on explicit reopen", () => {
+    let state = bindCandidate(bindOracle(createTaskState({ taskId: "lock", profile: "tank", style: "low-poly-faithful" }), "oracle"), "candidate-a");
+    for (const [id, kind, phase] of [["registration", "registration", "oracle-registration"], ["hull-gate", "deterministic-gate", "hull"]] as const) {
+      state = recordEvidenceArtifact(state, `${id}.json`, createEvidenceArtifact({ id, kind, phase, oracleHash: "oracle", candidateHash: "candidate-a", profileContractHash: state.profileContractHash, configHash: "fixture", result: { passed: true, summary: "fixture" } }));
+    }
+    state = acceptPhase(state, "oracle-registration", { geometryHash: "oracle", evidenceIds: ["registration"], contractHash: state.profileContractHash });
+    state.phaseGeometryHashes.hull = "hull-a";
+    state = acceptPhase(state, "hull", { geometryHash: "hull-a", evidenceIds: ["hull-gate"], contractHash: state.profileContractHash });
+    expect(() => bindCandidatePhases(state, "candidate-with-turret", { hull: "hull-a", turret: "turret-a" })).not.toThrow();
+    expect(() => bindCandidate(state, "candidate-b")).toThrow(/locked phase/i);
+    state = reopenPhase(state, "hull", "correct a measured station regression");
+    state = bindCandidate(state, "candidate-b");
+    expect(state.phaseStatus.hull).toBe("invalidated");
+    expect(state.phaseStatus.turret).toBe("invalidated");
+    expect(state.reopens).toHaveLength(1);
+  });
+
+  test("derives certification from hash-bound artifact files and rejects a passed boolean forgery", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-artifacts-"));
+    let state = bindCandidate(bindOracle(createTaskState({ taskId: "proof", profile: "generic", style: "low-poly-faithful" }), "oracle"), "candidate");
+    const kinds = ["registration", "deterministic-gate", "style", "complexity", "articulation", "visual-review", "turntable"] as const;
+    for (const kind of kinds) {
+      const artifact = createEvidenceArtifact({ id: kind, kind, phase: "final", oracleHash: "oracle", candidateHash: "candidate", profileContractHash: state.profileContractHash, configHash: "config", result: { passed: true, summary: "fixture" } });
+      const path = join(directory, `${kind}.json`);
+      await writeFile(path, `${JSON.stringify(artifact)}\n`);
+      state = recordEvidenceArtifact(state, path, artifact);
+    }
+    const forgedPath = join(directory, "style.json");
+    const forged = JSON.parse(await readFile(forgedPath, "utf8"));
+    forged.result.summary = "tampered";
+    await writeFile(forgedPath, `${JSON.stringify(forged)}\n`);
+    await expect(certifyStateFromArtifacts(state)).rejects.toThrow(/hash/i);
+  });
+
+  test("requires an explicit reason before changing evidence configuration", () => {
+    let state = bindCandidate(bindOracle(createTaskState({ taskId: "config", profile: "generic", style: "low-poly-faithful" }), "oracle"), "candidate");
+    const artifact = createEvidenceArtifact({ id: "gate", kind: "deterministic-gate", phase: "primary-mass", oracleHash: "oracle", candidateHash: "candidate", profileContractHash: state.profileContractHash, configHash: "config-a", result: { passed: true, summary: "fixture" } });
+    state = recordEvidenceArtifact(state, "gate.json", artifact);
+    expect(() => bindEvidenceConfig(state, "deterministic-gate", "config-b", "")).toThrow(/reason/);
+    state = bindEvidenceConfig(state, "deterministic-gate", "config-b", "camera precision changed");
+    expect(state.evidence.gate?.valid).toBe(false);
+  });
+});
+
+describe("scale-independent physical evaluation", () => {
+  test("freezes matched cameras and increases resolution when physical precision requires it", () => {
+    const coarse = deriveCanonicalFrame({ min: [-5, 0, -10], max: [5, 4, 10], size: [10, 4, 20], center: [0, 2, 0] }, 0.2);
+    const fine = deriveCanonicalFrame({ min: [-5, 0, -10], max: [5, 4, 10], size: [10, 4, 20], center: [0, 2, 0] }, 0.02);
+    expect(fine.width).toBeGreaterThan(coarse.width);
+    expect(fine.frameHash).not.toBe(coarse.frameHash);
+    expect(fine.cameras.side.target).toEqual([0, 2, 0]);
+  });
+
+  test("rejects metadata-only reversal, opposite wheel errors, and box-shaped fake tracks", () => {
+    const oracle = createTankFixture();
+    const mirrored = createTankFixture();
+    mirrored.userData.forwardAxis = "+z";
+    mirrored.scale.z = -1;
+    const mirroredReport = evaluateCandidate({ oracle, candidate: mirrored, profile: "tank" }).deterministic;
+    expect(mirroredReport.rows.find((row) => row.code === "orientation.physical")?.passed).toBe(false);
+
+    const wheels = createTankFixture();
+    const left = wheels.getObjectByName("road-wheel--1-0") as THREE.Mesh;
+    const right = wheels.getObjectByName("road-wheel-1-0") as THREE.Mesh;
+    left.scale.setScalar(0.8);
+    right.scale.setScalar(1.2);
+    const wheelReport = evaluateCandidate({ oracle, candidate: wheels, profile: "tank" }).deterministic;
+    expect(wheelReport.rows.some((row) => row.code.startsWith("running-gear.instance") && !row.passed)).toBe(true);
+
+    const tracks = createTankFixture();
+    const track = tracks.getObjectByName("track-1") as THREE.Mesh;
+    track.position.y += 1;
+    const trackReport = evaluateCandidate({ oracle, candidate: tracks, profile: "tank" }).deterministic;
+    expect(trackReport.rows.find((row) => row.code === "track.course")?.passed).toBe(false);
+
+    const boxes = createTankFixture();
+    for (const side of [-1, 1]) {
+      const old = boxes.getObjectByName(`track-${side}`) as THREE.Mesh;
+      old.geometry = new THREE.BoxGeometry(0.25, 1.25, 5.5);
+    }
+    expect(evaluateCandidate({ oracle, candidate: boxes, profile: "tank" }).deterministic.rows.find((row) => row.code === "track.course")?.passed).toBe(false);
+  });
+});
+
+describe("integrity boundaries", () => {
+  test("invalidates derivative caches when camera, profile, or material input changes", () => {
+    const identity = { sourceHash: "source", preparedHash: "prepared", candidateHash: "candidate", profileContractHash: "profile", measurementVersion: "2", cameraFrameHash: "camera", renderConfigHash: "render", materialHash: "material-a" };
+    const entry = createDerivativeCacheEntry(identity, { score: 100 });
+    expect(readDerivativeCache(entry, identity)).toEqual({ score: 100 });
+    expect(readDerivativeCache(entry, { ...identity, materialHash: "material-b" })).toBeUndefined();
+  });
+
+  test("audits local transitive candidate dependencies", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-transitive-"));
+    await writeFile(join(directory, "helper.mjs"), "new GLTFLoader().load('reference.glb'); export const x = 1;\n");
+    await writeFile(join(directory, "candidate.mjs"), "import { x } from './helper.mjs'; export function createCandidate(){ return x; }\n");
+    const audit = await auditCandidateModule(join(directory, "candidate.mjs"));
+    expect(audit.passed).toBe(false);
+    expect(audit.files).toHaveLength(2);
+    expect(audit.findings.some((finding) => finding.code === "oracle-runtime-load")).toBe(true);
+  });
+});

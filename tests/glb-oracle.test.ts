@@ -49,6 +49,7 @@ describe("source and prepared oracle lifecycle", () => {
     const multipart = probeGlb(minimalGlb({ multipart: true }));
     expect(fused.scene.meshCount).toBe(1);
     expect(fused.bounds?.size).toEqual([2, 2, 0]);
+    expect(probeGlb(minimalGlb({ translated: true })).bounds?.center[0]).toBe(3);
     expect(fused.semanticReadiness).toBe("insufficient");
     expect(multipart.semanticReadiness).toBe("partial");
     expect(fused.sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -76,7 +77,7 @@ describe("source and prepared oracle lifecycle", () => {
       forwardAxis: "+z",
       grounding: "min-y=0",
       scale: 2,
-      semanticMap: { Object_0: "primary" },
+      semanticMap: { "node:0": "primary" },
       articulationMap: {},
       normalization: { translation: [-3, 1, 0], rotationEuler: [0, 0, 0], scale: 2 },
       authoritativeDimensions: null,

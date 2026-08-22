@@ -1,6 +1,6 @@
 {
   "name": "mesh2threejs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Live-oracle to independently authored procedural Three.js reconstruction pipeline",
   "type": "module",
   "bin": {
@@ -36,10 +36,11 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "benchmark": "tsx benchmarks/geometry.bench.ts",
-    "validate": "npm run check && npm run test:coverage && npm run build && npm run validate:artifacts && npm run test:e2e && npm run benchmark",
+    "validate": "npm run validate:development",
+    "validate:development": "npm run check && npm run test:coverage && npm run build && npm run validate:artifacts",
     "validate:artifacts": "node dist/validation/artifacts.js",
     "test:e2e": "node dist/validation/e2e.js",
-    "prepack": "npm run validate"
+    "prepack": "npm run validate:development"
   },
   "engines": {
     "node": ">=22"

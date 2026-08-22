@@ -1,1 +1,0 @@
-{"schemaVersion":1,"views":["side","front","plan","hero"],"operators":["hull-pinned-curves","sections-z","bounds","landmarks","connectivity","watertightness","articulation"],"categories":["hull","whole-vehicle","turret"]}

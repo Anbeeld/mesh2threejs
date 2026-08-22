@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 2,
+  "id": "generic",
+  "semantics": {"required":["primary"],"optional":["attachment"],"critical":["primary"]},
+  "operators": ["adaptive-orthographic-curves","articulation-poses","attachments","bounds-robust","connectivity","critical-semantics","landmarks","physical-orientation","repeated-instances","sections"],
+  "phases": [
+    {"id":"oracle-registration","dependsOn":[],"owner":"oracle","requiredGates":["registration.complete"]},
+    {"id":"primary-mass","dependsOn":["oracle-registration"],"owner":"builder","requiredGates":["dimensions.robust","orientation.physical","silhouette.views"]},
+    {"id":"attachments","dependsOn":["primary-mass"],"owner":"builder","requiredGates":["attachments.contract"]},
+    {"id":"identity-features","dependsOn":["attachments"],"owner":"builder","requiredGates":["semantics.critical"]},
+    {"id":"style-complexity","dependsOn":["identity-features"],"owner":"builder","requiredGates":["connectivity.contract"]},
+    {"id":"visual-review","dependsOn":["style-complexity"],"owner":"reviewer","requiredGates":["visual.review"]},
+    {"id":"final","dependsOn":["visual-review"],"owner":"finalizer","requiredGates":[]}
+  ],
+  "gates": [
+    {"code":"registration.complete","phase":"oracle-registration","operator":"critical-semantics","required":true,"threshold":100},
+    {"code":"dimensions.robust","phase":"primary-mass","operator":"bounds-robust","required":true,"threshold":99},
+    {"code":"orientation.physical","phase":"primary-mass","operator":"physical-orientation","required":true,"threshold":100},
+    {"code":"silhouette.views","phase":"primary-mass","operator":"adaptive-orthographic-curves","required":true,"threshold":90,"views":["side","front","plan"]},
+    {"code":"attachments.contract","phase":"attachments","operator":"attachments","required":true,"threshold":100},
+    {"code":"semantics.critical","phase":"identity-features","operator":"critical-semantics","required":true,"threshold":100},
+    {"code":"connectivity.contract","phase":"style-complexity","operator":"connectivity","required":true,"threshold":100},
+    {"code":"visual.review","phase":"visual-review","operator":"critical-semantics","required":true,"threshold":100}
+  ],
+  "dimensions":["width","height","depth"],
+  "articulation":[],
+  "repeats":[],
+  "stylePermissions":{"maySimplify":["micro-detail"],"mustPreserve":["macro-proportions","orientation","critical-features"]},
+  "completion":{"requiresVisualReview":true,"requiredEvidence":["registration","deterministic-gate","style","complexity","articulation","visual-review","turntable"]}
+}

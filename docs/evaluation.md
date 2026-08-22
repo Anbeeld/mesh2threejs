@@ -1,9 +1,9 @@
 # Evaluation and reproducibility
 
-`npm run validate` runs strict type checking, all unit/protected fixtures, production build, two end-to-end reconstructions, and the geometry/render benchmark. `npm run test:coverage` enforces coverage floors. `npm pack --dry-run` verifies the distributable surface.
+`npm run validate` is the development check: strict types, regression/fixture coverage, build, and artifact/schema validation. `npm run test:e2e` is a small analytical smoke test, and `npm run benchmark` measures only the bundled analytical geometry/render workload. Neither establishes real-oracle or host certification.
 
-The e2e run creates self-authored tank and generic oracle/candidate pairs, evaluates profile/style gates, writes all six oracle/candidate passes, a comparison board, eight turntable frames, and invokes the critic worker. Temporary artifacts are removed after success; no third-party oracle is shipped.
+Protected tests cover physical reflection despite correct metadata, three-axis turret seating, hull length, robust height, per-wheel errors, physical track envelopes and fake box tracks, articulation ownership, open/disconnected masses, ambiguous semantics, phase locks, cache identities, transitive candidate dependencies, and artifact tampering.
 
-Critic calibration cases live in `fixtures/critic-calibration/cases.json` with frozen human labels and expected machine verdicts: obvious pass/fail, subtle shape fail, style fail, intentional low-poly pass, and a macro error disguised as low-poly. Disagreements are computed rather than omitted.
+Behavioral host trials and large real references remain a separate campaign. The required corpus, falsifiers, telemetry, and claim gates are recorded in [DEFERRED-VERIFICATION.md](DEFERRED-VERIFICATION.md). Until that campaign is completed, describe this repository as implementation-complete with development checks—not production-certified.
 
-For stochastic host-agent experiments, record host/model/version/config/tools/repository commit/task/selected context/hashes/grader/action trace/output/human label and all trials. The core evaluator is deterministic, so best-of-N reporting does not apply to its tests.
+For every later stochastic agent run, retain host/model/version/config/tools, repository commit, exact selected instructions, profile/config hashes, artifact hashes, action trace, output, grader, human label, and every trial. Never report best-of-N as reliability.

@@ -6,6 +6,6 @@
   "skillRoot": "skills",
   "launch": "Start OpenCode in the repository and explicitly load AGENTS.md, SKILL.md, and the selected role skill.",
   "cli": "node dist/cli.js",
-  "capabilities": { "projectInstructionDiscovery": false, "skillDiscovery": false, "nestedReferences": false, "commandExecution": false, "browserThreeJs": false, "durableState": true, "separateProcessCritic": true, "freshModelCritic": false },
+  "capabilities": { "projectInstructionDiscovery": false, "skillDiscovery": false, "nestedReferences": false, "commandExecution": false, "browserThreeJs": false, "durableState": true, "actualVisualReview": false },
   "limitations": ["OpenCode was not installed in the validation environment; host discovery and launch are unverified."]
 }

@@ -1,11 +1,11 @@
 # Repository agent contract
 
-Start by reading root `SKILL.md`, then `task.json` and `state.json` in the active workspace. Use only the role skill matching `state.route`; load only the selected profile and style documents.
+Start with root `SKILL.md`, then read `task.json` and `state.json` in the active workspace. Use only the role skill matching `state.route`, the selected `profiles/<id>/contract.json`, and the selected style contract.
 
-The candidate is independently authored procedural Three.js. Do not import, decode, embed, trace, or serialize oracle topology into candidate source. Builders cannot alter source/prepared oracles. Critics cannot alter candidates or state except by returning a hash-bound verdict.
+The candidate is independently authored procedural Three.js. Do not import, decode, embed, trace, or serialize oracle topology into candidate source. Builders cannot alter source/prepared oracles. Visual reviewers consume immutable evidence and cannot edit candidates. Finalizers verify and cannot repair.
 
-Run commands through the host-neutral npm/CLI surface. Preserve source-oracle bytes and preparation lineage. Record evidence artifacts before transitions. Any oracle change invalidates all comparison evidence; any candidate geometry/material/semantic change invalidates dependent gate, critic, and turntable evidence.
+Run commands through the host-neutral npm/CLI surface. Preserve source-oracle bytes and preparation lineage. Record self-hashed evidence artifacts before transitions. Accepted phases remain immutable until an explicit reasoned reopen invalidates that phase and every dependant. Oracle changes invalidate all comparison evidence; candidate geometry, material, semantic, or control changes invalidate dependent gates, captures, and visual review.
 
 Do not stop after a fixed number of attempts. If three equivalent attempts add no evidence and move no metric, route to diagnosis, identify the failing assumption, and choose a different evidence-backed action.
 
-Certification is fail-closed and requires registration, deterministic profile, style, complexity, articulation, independent critic, and turntable evidence for the current hashes, with no blocking unresolved item.
+Certification is fail-closed and derives results from current artifact files. It requires registration, deterministic profile, style, complexity, sampled articulation, genuine external visual review, and turntable evidence, with no blocking unresolved item. A boolean record, deterministic replay, or process boundary is not review evidence.

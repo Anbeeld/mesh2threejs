@@ -51,6 +51,16 @@ export const styleContractSchema = {
     },
     macroRelativeTolerance: { type: "number", minimum: 0, maximum: 0.02 },
     centerRelativeTolerance: { type: "number", minimum: 0, maximum: 0.02 },
+    featureSizePolicy: {
+      type: "object",
+      required: ["minimum", "unit", "appliesTo"],
+      properties: {
+        minimum: { type: "number", exclusiveMinimum: 0 },
+        unit: { const: "object-unit" },
+        appliesTo: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, uniqueItems: true },
+      },
+      additionalProperties: false,
+    },
   },
   additionalProperties: false,
 } as const;
@@ -69,6 +79,7 @@ export const taskManifestSchema = {
     oracleManifest: { type: "string", minLength: 1 },
     candidateModule: { type: "string", minLength: 1 },
     certification: { enum: ["exact-real", "oracle-relative"] },
+    subjectContract: { type: "string", minLength: 1 },
   },
   additionalProperties: false,
 } as const;

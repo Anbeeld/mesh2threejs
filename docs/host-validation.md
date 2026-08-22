@@ -1,13 +1,7 @@
-# Host adapter validation
+# Host status
 
-Validation environment: Windows, 2026-08-22.
+The Codex, Claude Code, and OpenCode adapters are configuration surfaces only. Their manifests do not prove instruction discovery, permissions, resumption, image inspection, or end-to-end behavior.
 
-| Host | Discovery/launch evidence | Commands/tools | Fresh critic | Certification status |
-|---|---|---|---|---|
-| Codex Desktop | This repository was implemented in a project-local task; root `AGENTS.md` and skills are present. Windows app alias was found but direct `codex --version` returned access denied. | Shell, filesystem, Node build/test/browser-capable host | Proven via separate Node worker process | Supported in the current desktop environment; CLI-alias launch not claimed |
-| Claude Code | Executable not installed | Host-neutral CLI/config supplied only | Node worker available if the host can execute it | Configuration-only, not certified on this machine |
-| OpenCode | Executable not installed | Host-neutral CLI/config supplied only | Node worker available if the host can execute it | Configuration-only, not certified on this machine |
+All hosts use `npm run build` and `node dist/cli.js`. The durable state exposes the active phase, locks, reopens, attempts, evidence bindings, and visual-review status. A host can certify only after a genuine image-capable reviewer returns a valid immutable-packet verdict. A fresh process running deterministic code does not qualify.
 
-All hosts use `npm run build` and `node dist/cli.js`; task state is surfaced through workspace `task.json`/`state.json`. The separate-process critic provides state/context isolation from the builder, but its deterministic implementation is not represented as a second model. A host vision agent may add calibrated `visualFindings` to the signed packet without gaining edit authority.
-
-The adapter manifests are regression-tested for honest capability flags. Actual Claude/OpenCode instruction discovery or subagent behavior remains deliberately unclaimed until those executables are installed and exercised.
+Actual host trials are deferred and listed in [DEFERRED-VERIFICATION.md](DEFERRED-VERIFICATION.md). Adapter capability fields must remain conservative until captured trials support them.

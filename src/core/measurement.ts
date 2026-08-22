@@ -1,4 +1,4 @@
-import type * as THREE from "three";
+import * as THREE from "three";
 import type { Axis, Bounds3, CaptureFrame, Point3, SceneComponent, SceneSnapshot } from "../types.js";
 import { boundsFromPoints, componentPoints } from "./geometry.js";
 
@@ -6,6 +6,21 @@ const axisIndex: Record<Axis, 0 | 1 | 2> = { x: 0, y: 1, z: 2 };
 
 export function measureBounds(snapshot: SceneSnapshot, filter?: (component: SceneComponent) => boolean): Bounds3 {
   return boundsFromPoints(componentPoints(snapshot, filter));
+}
+
+export function measureRobustBounds(snapshot: SceneSnapshot, options: { exclude?: RegExp; trimFraction?: number } = {}): Bounds3 {
+  const points = componentPoints(snapshot, (component) => !options.exclude?.test(component.id));
+  if (!points.length) return boundsFromPoints([]);
+  const trim = Math.max(0, Math.min(0.1, options.trimFraction ?? 0.002));
+  const min: Point3 = [0, 1, 2].map((axis) => {
+    const values = points.map((point) => point[axis]!).sort((a, b) => a - b);
+    return values[Math.floor((values.length - 1) * trim)]!;
+  }) as Point3;
+  const max: Point3 = [0, 1, 2].map((axis) => {
+    const values = points.map((point) => point[axis]!).sort((a, b) => a - b);
+    return values[Math.ceil((values.length - 1) * (1 - trim))]!;
+  }) as Point3;
+  return { min, max, size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]], center: [(max[0] + min[0]) / 2, (max[1] + min[1]) / 2, (max[2] + min[2]) / 2] };
 }
 
 export interface SectionRequest {
@@ -213,6 +228,17 @@ export function measureLandmarks(snapshot: SceneSnapshot, request: { semanticPat
     maximum: components.length ? Math.max(...components.map((component) => component.bounds.max[axis])) : Number.NaN,
     centers: components.map((component) => component.bounds.center),
   };
+}
+
+/** Translation-invariant signed volume; its sign exposes a physical reflection. */
+export function measureSignedVolume(snapshot: SceneSnapshot): number {
+  const origin = measureBounds(snapshot).center;
+  let volume = 0;
+  for (const triangle of snapshot.triangles) {
+    const points = triangle.points.map((point) => new THREE.Vector3(point[0] - origin[0], point[1] - origin[1], point[2] - origin[2])) as [THREE.Vector3, THREE.Vector3, THREE.Vector3];
+    volume += points[0].dot(points[1].clone().cross(points[2])) / 6;
+  }
+  return volume;
 }
 
 export function countConnectedIslands(snapshot: SceneSnapshot, semanticId: string): number {

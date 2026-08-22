@@ -1,26 +1,25 @@
 # Architecture
 
-The system separates truth, construction, measurement, judgment, and state.
+The pipeline separates reference truth, candidate construction, deterministic measurement, visual judgment, and durable authority.
 
 ```text
-immutable GLB -> probe -> prepared recipe -> registered oracle snapshot
-                                             | six capture passes
-procedural candidate module -> audit -> live candidate snapshot
-                                             | profile + style gates
-                                             v
-                                workorders + hash-bound packet
-                                             |
-                               separate Node critic process
-                                             |
-                                  fail-closed state certify
+immutable GLB -> prepared lineage -> frozen physical frame -> deterministic gates
+procedural module -> transitive audit -> native scene + pose controls -> workorders
+                                                      | matched six-pass evidence
+                                                      v
+                                            external visual reviewer
+                                                      |
+                                    verified artifacts -> finalizer
 ```
 
-`src/core/oracle.ts` parses static GLB 2.0 triangle data without a browser, hashes source bytes, applies a reproducible semantic/normalization recipe, and records repairs as new child recipes. It deliberately rejects unsupported primitives and malformed accessors rather than guessing.
+Each profile has one executable `contract.json`. It declares semantics, operators, phase dependencies and owners, gates, views, dimensions, repeats, articulation samples, style permissions, and completion evidence. Task lifecycle state is derived from it. Validation rejects unknown operators, missing dependencies, impossible critical semantics, unsupported gates, and runtime evidence that omits a declared threshold or view.
 
-`src/core/geometry.ts` snapshots live world transforms and structural metadata. Measurement/rendering use that snapshot, never cached oracle JSON. `src/core/render.ts` is a deterministic CPU rasterizer for beauty, alpha silhouette, semantic ID, depth, normal, and roughness/material-ID passes.
+`src/core/oracle.ts` hashes immutable GLB bytes and creates child preparation recipes. World bounds include node transforms; stable `node:N` identities avoid duplicate-name ambiguity. Normalized and sparse accessors are decoded, while unsupported required compression fails closed.
 
-Profiles compose generic operators. Generic evaluates three-axis dimensions and silhouettes, orientation, attachments, sections/landmarks/connectivity, and critical features. Tank retains hull-pinned CoT curve logic, fourteen stations with two edge outliers discarded, running gear, tracks, articulation ownership, and fabrication gates.
+`geometry.ts` snapshots live world transforms and rejects duplicate semantic IDs. `measurement.ts` supplies sections, robust dimensions, landmarks, connectivity, fabrication, attachment, signed-orientation, and pose checks. Tank evaluation freezes a reference-derived camera frame, permits translation-only hull registration, reuses it for whole/turret comparisons, reports all fourteen stations, compares running gear per role/side/order, and checks a physical track course rather than its count alone.
 
-Style uses oracle envelopes and feature centers plus an analytical faceting corridor; complexity is separate and cannot relax macro geometry. `state.ts` binds evidence to exact hashes, invalidates dependents, persists atomically, diagnoses repeated no-progress, and certifies only the complete evidence set.
+`render.ts` is the reproducible CPU diagnostic path. `three-render.ts` uses Three.js `WebGLRenderer` for matched material/light evidence when a browser or headless WebGL surface is supplied. The two paths are labeled separately.
 
-The critic is structurally read-only: it receives a signed packet over stdin in a fresh Node process and emits JSON. This is process/context independence, not a claim of an independently trained model. Visual findings can be supplied by a host vision review and are preserved in the signed packet.
+State writes are atomic. Accepted phases store geometry, contract, dependency, and evidence identities. Candidate changes are refused while affected phases remain locked; `reopen` records a reason and invalidates dependants. Evidence artifacts contain their result and content hash. Finalization re-reads the files and derives completion; state booleans are never authority.
+
+Visual review is a separate read-only role. Its packet binds all hashes and immutable captures. When genuine image inspection is unavailable, state remains `awaiting-visual-review`.

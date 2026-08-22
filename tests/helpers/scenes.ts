@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { createTrackCourseGeometry } from "../../src/kit.js";
 
 export function semanticMesh(
   id: string,
@@ -28,7 +29,8 @@ export function createGenericFixture(options: {
 } = {}): THREE.Group {
   const root = new THREE.Group();
   root.name = "generic-root";
-  root.userData.forwardAxis = options.mirrored ? "-z" : "+z";
+  root.userData.forwardAxis = "+z";
+  if (options.mirrored) root.scale.z = -1;
   root.add(semanticMesh("primary", new THREE.BoxGeometry(4, 2, options.depth ?? 3)));
   root.add(
     semanticMesh(
@@ -63,7 +65,8 @@ export function createTankFixture(options: {
 } = {}): THREE.Group {
   const root = new THREE.Group();
   root.name = "tank-root";
-  root.userData.forwardAxis = options.reverse ? "-z" : "+z";
+  root.userData.forwardAxis = "+z";
+  if (options.reverse) root.scale.z = -1;
 
   const hull = semanticMesh("hull", options.openHull ? new THREE.PlaneGeometry(3.2, 6) : new THREE.BoxGeometry(3.2, 1.2, 6), [0, 0.4, 0]);
   const upperHull = semanticMesh("hull-upper", new THREE.BoxGeometry(2.8, 0.6, 3.8), [0, 1.25, -0.2]);
@@ -115,7 +118,7 @@ export function createTankFixture(options: {
       root.add(wheel);
     }
     if (!(options.omitTrack && side === 1)) {
-      const track = semanticMesh(`track-${side}`, new THREE.BoxGeometry(0.25, 1.25, 5.5), [side * 1.7, 0.05, 0]);
+      const track = semanticMesh(`track-${side}`, createTrackCourseGeometry(5.5, 1.25, 0.25, 0.35), [side * 1.7, 0.05, 0]);
       track.userData.semanticRole = "track-course";
       root.add(track);
     }

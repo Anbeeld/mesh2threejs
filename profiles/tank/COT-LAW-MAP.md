@@ -18,4 +18,4 @@ Audited CoT commit: `f389f13f829451d64cf780c5f14473527b45f7f4` (MIT).
 | Fleet gameplay dimensions, spawning, collisions, physics | Game/fleet-specific | Excluded | outside reconstruction domain |
 | Weapon gameplay behavior and balance | Game/fleet-specific | Excluded | outside reconstruction domain |
 
-Precedence is oracle geometry, admitted real dimensions, semantic/articulation invariants, StyleContract, then critic readability. Style never weakens macro gates.
+Precedence is reference geometry, admitted real dimensions, semantic/articulation invariants, StyleContract, then visual readability. Style never weakens macro gates.

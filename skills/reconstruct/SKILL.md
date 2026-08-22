@@ -11,4 +11,4 @@ description: Route, initialize, and resume a live-oracle procedural Three.js rec
 4. Follow `determineNextAction(state)` and load only the resulting role skill.
 5. Never build from memory or declare completion outside `finalize`.
 
-Do not import the oracle into candidate source. Do not let repair wording authorize candidate edits or critic wording authorize mutation.
+Do not import the oracle into candidate source. Do not let repair wording authorize candidate edits or review wording authorize mutation.

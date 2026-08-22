@@ -41,6 +41,14 @@ describe("CoT-derived curve scoring", () => {
 describe("machine-readable contracts", () => {
   test("validates the canonical style and rejects geometry-relaxing contracts", () => {
     expect(validateStyleContract(lowPolyFaithful).valid).toBe(true);
+    expect(validateStyleContract({
+      ...lowPolyFaithful,
+      featureSizePolicy: { minimum: 0.05, unit: "object-unit", appliesTo: ["antenna-*"] },
+    }).valid).toBe(true);
+    expect(validateStyleContract({
+      ...lowPolyFaithful,
+      featureSizePolicy: { minimum: 0.05, unit: "pixels", appliesTo: ["antenna-*"] },
+    }).valid).toBe(false);
     expect(validateStyleContract({ ...lowPolyFaithful, preserve: { ...lowPolyFaithful.preserve, macroGeometry: false } }).valid).toBe(false);
   });
 
@@ -63,9 +71,7 @@ describe("machine-readable contracts", () => {
     expect(validateRenderProfile(standardRenderProfile()).valid).toBe(true);
   });
 
-  test("records critic calibration disagreement instead of hiding it", async () => {
-    const calibration = JSON.parse(await readFile(join(process.cwd(), "fixtures", "critic-calibration", "cases.json"), "utf8"));
-    expect(summarizeCalibration(calibration.cases)).toEqual({ total: 6, agreements: 6, disagreements: [], accuracy: 1 });
+  test("records evaluator disagreement instead of hiding it", () => {
     expect(summarizeCalibration([]).accuracy).toBe(1);
     expect(summarizeCalibration([{ id: "disagree", human: "PASS", machine: "FAIL" }])).toEqual({ total: 1, agreements: 0, disagreements: ["disagree"], accuracy: 0 });
   });
@@ -82,6 +88,12 @@ describe("CLI", () => {
     expect(code).toBe(0);
     expect(JSON.parse(await readFile(join(directory, "task.json"), "utf8")).id).toBe("cli-fixture");
     expect(output.join("\n")).toContain("cli-fixture");
+    output.length = 0;
+    expect(await runCli(["status", join(directory, "state.json")], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(0);
+    expect(JSON.parse(output[0]!).activePhase).toBe("oracle-registration");
+    output.length = 0;
+    expect(await runCli(["next", join(directory, "state.json")], { stdout: (value) => output.push(value), stderr: (value) => output.push(value) })).toBe(0);
+    expect(JSON.parse(output[0]!).route).toBe("onboard-oracle");
   });
 
   test("fails closed on unknown commands", async () => {

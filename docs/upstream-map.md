@@ -17,3 +17,13 @@ Direct algorithm adaptation appears in `src/core/compare.ts`: translation-only c
 img2threejs concepts were reimplemented in TypeScript rather than copied line-for-line: conservative GLB admission (`src/core/oracle.ts`), explicit source/prepared lineage, separated durable state (`src/core/state.ts`), and machine-readable render/workspace contracts. PROMPTING.md influenced the progressive role routing and fail-closed state design; no substantial prose was copied.
 
 Excluded CoT baggage: fleet manifests, spawning, collision/physics, gameplay weapons, balance, preview gallery, and runtime vehicle integration. No upstream models or user oracle assets are shipped.
+
+## Drift snapshot
+
+Remote heads inspected on 2026-08-22:
+
+- Claude-of-Tanks: `93a801bfad338748ea8901a6dcb12722dbc8b52b` (pin is behind). Relevant changed paths include `src/vehicles/suspensionPatterns.js`, `src/vehicles/profiles/leopard.js`, `tools/track-system-audit.mjs`, and `tools/track-system-audit.html`. Review found fleet/gameplay suspension-link receipts and an axle-gap audit, not a change to the adapted curve/station formulas. No code was auto-merged; task-specific generic connectivity can declare suspension links when they are reference-critical.
+- img2threejs: still `d6673386f89673a58736f8d398dd16ece67874f5`.
+- PROMPTING.md: still `ea8c5e7e22134ac57984d67a2cdc7c29c7c4ba90`.
+
+`mesh2threejs upstream-drift` rechecks remote heads and reports changed relevant paths without modifying this repository.

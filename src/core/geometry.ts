@@ -62,7 +62,11 @@ function semanticOwner(object: THREE.Object3D): { id: string; parent?: string; r
   return { id: object.name || object.uuid, critical };
 }
 
-function materialRecord(mesh: THREE.Mesh, triangleIndex: number): { id: string; color: number; roughness: number } {
+function materialRecord(
+  mesh: THREE.Mesh,
+  triangleIndex: number,
+  materialId: (material: THREE.Material | undefined) => string,
+): { id: string; color: number; roughness: number } {
   const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
   let materialIndex = 0;
   const indexOffset = triangleIndex * 3;
@@ -76,7 +80,7 @@ function materialRecord(mesh: THREE.Mesh, triangleIndex: number): { id: string; 
   const material = materials[materialIndex] ?? materials[0];
   const standard = material as THREE.MeshStandardMaterial | undefined;
   return {
-    id: material?.name || material?.uuid || `material-${materialIndex}`,
+    id: materialId(material),
     color: standard?.color?.getHex() ?? 0x7f7f7f,
     roughness: typeof standard?.roughness === "number" ? standard.roughness : 0.7,
   };
@@ -101,7 +105,27 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
   const triangles: SceneTriangle[] = [];
   const componentDrafts = new Map<string, Omit<SceneComponent, "bounds"> & { bounds: Bounds3 }>();
   const materialIds = new Set<string>();
+  const materialIdentity = new WeakMap<THREE.Material, string>();
+  let nextMaterialId = 0;
+  const stableMaterialId = (material: THREE.Material | undefined): string => {
+    if (!material) return "material-missing";
+    const existing = materialIdentity.get(material);
+    if (existing) return existing;
+    const id = `material-${nextMaterialId}`;
+    nextMaterialId += 1;
+    materialIdentity.set(material, id);
+    return id;
+  };
   let meshCount = 0;
+  const semanticOwners = new Map<string, THREE.Object3D>();
+
+  root.traverse((object) => {
+    const semanticId = typeof object.userData.semanticId === "string" ? object.userData.semanticId : undefined;
+    if (!semanticId) return;
+    const previous = semanticOwners.get(semanticId);
+    if (previous && previous !== object) throw new Error(`ambiguous duplicate semantic id: ${semanticId}`);
+    semanticOwners.set(semanticId, object);
+  });
 
   root.traverse((object) => {
     const mesh = object as THREE.Mesh;
@@ -138,7 +162,7 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
         pointFromAttribute(position, b, mesh.matrixWorld),
         pointFromAttribute(position, c, mesh.matrixWorld),
       ];
-      const material = materialRecord(mesh, triangleIndex);
+      const material = materialRecord(mesh, triangleIndex, stableMaterialId);
       materialIds.add(material.id);
       const record: SceneTriangle = {
         points,
@@ -157,6 +181,25 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
   const components: Record<string, SceneComponent> = {};
   for (const [id, component] of componentDrafts) {
     components[id] = { ...component, bounds: finishBounds(component.bounds) };
+  }
+  for (const [id, object] of semanticOwners) {
+    const worldOrigin = object.getWorldPosition(new THREE.Vector3());
+    const origin: Point3 = [worldOrigin.x, worldOrigin.y, worldOrigin.z];
+    if (components[id]) { components[id]!.origin = origin; continue; }
+    const box = new THREE.Box3().setFromObject(object);
+    const min: Point3 = [box.min.x, box.min.y, box.min.z];
+    const max: Point3 = [box.max.x, box.max.y, box.max.z];
+    const parent = object.parent && typeof object.parent.userData.semanticId === "string" ? object.parent.userData.semanticId : undefined;
+    components[id] = {
+      id,
+      name: object.name || id,
+      ...(typeof object.userData.semanticRole === "string" ? { role: object.userData.semanticRole } : {}),
+      ...(parent ? { parentSemanticId: parent } : {}),
+      critical: object.userData.critical === true,
+      triangleIndices: [],
+      bounds: finishBounds({ min, max, size: [0, 0, 0], center: [0, 0, 0] }),
+      origin,
+    };
   }
   const forwardAxis = typeof root.userData.forwardAxis === "string" ? root.userData.forwardAxis : undefined;
   return {

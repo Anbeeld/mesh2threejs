@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { createTrackCourseGeometry } from "../kit.js";
 
 function mesh(id: string, geometry: THREE.BufferGeometry, position: [number, number, number] = [0, 0, 0], critical = false): THREE.Mesh {
   const result = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0x66705a, roughness: 0.72 }));
@@ -49,7 +50,7 @@ export function analyticalTank(): THREE.Group {
       wheel.userData.semanticRole = "road-wheel";
       root.add(wheel);
     }
-    const track = mesh(`track-${side}`, new THREE.BoxGeometry(0.25, 1.25, 5.5), [side * 1.7, 0.05, 0]);
+    const track = mesh(`track-${side}`, createTrackCourseGeometry(5.5, 1.25, 0.25, 0.35), [side * 1.7, 0.05, 0]);
     track.userData.semanticRole = "track-course";
     root.add(track);
   }

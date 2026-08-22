@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 2,
+  "id": "tank",
+  "semantics": {
+    "required": ["hull", "turret", "gun", "turret-pivot", "gun-pivot"],
+    "optional": ["hull-upper", "cupola", "sprocket", "idler", "return-roller"],
+    "critical": ["hull", "turret", "gun", "turret-pivot", "gun-pivot"]
+  },
+  "operators": ["adaptive-orthographic-curves", "articulation-poses", "bounds-robust", "connectivity", "critical-semantics", "fabrication", "hull-pinned-registration", "landmarks", "physical-orientation", "repeated-instances", "sections", "track-course"],
+  "phases": [
+    {"id":"oracle-registration","dependsOn":[],"owner":"oracle","requiredGates":["registration.complete"]},
+    {"id":"hull","dependsOn":["oracle-registration"],"owner":"builder","requiredGates":["curves.hull","hull.stations","dimensions.hull-length","orientation.physical"]},
+    {"id":"turret","dependsOn":["hull"],"owner":"builder","requiredGates":["curves.turret","turret.placement"]},
+    {"id":"gun","dependsOn":["turret"],"owner":"builder","requiredGates":["gun.geometry","gun.pose"]},
+    {"id":"running-gear","dependsOn":["hull"],"owner":"builder","requiredGates":["running-gear.instances"]},
+    {"id":"tracks","dependsOn":["running-gear"],"owner":"builder","requiredGates":["track.course"]},
+    {"id":"fittings-articulation","dependsOn":["gun","tracks"],"owner":"builder","requiredGates":["articulation.poses","ownership.seating"]},
+    {"id":"style-fabrication","dependsOn":["fittings-articulation"],"owner":"builder","requiredGates":["fabrication.profile"]},
+    {"id":"visual-review","dependsOn":["style-fabrication"],"owner":"reviewer","requiredGates":["visual.review"]},
+    {"id":"final","dependsOn":["visual-review"],"owner":"finalizer","requiredGates":["curves.whole"]}
+  ],
+  "gates": [
+    {"code":"registration.complete","phase":"oracle-registration","operator":"critical-semantics","required":true,"threshold":100},
+    {"code":"curves.hull","phase":"hull","operator":"adaptive-orthographic-curves","required":true,"threshold":90,"views":["side","plan","front"]},
+    {"code":"hull.stations","phase":"hull","operator":"sections","required":true,"threshold":90},
+    {"code":"dimensions.hull-length","phase":"hull","operator":"bounds-robust","required":true,"threshold":99},
+    {"code":"orientation.physical","phase":"hull","operator":"physical-orientation","required":true,"threshold":100},
+    {"code":"curves.turret","phase":"turret","operator":"adaptive-orthographic-curves","required":true,"threshold":90,"views":["side","plan"]},
+    {"code":"turret.placement","phase":"turret","operator":"landmarks","required":true,"threshold":99},
+    {"code":"gun.geometry","phase":"gun","operator":"landmarks","required":true,"threshold":99},
+    {"code":"gun.pose","phase":"gun","operator":"articulation-poses","required":true,"threshold":100},
+    {"code":"running-gear.instances","phase":"running-gear","operator":"repeated-instances","required":true,"threshold":99},
+    {"code":"track.course","phase":"tracks","operator":"track-course","required":true,"threshold":99},
+    {"code":"articulation.poses","phase":"fittings-articulation","operator":"articulation-poses","required":true,"threshold":100},
+    {"code":"ownership.seating","phase":"fittings-articulation","operator":"connectivity","required":true,"threshold":100},
+    {"code":"fabrication.profile","phase":"style-fabrication","operator":"fabrication","required":true,"threshold":100},
+    {"code":"visual.review","phase":"visual-review","operator":"critical-semantics","required":true,"threshold":100},
+    {"code":"curves.whole","phase":"final","operator":"adaptive-orthographic-curves","required":true,"threshold":90,"views":["side","plan","front"]}
+  ],
+  "dimensions": ["hullLength", "overallLength", "width", "height"],
+  "articulation": [
+    {"control":"turretYaw","moving":["turret-pivot","turret","gun-pivot","gun"],"stationary":["hull"],"samples":[-2.2,-0.6,0,0.6,2.2]},
+    {"control":"gunElevation","moving":["gun-pivot","gun"],"stationary":["hull","turret-pivot"],"samples":[-0.18,0,0.3]}
+  ],
+  "repeats": [{"role":"road-wheel","orderedBy":"z","sideAxis":"x"},{"role":"track-course","orderedBy":"z","sideAxis":"x"}],
+  "stylePermissions": {"maySimplify":["micro-bevels","small-fasteners","surface-texture"],"mustPreserve":["macro-proportions","orientation","articulation","repeat-counts","silhouette-breaking-fittings"]},
+  "completion": {"requiresVisualReview":true,"requiredEvidence":["registration","deterministic-gate","style","complexity","articulation","visual-review","turntable"]}
+}

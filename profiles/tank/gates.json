@@ -1,1 +1,0 @@
-{"schemaVersion":1,"profile":"tank","required":["curves.hull","curves.whole","curves.turret","hull.station","turret.placement","gun.length","running-gear.count","running-gear.radius","running-gear.spacing","track.course","fabrication.watertight","floaters.articulation","orientation.forward","critical-feature.*"],"passFloor":90,"hullStations":14,"discardWorstStations":2}

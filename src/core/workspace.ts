@@ -12,15 +12,17 @@ export interface TaskManifest {
   oracleManifest: string;
   candidateModule: string;
   certification: CertificationLevel;
+  subjectContract?: string;
 }
 
 export async function initializeWorkspace(directory: string, task: Omit<TaskManifest, "schemaVersion">): Promise<{ root: string; directories: string[] }> {
   const root = resolve(directory);
-  const directories = ["oracle", "candidate", "evidence", "reports", "captures", "critic"];
+  const directories = ["oracle", "candidate", "evidence", "reports", "captures", "visual-review"];
   await mkdir(root, { recursive: true });
   await Promise.all(directories.map((name) => mkdir(join(root, name), { recursive: true })));
   const manifest: TaskManifest = { schemaVersion: 1, ...task };
   await writeFile(join(root, "task.json"), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
-  await saveTaskState(join(root, "state.json"), createTaskState({ taskId: task.id, profile: task.profile, style: task.style, certification: task.certification }));
+  const state = createTaskState({ taskId: task.id, profile: task.profile, style: task.style, certification: task.certification });
+  await saveTaskState(join(root, "state.json"), state);
   return { root, directories };
 }

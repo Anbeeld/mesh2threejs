@@ -11,6 +11,7 @@ export interface StyleContract {
   appearance: { shading: "flat-or-faceted"; materialVocabulary: "simple-pbr"; texturePolicy: "none-or-generated"; palette: "subject-derived" };
   macroRelativeTolerance: number;
   centerRelativeTolerance: number;
+  featureSizePolicy?: { minimum: number; unit: "object-unit"; appliesTo: string[] };
 }
 
 export const lowPolyFaithful: StyleContract = {
@@ -38,6 +39,34 @@ function estimateSegments(snapshot: SceneSnapshot, component: SceneComponent): n
   const triangles = componentTriangles(snapshot, component);
   if (triangles < 24) return null;
   return Math.max(3, Math.round(triangles / 4));
+}
+
+function matchesSemanticPattern(semanticId: string, pattern: string): boolean {
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*");
+  return new RegExp(`^${escaped}$`, "u").test(semanticId);
+}
+
+function featureSizeRows(candidate: SceneSnapshot, contract: StyleContract): GateRow[] {
+  const policy = contract.featureSizePolicy;
+  if (!policy) return [];
+  return Object.values(candidate.components)
+    .filter((component) => policy.appliesTo.some((pattern) => matchesSemanticPattern(component.id, pattern)))
+    .map((component) => {
+      const positiveDimensions = component.bounds.size.filter((value) => value > Number.EPSILON);
+      const actual = positiveDimensions.length ? Math.min(...positiveDimensions) : 0;
+      const passed = actual >= policy.minimum;
+      return {
+        code: `style.feature-size.${component.id}`,
+        component: component.id,
+        passed,
+        score: passed ? 100 : Math.max(0, (actual / policy.minimum) * 100),
+        severity: "major" as const,
+        message: `${component.id} minimum physical feature: ${actual.toFixed(4)} ${policy.unit}; required ${policy.minimum.toFixed(4)} ${policy.unit}`,
+        oracleValue: policy.minimum,
+        candidateValue: actual,
+        deviation: actual - policy.minimum,
+      };
+    });
 }
 
 function componentEnvelopeRows(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: StyleContract): GateRow[] {
@@ -101,7 +130,7 @@ function componentEnvelopeRows(oracle: SceneSnapshot, candidate: SceneSnapshot, 
 }
 
 export function evaluateLowPolyStyle(oracle: SceneSnapshot, candidate: SceneSnapshot, contract: StyleContract): GateReport {
-  const rows = componentEnvelopeRows(oracle, candidate, contract);
+  const rows = [...componentEnvelopeRows(oracle, candidate, contract), ...featureSizeRows(candidate, contract)];
   const complexity: Array<[string, number, number]> = [
     ["triangles", candidate.triangleCount, contract.complexity.triangleMax],
     ["meshes", candidate.meshCount, contract.complexity.meshMax],

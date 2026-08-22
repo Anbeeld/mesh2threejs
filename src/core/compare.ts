@@ -137,9 +137,23 @@ export function rowsToWorkorders(rows: GateRow[]): Workorder[] {
       ...(row.candidateValue !== undefined ? { candidateValue: row.candidateValue } : {}),
       ...(row.deviation !== undefined ? { absoluteDeviation: Math.abs(row.deviation) } : {}),
       ...(row.normalizedDeviation !== undefined ? { normalizedDeviation: Math.abs(row.normalizedDeviation) } : {}),
+      ...(row.phase ? { phase: row.phase } : {}),
+      ...(row.category ? { category: row.category } : {}),
+      ...(row.registration ? { registration: row.registration } : {}),
+      ...(row.statistics ? { statistics: row.statistics } : {}),
+      ...(row.worstLocations ? { worstLocations: row.worstLocations } : {}),
+      ...(row.physicalUnit ? { physicalUnit: row.physicalUnit } : {}),
       errorKind: row.code,
       priority: row.severity,
       correction: row.message,
+      repairGroup: `${row.phase ?? "unphased"}:${row.component}`,
     }))
     .sort((a, b) => severityOrder[a.priority] - severityOrder[b.priority] || (b.normalizedDeviation ?? 0) - (a.normalizedDeviation ?? 0));
+}
+
+export function selectRepairGroup(workorders: Workorder[], activePhase: string): Workorder[] {
+  const eligible = workorders.filter((item) => item.phase === activePhase);
+  if (!eligible.length) return [];
+  const firstGroup = eligible[0]?.repairGroup;
+  return eligible.filter((item) => item.repairGroup === firstGroup);
 }

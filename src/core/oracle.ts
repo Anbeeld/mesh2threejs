@@ -77,28 +77,62 @@ function readScalar(buffer: Buffer, offset: number, componentType: number): numb
   }
 }
 
+function normalizedScalar(value: number, componentType: number): number {
+  switch (componentType) {
+    case 5120: return Math.max(value / 127, -1);
+    case 5121: return value / 255;
+    case 5122: return Math.max(value / 32767, -1);
+    case 5123: return value / 65535;
+    case 5125: return value / 4294967295;
+    default: return value;
+  }
+}
+
 function readAccessor(parsed: ParsedGlb, accessorIndex: number): { values: number[]; count: number; components: number; min?: number[]; max?: number[] } {
   const accessors = asArray(parsed.json.accessors);
   const accessor = asObject(accessors[accessorIndex], `accessor ${accessorIndex}`);
   const views = asArray(parsed.json.bufferViews);
   const viewIndex = accessor.bufferView;
-  if (typeof viewIndex !== "number") throw new Error(`accessor ${accessorIndex} has no bufferView`);
-  const view = asObject(views[viewIndex], `bufferView ${viewIndex}`);
-  if ((view.buffer ?? 0) !== 0) throw new Error("external or multi-buffer GLB is unsupported");
   const componentType = Number(accessor.componentType);
   const componentBytes = COMPONENT_BYTES[componentType];
   const components = TYPE_COMPONENTS[String(accessor.type)];
   const count = Number(accessor.count);
   if (!componentBytes || !components || !Number.isInteger(count) || count < 0) throw new Error(`accessor ${accessorIndex} is invalid`);
-  const viewOffset = Number(view.byteOffset ?? 0);
   const accessorOffset = Number(accessor.byteOffset ?? 0);
-  const stride = Number(view.byteStride ?? componentBytes * components);
-  const values: number[] = [];
-  for (let item = 0; item < count; item += 1) {
-    for (let component = 0; component < components; component += 1) {
-      const offset = viewOffset + accessorOffset + item * stride + component * componentBytes;
-      if (offset < 0 || offset + componentBytes > parsed.binary.length) throw new Error(`accessor ${accessorIndex} exceeds BIN chunk`);
-      values.push(readScalar(parsed.binary, offset, componentType));
+  const values: number[] = new Array(count * components).fill(0);
+  if (typeof viewIndex === "number") {
+    const view = asObject(views[viewIndex], `bufferView ${viewIndex}`);
+    if ((view.buffer ?? 0) !== 0) throw new Error("external or multi-buffer GLB is unsupported");
+    const viewOffset = Number(view.byteOffset ?? 0);
+    const stride = Number(view.byteStride ?? componentBytes * components);
+    for (let item = 0; item < count; item += 1) {
+      for (let component = 0; component < components; component += 1) {
+        const offset = viewOffset + accessorOffset + item * stride + component * componentBytes;
+        if (offset < 0 || offset + componentBytes > parsed.binary.length) throw new Error(`accessor ${accessorIndex} exceeds BIN chunk`);
+        const raw = readScalar(parsed.binary, offset, componentType);
+        values[item * components + component] = accessor.normalized === true ? normalizedScalar(raw, componentType) : raw;
+      }
+    }
+  } else if (!accessor.sparse) throw new Error(`accessor ${accessorIndex} has neither bufferView nor sparse values`);
+  if (accessor.sparse) {
+    const sparse = asObject(accessor.sparse, `accessor ${accessorIndex} sparse`);
+    const sparseCount = Number(sparse.count);
+    const indices = asObject(sparse.indices, "sparse indices");
+    const indexType = Number(indices.componentType);
+    const indexBytes = COMPONENT_BYTES[indexType];
+    const indexView = asObject(views[Number(indices.bufferView)], "sparse index bufferView");
+    const valuesSpec = asObject(sparse.values, "sparse values");
+    const valuesView = asObject(views[Number(valuesSpec.bufferView)], "sparse values bufferView");
+    if (!indexBytes || ![5121, 5123, 5125].includes(indexType) || !Number.isInteger(sparseCount) || sparseCount < 0) throw new Error(`accessor ${accessorIndex} sparse metadata is invalid`);
+    for (let item = 0; item < sparseCount; item += 1) {
+      const indexOffset = Number(indexView.byteOffset ?? 0) + Number(indices.byteOffset ?? 0) + item * indexBytes;
+      const target = readScalar(parsed.binary, indexOffset, indexType);
+      if (!Number.isInteger(target) || target < 0 || target >= count) throw new Error(`accessor ${accessorIndex} sparse index is out of range`);
+      for (let component = 0; component < components; component += 1) {
+        const valueOffset = Number(valuesView.byteOffset ?? 0) + Number(valuesSpec.byteOffset ?? 0) + (item * components + component) * componentBytes;
+        const raw = readScalar(parsed.binary, valueOffset, componentType);
+        values[target * components + component] = accessor.normalized === true ? normalizedScalar(raw, componentType) : raw;
+      }
     }
   }
   const min = Array.isArray(accessor.min) ? accessor.min.map(Number) : undefined;
@@ -135,6 +169,7 @@ export interface GlbProbe {
   asset: { version: string | null; generator: string | null };
   scene: { sceneCount: number; nodeCount: number; meshCount: number; primitiveCount: number; materialCount: number; skinCount: number; animationCount: number };
   names: string[];
+  semanticIdentities: Array<{ id: string; name: string; parentId: string | null }>;
   bounds: Bounds3 | null;
   semanticReadiness: SemanticReadiness;
   warnings: string[];
@@ -149,9 +184,9 @@ export function probeGlb(input: Uint8Array): GlbProbe {
   const animations = asArray(parsed.json.animations);
   const scenes = asArray(parsed.json.scenes);
   let primitiveCount = 0;
-  const mins: Point3[] = [];
-  const maxs: Point3[] = [];
   const warnings: string[] = [];
+  const unsupportedExtensions = asArray(parsed.json.extensionsRequired).filter((value): value is string => typeof value === "string" && ["KHR_draco_mesh_compression", "EXT_meshopt_compression"].includes(value));
+  if (unsupportedExtensions.length) throw new Error(`unsupported required glTF geometry extension: ${unsupportedExtensions.join(", ")}`);
   for (let meshIndex = 0; meshIndex < meshes.length; meshIndex += 1) {
     const mesh = asObject(meshes[meshIndex], `mesh ${meshIndex}`);
     const primitives = asArray(mesh.primitives);
@@ -163,23 +198,21 @@ export function probeGlb(input: Uint8Array): GlbProbe {
         warnings.push(`mesh ${meshIndex} primitive ${primitiveIndex} has no POSITION`);
         continue;
       }
-      const bounds = accessorBounds(parsed, attributes.POSITION);
-      mins.push(bounds.min);
-      maxs.push(bounds.max);
+      accessorBounds(parsed, attributes.POSITION);
     }
   }
-  const bounds = mins.length
-    ? (() => {
-        const min: Point3 = [0, 1, 2].map((axis) => Math.min(...mins.map((point) => point[axis] ?? Infinity))) as Point3;
-        const max: Point3 = [0, 1, 2].map((axis) => Math.max(...maxs.map((point) => point[axis] ?? -Infinity))) as Point3;
-        const size: Point3 = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-        return { min, max, size, center: [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2] as Point3 };
-      })()
-    : null;
+  const sceneRoot = meshes.length ? loadGlbScene(input) : null;
+  const worldBox = sceneRoot ? new THREE.Box3().setFromObject(sceneRoot) : null;
+  const bounds = worldBox && !worldBox.isEmpty() ? { min: [worldBox.min.x, worldBox.min.y, worldBox.min.z] as Point3, max: [worldBox.max.x, worldBox.max.y, worldBox.max.z] as Point3, size: [worldBox.max.x - worldBox.min.x, worldBox.max.y - worldBox.min.y, worldBox.max.z - worldBox.min.z] as Point3, center: [(worldBox.min.x + worldBox.max.x) / 2, (worldBox.min.y + worldBox.max.y) / 2, (worldBox.min.z + worldBox.max.z) / 2] as Point3 } : null;
   const names = [...nodes, ...meshes].map((item, index) => {
     const object = asObject(item, `named glTF item ${index}`);
     return typeof object.name === "string" ? object.name : "";
   }).filter(Boolean);
+  const semanticIdentities = nodes.map((item, index) => {
+    const node = asObject(item, `node ${index}`);
+    const parentIndex = nodes.findIndex((parent) => asArray(asObject(parent, "node").children).includes(index));
+    return { id: `node:${index}`, name: typeof node.name === "string" ? node.name : `node-${index}`, parentId: parentIndex >= 0 ? `node:${parentIndex}` : null };
+  });
   const meaningfulNames = names.filter((name) => !/^(object|mesh|node)[_-]?\d*$/iu.test(name));
   let semanticReadiness: SemanticReadiness;
   if (meshes.length === 1 && nodes.length <= 1) semanticReadiness = "insufficient";
@@ -208,6 +241,7 @@ export function probeGlb(input: Uint8Array): GlbProbe {
       animationCount: animations.length,
     },
     names,
+    semanticIdentities,
     bounds,
     semanticReadiness,
     warnings,
@@ -258,6 +292,7 @@ export function loadGlbScene(input: Uint8Array): THREE.Group {
     const node = asObject(nodeValue, `node ${nodeIndex}`);
     const group = new THREE.Group();
     group.name = typeof node.name === "string" ? node.name : `node-${nodeIndex}`;
+    group.userData.oracleNodeId = `node:${nodeIndex}`;
     if (typeof node.mesh === "number") {
       const mesh = asObject(meshValues[node.mesh], `mesh ${node.mesh}`);
       const primitives = asArray(mesh.primitives);
@@ -392,8 +427,12 @@ export async function loadPreparedOracle(manifest: OracleManifest): Promise<THRE
   const sourceBytes = await readFile(manifest.sourcePath);
   if (sha256(sourceBytes) !== manifest.sourceHash) throw new Error("immutable source oracle bytes changed");
   const source = loadGlbScene(sourceBytes);
+  const nameCounts = new Map<string, number>();
+  source.traverse((object) => nameCounts.set(object.name, (nameCounts.get(object.name) ?? 0) + 1));
   source.traverse((object) => {
-    const semantic = recipe.semanticMap[object.name];
+    const stableId = typeof object.userData.oracleNodeId === "string" ? object.userData.oracleNodeId : undefined;
+    if ((nameCounts.get(object.name) ?? 0) > 1 && recipe.semanticMap[object.name]) throw new Error(`ambiguous semantic map key ${object.name}; use stable node:N identity`);
+    const semantic = (stableId ? recipe.semanticMap[stableId] : undefined) ?? recipe.semanticMap[object.name];
     if (semantic) object.userData.semanticId = semantic;
     const articulationPivot = recipe.articulationMap[object.name] ?? (semantic ? recipe.articulationMap[semantic] : undefined);
     if (articulationPivot) object.userData.articulationPivot = articulationPivot;

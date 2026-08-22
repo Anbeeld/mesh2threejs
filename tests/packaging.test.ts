@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 
 describe("host packaging and progressive disclosure", () => {
-  test.each(["reconstruct", "onboard-oracle", "repair-oracle", "build", "critic", "diagnose", "finalize"])("packages valid %s role metadata", async (role) => {
+  test.each(["reconstruct", "onboard-oracle", "repair-oracle", "build", "visual-review", "diagnose", "finalize"])("packages valid %s role metadata", async (role) => {
     const root = process.cwd();
     const skill = await readFile(join(root, "skills", role, "SKILL.md"), "utf8");
     const metadata = await readFile(join(root, "skills", role, "agents", "openai.yaml"), "utf8");
@@ -12,12 +12,13 @@ describe("host packaging and progressive disclosure", () => {
     expect(metadata).toContain(`$${role}`);
   });
 
-  test("marks unexecuted hosts as unverified and retains a proven critic path", async () => {
+  test("marks unexecuted hosts and visual review as unverified", async () => {
     const root = process.cwd();
     const codex = JSON.parse(await readFile(join(root, "adapters", "codex", "adapter.json"), "utf8"));
     const claude = JSON.parse(await readFile(join(root, "adapters", "claude-code", "adapter.json"), "utf8"));
     const opencode = JSON.parse(await readFile(join(root, "adapters", "opencode", "adapter.json"), "utf8"));
-    expect(codex.capabilities.separateProcessCritic).toBe(true);
+    expect(codex.status).toContain("unverified");
+    expect(codex.capabilities.actualVisualReview).toBe(false);
     expect(claude.status).toContain("not-installed");
     expect(opencode.status).toContain("not-installed");
     expect(claude.capabilities.projectInstructionDiscovery).toBe(false);

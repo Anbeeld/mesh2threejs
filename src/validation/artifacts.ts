@@ -1,8 +1,11 @@
-import { readdir, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { AnySchema } from "ajv";
+import { loadProfileContract, validateProfileContract } from "../core/contracts.js";
+import { evaluateCandidateWithPoses } from "../core/orchestration.js";
+import { analyticalGeneric, analyticalTank } from "../fixtures/analytical.js";
 
 export interface ArtifactValidationResult {
   validated: number;
@@ -36,19 +39,34 @@ export async function validateRepositoryArtifacts(root: string): Promise<Artifac
     errors.push(`style artifacts: ${String(error)}`);
   }
   for (const profile of ["generic", "tank"]) {
-    for (const name of ["gates.json", "measurements.json", "phases.json"]) {
-      try {
-        await jsonFile(join(base, "profiles", profile, name));
-        validated += 1;
-      } catch (error) {
-        errors.push(`${profile}/${name}: ${String(error)}`);
-      }
-    }
+    try {
+      const contract = await loadProfileContract(profile as "generic" | "tank");
+      const result = validateProfileContract(contract);
+      if (!result.valid) errors.push(`${profile}/contract.json: ${result.errors.join("; ")}`);
+      const oracle = profile === "tank" ? analyticalTank() : analyticalGeneric();
+      const candidate = profile === "tank" ? analyticalTank() : analyticalGeneric();
+      const turret = candidate.getObjectByName("turret-pivot");
+      const gun = candidate.getObjectByName("gun-pivot");
+      const execution = await evaluateCandidateWithPoses({
+        oracle,
+        candidate: {
+          root: candidate,
+          setPose: ({ turretYaw, gunElevation }) => {
+            if (turret) turret.rotation.y = turretYaw;
+            if (gun) gun.rotation.x = gunElevation;
+            candidate.updateMatrixWorld(true);
+          },
+        },
+        profile: profile as "generic" | "tank",
+      });
+      if (!execution.contractGates.passed) errors.push(`${profile}/contract.json: runtime gate drift: ${execution.contractGates.rows.filter((row) => !row.passed).map((row) => row.message).join("; ")}`);
+      validated += 1;
+    } catch (error) { errors.push(`${profile}/contract.json: ${String(error)}`); }
   }
   for (const host of ["codex", "claude-code", "opencode"]) {
     try {
-      const adapter = await jsonFile(join(base, "adapters", host, "adapter.json")) as { host?: unknown; status?: unknown; capabilities?: { separateProcessCritic?: unknown } };
-      if (typeof adapter.host !== "string" || typeof adapter.status !== "string" || adapter.capabilities?.separateProcessCritic !== true) {
+      const adapter = await jsonFile(join(base, "adapters", host, "adapter.json")) as { host?: unknown; status?: unknown; capabilities?: { actualVisualReview?: unknown } };
+      if (typeof adapter.host !== "string" || typeof adapter.status !== "string" || typeof adapter.capabilities?.actualVisualReview !== "boolean") {
         errors.push(`${host} adapter has an invalid capability contract`);
       }
       validated += 1;
@@ -56,24 +74,13 @@ export async function validateRepositoryArtifacts(root: string): Promise<Artifac
       errors.push(`${host} adapter: ${String(error)}`);
     }
   }
-  try {
-    const calibration = await jsonFile(join(base, "fixtures", "critic-calibration", "cases.json")) as { cases?: unknown[] };
-    if (!Array.isArray(calibration.cases) || calibration.cases.length < 6) errors.push("critic calibration set is incomplete");
-    validated += 1;
-  } catch (error) {
-    errors.push(`critic calibration: ${String(error)}`);
-  }
-  const skillRoots = [base, ...(await readdir(join(base, "skills"), { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => join(base, "skills", entry.name))];
+  const skillRoots = [base, ...["reconstruct", "onboard-oracle", "repair-oracle", "build", "visual-review", "diagnose", "finalize"].map((name) => join(base, "skills", name))];
   for (const skillRoot of skillRoots) {
     try {
       const skill = await readFile(join(skillRoot, "SKILL.md"), "utf8");
       if (!/^---\r?\n/u.test(skill) || skill.includes("TODO")) errors.push(`${skillRoot}: incomplete SKILL.md`);
       validated += 1;
-    } catch (error) {
-      errors.push(`${skillRoot}: ${String(error)}`);
-    }
+    } catch (error) { errors.push(`${skillRoot}: ${String(error)}`); }
   }
   return { validated, errors };
 }

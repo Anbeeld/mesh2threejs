@@ -3,11 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
-  assertCriticVerdictFresh,
   auditCandidateSource,
-  createCriticPacket,
-  evaluateCriticPacket,
+  awaitingVisualReview,
+  createDeterministicReplayPacket,
+  createVisualReviewPacket,
   loadCandidateModule,
+  loadCandidateRuntime,
+  fingerprintScene,
+  replayDeterministicRows,
 } from "../src/index.js";
 
 describe("canonical procedural candidate", () => {
@@ -17,6 +20,10 @@ describe("canonical procedural candidate", () => {
     await writeFile(path, `import * as THREE from ${JSON.stringify(new URL("../node_modules/three/build/three.module.js", import.meta.url).href)}; export function createCandidate(){ return new THREE.Group(); }`);
     const candidate = await loadCandidateModule(path);
     expect(candidate.isObject3D).toBe(true);
+    const first = await loadCandidateRuntime(path);
+    const second = await loadCandidateRuntime(path);
+    expect(first.sourceHash).toBe(second.sourceHash);
+    expect(fingerprintScene(first.root)).toBe(fingerprintScene(second.root));
   });
 
   test("rejects oracle embedding and topology dumps", () => {
@@ -27,42 +34,31 @@ describe("canonical procedural candidate", () => {
   });
 });
 
-describe("hash-bound critic", () => {
-  test("issues ordered findings and cannot bless deterministic failures", () => {
-    const packet = createCriticPacket({
+describe("deterministic replay and visual authority", () => {
+  test("replays objective rows without presenting itself as visual review", () => {
+    const packet = createDeterministicReplayPacket({
       candidateHash: "candidate-a",
       oracleHash: "oracle-a",
-      profile: "generic",
-      style: "low-poly-faithful",
-      deterministicPassed: false,
       rows: [{ code: "dimensions.depth", passed: false, severity: "critical", message: "wrong depth" }],
-      captures: [],
-      visualFindings: [],
     });
-    const verdict = evaluateCriticPacket(packet);
-    expect(verdict.verdict).toBe("FAIL");
-    expect(verdict.findings[0]?.criterion).toBe("dimensions.depth");
-    expect(() => assertCriticVerdictFresh(verdict, "candidate-b")).toThrow(/stale/);
+    expect(replayDeterministicRows(packet)).toMatchObject({ kind: "deterministic-replay", passed: false, failedCodes: ["dimensions.depth"] });
   });
 
-  test("fails a deterministic pass when calibrated visual inspection finds fabrication or style defects", () => {
-    const packet = createCriticPacket({
+  test("keeps a complete immutable packet waiting when no external vision reviewer exists", () => {
+    const hash = "a".repeat(64);
+    const packet = createVisualReviewPacket({
       candidateHash: "candidate-a",
       oracleHash: "oracle-a",
       profile: "generic",
-      style: "low-poly-faithful",
-      deterministicPassed: true,
-      rows: [],
-      captures: ["beauty-front.png", "normal-front.png"],
-      visualFindings: [{
-        criterion: "fabrication.readability",
-        evidence: "front beauty view shows an unsupported floating bracket",
-        severity: "major",
-        affectedRegionView: "front / upper bracket",
-        expectedCorrection: "seat the bracket on its parent surface",
-        reopenDeterministicGate: true,
-      }],
+      profileContractHash: hash,
+      styleHash: hash,
+      deterministicArtifactHash: hash,
+      captures: [{ path: "beauty-front.png", sha256: hash, pass: "beauty", cameraId: "front" }],
+      comparisonBoardHashes: [hash],
+      turntableHashes: [hash],
+      articulationArtifactHash: hash,
+      regionEvidence: { status: "available", semanticArtifactHash: hash },
     });
-    expect(evaluateCriticPacket(packet).verdict).toBe("FAIL");
+    expect(awaitingVisualReview(packet).status).toBe("awaiting-visual-review");
   });
 });

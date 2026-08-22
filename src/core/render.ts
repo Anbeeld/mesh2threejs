@@ -5,6 +5,40 @@ import * as THREE from "three";
 import type { CaptureCamera, CaptureFrame, CapturePass, Point3, RenderProfile, SceneSnapshot, SceneTriangle } from "../types.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 
+export interface CanonicalFrame {
+  width: number;
+  height: number;
+  pixelsPerUnit: number;
+  orthographicHeight: number;
+  minFeatureSize: number;
+  cameras: Record<"side" | "front" | "plan" | "hero", CaptureCamera>;
+  frameHash: string;
+}
+
+export function deriveCanonicalFrame(bounds: { min: Point3; max: Point3; size: Point3; center: Point3 }, minFeatureSize: number): CanonicalFrame {
+  if (!(minFeatureSize > 0) || !Number.isFinite(minFeatureSize)) throw new Error("minimum feature size must be a positive object-unit value");
+  const span = Math.max(...bounds.size, minFeatureSize);
+  const orthographicHeight = Math.max(bounds.size[1], bounds.size[0], bounds.size[2]) * 1.15;
+  const pixelsPerUnit = Math.max(8, Math.min(1536 / span, 2 / minFeatureSize));
+  const resolution = Math.max(128, Math.min(768, Math.ceil(orthographicHeight * pixelsPerUnit / 16) * 16));
+  const distance = span * 2.5 + 1;
+  const [x, y, z] = bounds.center;
+  const payload = {
+    width: resolution,
+    height: resolution,
+    pixelsPerUnit,
+    orthographicHeight,
+    minFeatureSize,
+    cameras: {
+      side: { id: "side", projection: "orthographic" as const, position: [x + distance, y, z] as const, target: [x, y, z] as const },
+      front: { id: "front", projection: "orthographic" as const, position: [x, y, z + distance] as const, target: [x, y, z] as const },
+      plan: { id: "plan", projection: "orthographic" as const, position: [x, y + distance, z] as const, target: [x, y, z] as const },
+      hero: { id: "hero", projection: "perspective" as const, position: [x + distance * 0.7, y + distance * 0.35, z + distance * 0.7] as const, target: [x, y, z] as const },
+    },
+  };
+  return { ...payload, frameHash: sha256(canonicalJson(payload)) };
+}
+
 const STANDARD_PASSES: CapturePass[] = [
   "beauty",
   "alpha-silhouette",

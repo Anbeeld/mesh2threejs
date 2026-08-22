@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "host": "codex-desktop",
-  "status": "supported-current-environment",
+  "status": "configuration-only-unverified",
   "instructionFiles": ["AGENTS.md", "SKILL.md"],
   "skillRoot": "skills",
   "launch": "Open this repository as a Codex Desktop task, then invoke $mesh2threejs or follow SKILL.md.",
   "cli": "node dist/cli.js",
-  "capabilities": { "projectInstructionDiscovery": true, "skillDiscovery": true, "nestedReferences": true, "commandExecution": true, "browserThreeJs": true, "durableState": true, "separateProcessCritic": true, "freshModelCritic": false },
-  "limitations": ["The packaged Windows app alias was not executable from the test shell.", "Separate-process critic isolation is proven; a distinct-model critic is not claimed."]
+  "capabilities": { "projectInstructionDiscovery": false, "skillDiscovery": false, "nestedReferences": false, "commandExecution": false, "browserThreeJs": false, "durableState": true, "actualVisualReview": false },
+  "limitations": ["A fresh end-to-end host trial with actual image inspection has not been captured."]
 }

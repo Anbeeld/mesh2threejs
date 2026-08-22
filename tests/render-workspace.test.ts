@@ -52,7 +52,8 @@ describe("diagnostic render and workspace contract", () => {
       candidateModule: "candidate/candidate.mjs",
       certification: "oracle-relative",
     });
-    expect(result.directories).toEqual(expect.arrayContaining(["oracle", "candidate", "evidence"]));
+    expect(result.directories).toEqual(expect.arrayContaining(["oracle", "candidate", "evidence", "visual-review"]));
+    expect(result.directories).not.toContain("critic");
     expect(JSON.parse(await readFile(join(directory, "task.json"), "utf8")).id).toBe("fixture");
   });
 });

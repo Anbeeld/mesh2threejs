@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type * as THREE from "three";
 import { snapshotScene } from "./geometry.js";
+import type { SceneSnapshot } from "../types.js";
 
 export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -20,16 +21,20 @@ export function sha256(value: string | Uint8Array): string {
 
 export function fingerprintScene(root: THREE.Object3D): string {
   const snapshot = snapshotScene(root);
+  return fingerprintSnapshot(snapshot);
+}
+
+export function fingerprintSnapshot(snapshot: SceneSnapshot, semanticIds?: ReadonlySet<string>, options: { includeMaterials?: boolean } = {}): string {
+  const components = Object.values(snapshot.components).filter((component) => !semanticIds || semanticIds.has(component.id));
+  const accepted = new Set(components.map((component) => component.id));
   const payload = {
     metadata: snapshot.metadata,
-    components: Object.values(snapshot.components)
+    components: components
       .sort((a, b) => a.id.localeCompare(b.id))
-      .map(({ id, role, parentSemanticId, critical }) => ({ id, role, parentSemanticId, critical })),
-    triangles: snapshot.triangles.map((triangle) => ({
+      .map(({ id, role, parentSemanticId, critical, origin }) => ({ id, role, parentSemanticId, critical, origin })),
+    triangles: snapshot.triangles.filter((triangle) => !semanticIds || accepted.has(triangle.componentId)).map((triangle) => ({
       componentId: triangle.componentId,
-      materialId: triangle.materialId,
-      color: triangle.color,
-      roughness: triangle.roughness,
+      ...(options.includeMaterials === false ? {} : { materialId: triangle.materialId, color: triangle.color, roughness: triangle.roughness }),
       points: triangle.points,
     })),
   };

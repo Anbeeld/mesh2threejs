@@ -6,6 +6,6 @@
   "skillRoot": "skills",
   "launch": "Start Claude Code in the repository and explicitly ask it to read AGENTS.md and SKILL.md before selecting a role skill.",
   "cli": "node dist/cli.js",
-  "capabilities": { "projectInstructionDiscovery": false, "skillDiscovery": false, "nestedReferences": false, "commandExecution": false, "browserThreeJs": false, "durableState": true, "separateProcessCritic": true, "freshModelCritic": false },
+  "capabilities": { "projectInstructionDiscovery": false, "skillDiscovery": false, "nestedReferences": false, "commandExecution": false, "browserThreeJs": false, "durableState": true, "actualVisualReview": false },
   "limitations": ["Claude Code was not installed in the validation environment; host discovery and launch are unverified."]
 }

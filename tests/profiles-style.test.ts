@@ -23,7 +23,7 @@ describe("sibling subject profiles", () => {
     expect(report.passed).toBe(false);
     expect(report.rows.map((row) => row.code)).toEqual(expect.arrayContaining([
       "dimensions.depth",
-      "orientation.forward",
+      "orientation.physical",
       "attachment.contiguity",
       "critical-feature.identity-fitting",
     ]));
@@ -41,14 +41,14 @@ describe("sibling subject profiles", () => {
       "curves.hull",
       "curves.whole",
       "curves.turret",
-      "hull.station",
+      "hull.stations",
       "turret.placement",
-      "gun.length",
-      "running-gear.radius",
+      "gun.geometry",
+      "running-gear.instances",
       "running-gear.spacing",
       "critical-feature.cupola",
-      "fabrication.watertight",
-      "floaters.articulation",
+      "fabrication.profile",
+      "ownership.seating",
     ]));
     expect(report.workorders.some((item) => item.oracleValue !== undefined && item.candidateValue !== undefined)).toBe(true);
   });
@@ -59,12 +59,19 @@ describe("sibling subject profiles", () => {
     })).toThrow(/authoritative dimensions/);
   });
 
+  test("accepts an identical articulated tank as physically seated", () => {
+    const report = evaluateTankProfile(snapshotScene(createTankFixture()), snapshotScene(createTankFixture()), {
+      certification: "oracle-relative",
+    });
+    expect(report.rows.find((row) => row.code === "ownership.seating")?.passed).toBe(true);
+  });
+
   test.each([
-    ["wrong orientation", { reverse: true }, "orientation.forward"],
+    ["wrong orientation", { reverse: true }, "orientation.physical"],
     ["wrong wheel count", { omitWheel: true }, "running-gear.count"],
     ["wrong track course", { omitTrack: true }, "track.course"],
-    ["floating turret fitting", { detachTurretItem: true }, "floaters.articulation"],
-    ["open hull mass", { openHull: true }, "fabrication.watertight"],
+    ["floating turret fitting", { detachTurretItem: true }, "ownership.seating"],
+    ["open hull mass", { openHull: true }, "fabrication.profile"],
   ] as const)("tank protected fixture catches %s", (_label, defect, code) => {
     const report = evaluateTankProfile(snapshotScene(createTankFixture()), snapshotScene(createTankFixture(defect)), { certification: "oracle-relative" });
     expect(report.rows.find((row) => row.code === code)?.passed).toBe(false);
@@ -129,5 +136,24 @@ describe("low-poly-faithful anti-gaming gate", () => {
     withoutCupola.add(semanticMesh("body", new THREE.BoxGeometry(2, 2, 2)));
     expect(evaluateLowPolyStyle(snapshotScene(oracle), snapshotScene(withoutBolt), lowPolyFaithful).passed).toBe(true);
     expect(evaluateLowPolyStyle(snapshotScene(oracle), snapshotScene(withoutCupola), lowPolyFaithful).passed).toBe(false);
+  });
+
+  test("enforces physical feature size only when an explicit semantic policy opts in", () => {
+    const oracle = new THREE.Group();
+    oracle.add(semanticMesh("body", new THREE.BoxGeometry(2, 2, 2)));
+    oracle.add(semanticMesh("antenna-tip", new THREE.BoxGeometry(0.01, 0.01, 0.01), [0, 1.1, 0]));
+    const candidate = oracle.clone(true);
+
+    const withoutPolicy = evaluateLowPolyStyle(snapshotScene(oracle), snapshotScene(candidate), lowPolyFaithful);
+    expect(withoutPolicy.rows.some((row) => row.code.startsWith("style.feature-size."))).toBe(false);
+
+    const withPolicy = evaluateLowPolyStyle(snapshotScene(oracle), snapshotScene(candidate), {
+      ...lowPolyFaithful,
+      featureSizePolicy: { minimum: 0.05, unit: "object-unit", appliesTo: ["antenna-*"] },
+    });
+    expect(withPolicy.rows.find((row) => row.code === "style.feature-size.antenna-tip")).toMatchObject({
+      passed: false,
+      oracleValue: 0.05,
+    });
   });
 });

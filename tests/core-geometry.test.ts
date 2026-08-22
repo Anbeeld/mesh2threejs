@@ -91,4 +91,12 @@ describe("live scene geometry", () => {
     root.getObjectByName("attachment")?.position.setX(3);
     expect(fingerprintScene(root)).not.toBe(first);
   });
+
+  test("counts the resolved material rather than unused geometry group slots", () => {
+    const material = new THREE.MeshStandardMaterial({ color: 0x66705a, roughness: 0.72 });
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), material));
+    root.add(new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 2, 8), material));
+    expect(snapshotScene(root).materialCount).toBe(1);
+  });
 });

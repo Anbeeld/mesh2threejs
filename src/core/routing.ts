@@ -1,6 +1,6 @@
 import type { ProfileId } from "../types.js";
 
-export type Route = "reconstruct" | "onboard-oracle" | "repair-oracle" | "build" | "critic" | "finalize" | "diagnose";
+export type Route = "reconstruct" | "onboard-oracle" | "repair-oracle" | "build" | "visual-review" | "finalize" | "diagnose";
 export type RouteAction =
   | "initialize-state"
   | "edit-prepared-oracle"
@@ -17,7 +17,7 @@ const PERMISSIONS: Record<Route, ReadonlySet<RouteAction>> = {
   "onboard-oracle": new Set(["edit-prepared-oracle", "render", "run-gates"]),
   "repair-oracle": new Set(["edit-prepared-oracle", "render", "run-gates"]),
   build: new Set(["edit-candidate", "render", "run-gates"]),
-  critic: new Set(["render", "run-gates", "issue-verdict"]),
+  "visual-review": new Set(["render", "run-gates", "issue-verdict"]),
   finalize: new Set(["render", "run-gates", "certify"]),
   diagnose: new Set(["render", "run-gates", "recommend-transition"]),
 };

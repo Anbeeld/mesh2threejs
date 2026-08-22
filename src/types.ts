@@ -36,6 +36,7 @@ export interface SceneComponent {
   critical: boolean;
   triangleIndices: number[];
   bounds: Bounds3;
+  origin?: Point3;
 }
 
 export interface SceneSnapshot {
@@ -98,7 +99,14 @@ export interface GateRow {
   deviation?: number;
   normalizedDeviation?: number;
   view?: string;
+  viewsEvaluated?: string[];
   position?: number;
+  phase?: string;
+  category?: string;
+  registration?: { dAlong: number; vertical: number; kind: "translation-only" };
+  statistics?: { mean: number; p95: number; coverage: number; sampleCount: number; trimmedCount?: number };
+  worstLocations?: Array<{ position: number; oracleValue: number; candidateValue: number; physicalDeviation: number }>;
+  physicalUnit?: string;
 }
 
 export interface Workorder {
@@ -112,6 +120,13 @@ export interface Workorder {
   errorKind: string;
   priority: Severity;
   correction: string;
+  phase?: string;
+  category?: string;
+  registration?: GateRow["registration"];
+  statistics?: GateRow["statistics"];
+  worstLocations?: GateRow["worstLocations"];
+  physicalUnit?: string;
+  repairGroup?: string;
 }
 
 export interface GateReport {
@@ -123,5 +138,13 @@ export interface GateReport {
 }
 
 export interface CandidateModule {
-  createCandidate: () => THREE.Object3D | Promise<THREE.Object3D>;
+  createCandidate: () => CandidateBuild | Promise<CandidateBuild>;
 }
+
+export interface CandidateRuntime {
+  root: THREE.Object3D;
+  setPose: (pose: { turretYaw: number; gunElevation: number }) => void | Promise<void>;
+  sourceHash?: string;
+}
+
+export type CandidateBuild = THREE.Object3D | CandidateRuntime;
