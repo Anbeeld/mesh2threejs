@@ -158,6 +158,33 @@ describe("running gear radial truth", () => {
   });
 });
 
+describe("orientation proof is never deferred", () => {
+  test("a hull-only candidate must physically match fore/aft asymmetry, not receive a free pass", async () => {
+    const oracle = snapshotScene(createSlopedTank());
+    const hullOnlyRoot = new THREE.Group();
+    hullOnlyRoot.name = "hull-only";
+    hullOnlyRoot.userData.forwardAxis = "+z";
+    const hullMesh = createSlopedTank().getObjectByName("hull") as THREE.Mesh;
+    hullOnlyRoot.add(semanticMesh("hull", hullMesh.geometry.clone(), [0, 0, 0]));
+    const passing = evaluateTankProfile(oracle, snapshotScene(hullOnlyRoot), { certification: "oracle-relative" });
+    const orientationPassing = passing.rows.find((row) => row.code === "orientation.physical");
+    expect(orientationPassing?.passed).toBe(true);
+    expect(orientationPassing?.message).toMatch(/hull-local fore\/aft section signature/);
+
+    // Mirror the hull fore/aft: the hull-local section signature reverses and must fail.
+    const mirroredRoot = new THREE.Group();
+    mirroredRoot.name = "mirrored-hull-only";
+    mirroredRoot.userData.forwardAxis = "+z";
+    const mirroredHull = semanticMesh("hull", hullMesh.geometry.clone(), [0, 0, 0]);
+    mirroredHull.scale.z = -1;
+    mirroredRoot.add(mirroredHull);
+    const failing = evaluateTankProfile(oracle, snapshotScene(mirroredRoot), { certification: "oracle-relative" });
+    const orientationFailing = failing.rows.find((row) => row.code === "orientation.physical");
+    expect(orientationFailing?.passed).toBe(false);
+    expect(orientationFailing?.message).toMatch(/reversed/);
+  });
+});
+
 describe("candidate audit structural magnitude only", () => {
   test("typed control cages of several hundred values are legal", () => {
     const cage = `const cage = new Float32Array([${Array.from({ length: 420 }, (_, index) => (index % 7) - 3).join(",")}]);\n`;

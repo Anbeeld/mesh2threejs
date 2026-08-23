@@ -746,7 +746,7 @@ interface RegisteredComponent {
   object: THREE.Object3D;
 }
 
-function collectRegisteredComponents(root: THREE.Object3D): { components: RegisteredComponent[]; pivots: Map<string, THREE.Vector3> } {
+function collectRegisteredComponents(root: THREE.Object3D): { components: RegisteredComponent[]; pivots: Map<string, THREE.Vector3>; semanticObjects: Map<string, THREE.Object3D[]> } {
   const bySemantic = new Map<string, THREE.Object3D[]>();
   const pivots = new Map<string, THREE.Vector3>();
   root.updateMatrixWorld(true);
@@ -776,7 +776,29 @@ function collectRegisteredComponents(root: THREE.Object3D): { components: Regist
     const role = resolveSemanticRole(semanticId, declaredRole);
     components.push({ semanticId, ...(role !== undefined ? { role } : {}), box, object: objects[0]! });
   }
-  return { components, pivots };
+  return { components, pivots, semanticObjects: bySemantic };
+}
+
+/**
+ * Pivot origins come from real pivot anchors in priority order: an object whose SEMANTIC ID is
+ * the pivot name (the prepared semantic map's own pivot node), then an object NAMED after the
+ * pivot. The origin of whichever child merely declares `articulationPivot` is never used — a
+ * barrel-centered gun mesh must not masquerade as its trunnion.
+ */
+function resolvePivotOrigin(root: THREE.Object3D, pivotName: string, semanticObjects: Map<string, THREE.Object3D[]>): THREE.Vector3 | null {
+  const semanticObject = semanticObjects.get(pivotName)?.[0];
+  if (semanticObject) {
+    const position = new THREE.Vector3();
+    semanticObject.getWorldPosition(position);
+    return position;
+  }
+  const named = root.getObjectByName(pivotName);
+  if (named) {
+    const position = new THREE.Vector3();
+    named.getWorldPosition(position);
+    return position;
+  }
+  return null;
 }
 
 function worldVertexDirectionFrom(origin: THREE.Vector3, component: RegisteredComponent): THREE.Vector3 | null {
@@ -799,18 +821,29 @@ function worldVertexDirectionFrom(origin: THREE.Vector3, component: RegisteredCo
   return farthest !== null ? (farthest as THREE.Vector3).sub(origin).normalize() : null;
 }
 
+export interface RegistrationOptions {
+  /**
+   * Physical canonical-frame proofs (wheel chains, track pairs, gun-forward) are TANK-specific.
+   * They apply only when the caller declares this registration as a tank; generic subjects are
+   * never required to satisfy tank conventions. Defaults to "generic".
+   */
+  profile?: "tank" | "generic";
+}
+
 /**
  * Verifies prepared-oracle registration. Metadata rows (declared axes, scale, grounding,
- * required semantics/pivots) are checked first; then, whenever available tank semantics exist,
- * the physical canonical-frame rows become MANDATORY: a required proof that cannot be evaluated
- * fails registration ("manual-map-required") instead of being omitted. Wheels prove
- * longitudinal/lateral/ground contact, paired track courses prove Z-span/X-separation, and a
- * gun with a pivot proves neutral barrel alignment with canonical +Z geometrically.
+ * required semantics/pivots) are always checked. Tank frame proofs run only for
+ * `options.profile === "tank"` and then become MANDATORY whenever the relevant semantics
+ * exist: a required proof that cannot be evaluated fails registration ("manual-map-required")
+ * instead of being omitted. Wheels prove longitudinal/lateral/ground contact, paired track
+ * courses prove Z-span/X-separation, and a gun with a resolvable semantic pivot proves neutral
+ * barrel alignment with canonical +Z geometrically.
  */
-export function verifyOracleRegistration(root: THREE.Object3D, expected: RegistrationExpectation): RegistrationEvidence {
+export function verifyOracleRegistration(root: THREE.Object3D, expected: RegistrationExpectation, options: RegistrationOptions = {}): RegistrationEvidence {
   root.updateMatrixWorld(true);
   const bounds = new THREE.Box3().setFromObject(root);
-  const { components, pivots } = collectRegisteredComponents(root);
+  const { components, pivots, semanticObjects } = collectRegisteredComponents(root);
+  const isTank = options.profile === "tank";
   const semantics = new Set(components.map((component) => component.semanticId));
   const names = new Set<string>();
   root.traverse((object) => names.add(object.name));
@@ -825,62 +858,66 @@ export function verifyOracleRegistration(root: THREE.Object3D, expected: Registr
   ];
   const failRow = (code: string, reason: string): void => { rows.push({ code, passed: false, expected: "mechanically proven", actual: `manual-map-required: ${reason}` }); };
 
-  const wheels = components.filter((component) => component.role === "road-wheel" || component.role === "sprocket" || component.role === "idler");
-  if (wheels.length >= 4) {
-    const centers = wheels.map((wheel) => wheel.box.getCenter(new THREE.Vector3()));
-    const zVar = Math.max(...centers.map((center) => center.z)) - Math.min(...centers.map((center) => center.z));
-    const xVar = Math.max(...centers.map((center) => center.x)) - Math.min(...centers.map((center) => center.x));
-    rows.push({ code: "registration.frame.longitudinal", passed: zVar > xVar * 1.5, expected: "wheel-chain spread along canonical Z >> X", actual: `zSpan ${zVar.toFixed(2)} xSpan ${xVar.toFixed(2)}` });
-    const left = centers.filter((center) => center.x < 0).length;
-    const right = centers.filter((center) => center.x > 0).length;
-    rows.push({ code: "registration.frame.lateral", passed: left > 0 && right > 0, expected: "left/right running gear separated on canonical X", actual: `L${left} R${right}` });
-    const span = Math.max(bounds.max.x - bounds.min.x, bounds.max.z - bounds.min.z);
-    const groundTolerance = Math.max(1.5, span * 0.15);
-    const elevated = wheels.some((wheel) => wheel.box.min.y - bounds.min.y > groundTolerance);
-    rows.push({ code: "registration.frame.ground-contact", passed: !elevated, expected: "running gear near ground plane", actual: elevated ? "elevated above ground" : "near ground" });
-  } else if (components.some((component) => /^hull|^turret|^gun/u.test(component.semanticId)) && components.some((component) => component.role === undefined && /wheel|sprocket|idler|roller/u.test(component.semanticId))) {
-    failRow("registration.frame.longitudinal", "wheel-like semantics are mapped without the road-wheel role; declare structured roles");
-  }
+  if (isTank) {
+    const wheels = components.filter((component) => component.role === "road-wheel" || component.role === "sprocket" || component.role === "idler");
+    if (wheels.length >= 4) {
+      const centers = wheels.map((wheel) => wheel.box.getCenter(new THREE.Vector3()));
+      const zVar = Math.max(...centers.map((center) => center.z)) - Math.min(...centers.map((center) => center.z));
+      const xVar = Math.max(...centers.map((center) => center.x)) - Math.min(...centers.map((center) => center.x));
+      rows.push({ code: "registration.frame.longitudinal", passed: zVar > xVar * 1.5, expected: "wheel-chain spread along canonical Z >> X", actual: `zSpan ${zVar.toFixed(2)} xSpan ${xVar.toFixed(2)}` });
+      const left = centers.filter((center) => center.x < 0).length;
+      const right = centers.filter((center) => center.x > 0).length;
+      rows.push({ code: "registration.frame.lateral", passed: left > 0 && right > 0, expected: "left/right running gear separated on canonical X", actual: `L${left} R${right}` });
+      const span = Math.max(bounds.max.x - bounds.min.x, bounds.max.z - bounds.min.z);
+      const groundTolerance = Math.max(1.5, span * 0.15);
+      const elevated = wheels.some((wheel) => wheel.box.min.y - bounds.min.y > groundTolerance);
+      rows.push({ code: "registration.frame.ground-contact", passed: !elevated, expected: "running gear near ground plane", actual: elevated ? "elevated above ground" : "near ground" });
+    } else if (components.some((component) => /^hull|^turret|^gun/u.test(component.semanticId)) && components.some((component) => component.role === undefined && /wheel|sprocket|idler|roller/u.test(component.semanticId))) {
+      failRow("registration.frame.longitudinal", "wheel-like semantics are mapped without the road-wheel role; declare structured roles");
+    }
 
-  const tracks = components.filter((component) => component.role === "track-course" || /^track[-_ ]/u.test(component.semanticId));
-  if (tracks.length === 2) {
-    const a = tracks[0]!.box;
-    const b = tracks[1]!.box;
-    const size = (box: THREE.Box3): [number, number, number] => [box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z];
-    const aSize = size(a);
-    const bSize = size(b);
-    const majorZ = Math.max(aSize[2], bSize[2]) > Math.max(aSize[0], bSize[0]) * 1.5;
-    const centerA = a.getCenter(new THREE.Vector3());
-    const centerB = b.getCenter(new THREE.Vector3());
-    const separationX = Math.abs(centerA.x - centerB.x);
-    const separationOther = Math.max(Math.abs(centerA.y - centerB.y), Math.abs(centerA.z - centerB.z));
-    rows.push({
-      code: "registration.frame.track-pair",
-      passed: majorZ && separationX > separationOther,
-      expected: "two courses spanning canonical Z, separated along canonical X",
-      actual: `zSpan ${Math.max(aSize[2], bSize[2]).toFixed(2)} xSpan ${Math.max(aSize[0], bSize[0]).toFixed(2)} separation x ${separationX.toFixed(2)} other ${separationOther.toFixed(2)}`,
-    });
-  } else if (tracks.length > 2) {
-    failRow("registration.frame.track-pair", `expected two track courses, found ${tracks.length}`);
-  }
+    const tracks = components.filter((component) => component.role === "track-course" || /^track[-_ ]/u.test(component.semanticId));
+    if (tracks.length === 2) {
+      const a = tracks[0]!.box;
+      const b = tracks[1]!.box;
+      const size = (box: THREE.Box3): [number, number, number] => [box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z];
+      const aSize = size(a);
+      const bSize = size(b);
+      const majorZ = Math.max(aSize[2], bSize[2]) > Math.max(aSize[0], bSize[0]) * 1.5;
+      const centerA = a.getCenter(new THREE.Vector3());
+      const centerB = b.getCenter(new THREE.Vector3());
+      const separationX = Math.abs(centerA.x - centerB.x);
+      const separationOther = Math.max(Math.abs(centerA.y - centerB.y), Math.abs(centerA.z - centerB.z));
+      rows.push({
+        code: "registration.frame.track-pair",
+        passed: majorZ && separationX > separationOther,
+        expected: "two courses spanning canonical Z, separated along canonical X",
+        actual: `zSpan ${Math.max(aSize[2], bSize[2]).toFixed(2)} xSpan ${Math.max(aSize[0], bSize[0]).toFixed(2)} separation x ${separationX.toFixed(2)} other ${separationOther.toFixed(2)}`,
+      });
+    } else if (tracks.length > 2) {
+      failRow("registration.frame.track-pair", `expected two track courses, found ${tracks.length}`);
+    }
 
-  const gun = components.find((component) => component.semanticId === "gun" || component.semanticId.startsWith("gun-"));
-  if (gun) {
-    const origin = pivots.get("gun-pivot");
-    if (!origin) {
-      failRow("registration.frame.gun-forward", "gun semantics present but no resolvable gun-pivot origin");
-    } else {
-      const direction = worldVertexDirectionFrom(origin, gun);
-      if (!direction || !Number.isFinite(direction.z)) {
-        failRow("registration.frame.gun-forward", "gun geometry produced no barrel direction");
+    const gun = components.find((component) => component.semanticId === "gun" || component.semanticId.startsWith("gun-"));
+    if (gun) {
+      // The barrel direction must originate at a REAL pivot anchor — never the origin of
+      // whichever mesh merely declares it belongs to the pivot.
+      const origin = resolvePivotOrigin(root, "gun-pivot", semanticObjects);
+      if (!origin) {
+        failRow("registration.frame.gun-forward", "gun semantics present but no semantic or named gun-pivot anchor exists; map a real pivot node");
       } else {
-        const cosine = direction.z;
-        rows.push({
-          code: "registration.frame.gun-forward",
-          passed: cosine >= Math.cos(Math.PI / 6),
-          expected: "neutral barrel axis aligned with canonical +Z within 30 degrees",
-          actual: `+Z cosine ${cosine.toFixed(4)}`,
-        });
+        const direction = worldVertexDirectionFrom(origin, gun);
+        if (!direction || !Number.isFinite(direction.z)) {
+          failRow("registration.frame.gun-forward", "gun geometry produced no barrel direction");
+        } else {
+          const cosine = direction.z;
+          rows.push({
+            code: "registration.frame.gun-forward",
+            passed: cosine >= Math.cos(Math.PI / 6),
+            expected: "neutral barrel axis aligned with canonical +Z within 30 degrees from the semantic gun-pivot anchor",
+            actual: `+Z cosine ${cosine.toFixed(4)}`,
+          });
+        }
       }
     }
   }

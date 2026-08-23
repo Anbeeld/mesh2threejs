@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { OracleManifest } from "./oracle.js";
 import type { CandidateIdentity } from "./candidate.js";
@@ -241,4 +241,69 @@ async function createSanityRunDirectory(parent: string): Promise<string> {
     }
   }
   throw new Error(`no available oracle-sanity run directory under ${parent}`);
+}
+
+export interface OracleSanityVerification {
+  manifestPath: string;
+  manifest: {
+    schemaVersion: 1;
+    kind: string;
+    oracleHash: string;
+    preparedOracleHash: string;
+    views: string[];
+    captures: Array<{ view: string; path: string; sha256: string }>;
+    [key: string]: unknown;
+  };
+}
+
+/**
+ * Locates the newest oracle sanity board and proves it is authoritative for the CURRENT
+ * preparation: the manifest must bind the live prepared-oracle hash and every referenced
+ * capture must still hash to its recorded value. A board captured for an earlier preparation
+ * can never satisfy a later registration lock.
+ */
+export async function verifyLatestOracleSanity(capturesDirectory: string, preparedOracleHash: string): Promise<OracleSanityVerification> {
+  let names: string[];
+  try {
+    names = (await readdir(capturesDirectory, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse();
+  } catch {
+    throw new Error("no oracle-sanity capture exists; run `mesh2threejs oracle-sanity WORKSPACE` before locking tank registration");
+  }
+  const sequence = (name: string): number => Number(name.match(/^oracle-sanity-(\d+)$/u)?.[1] ?? -1);
+  const candidates = names.filter((name) => sequence(name) >= 0);
+  let manifestPath: string | undefined;
+  for (const name of candidates) {
+    const candidatePath = join(capturesDirectory, name, "oracle-sanity-manifest.json");
+    try {
+      await readFile(candidatePath);
+      manifestPath = candidatePath;
+      break;
+    } catch { /* inspect the next completed run */ }
+  }
+  if (!manifestPath) throw new Error("no completed oracle-sanity capture exists; run `mesh2threejs oracle-sanity WORKSPACE` before locking tank registration");
+  let manifestValue: unknown;
+  try {
+    manifestValue = JSON.parse(await readFile(manifestPath, "utf8"));
+  } catch (error) {
+    throw new Error(`oracle-sanity manifest is unreadable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const manifest = manifestValue as OracleSanityVerification["manifest"];
+  if (manifest.schemaVersion !== 1 || manifest.kind !== "oracle-sanity-board" || !Array.isArray(manifest.captures)) {
+    throw new Error(`oracle-sanity manifest at ${manifestPath} is not a valid sanity board`);
+  }
+  if (manifest.preparedOracleHash !== preparedOracleHash) {
+    throw new Error("the latest oracle-sanity board was captured for a different oracle preparation; rerun `mesh2threejs oracle-sanity WORKSPACE` for the current preparation");
+  }
+  for (const capture of manifest.captures) {
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(capture.path);
+    } catch {
+      throw new Error(`oracle-sanity capture file is missing: ${capture.path}`);
+    }
+    if (sha256(bytes) !== capture.sha256) {
+      throw new Error(`oracle-sanity capture bytes changed since capture: ${capture.path}`);
+    }
+  }
+  return { manifestPath, manifest };
 }

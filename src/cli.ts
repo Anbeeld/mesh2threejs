@@ -16,7 +16,7 @@ import { getProfileContract, profileContractHash } from "./core/contracts.js";
 import { inspectAllUpstreamDrift } from "./core/upstream.js";
 import type { GenericSubjectContract } from "./profiles/generic.js";
 import { awaitingVisualReview, createVisualReviewPacket, verifyVisualReviewPacketFiles, verifyVisualReviewVerdict, type ReviewFileReference, type VisualReviewPacket, type VisualReviewVerdict } from "./core/review.js";
-import { performRenderRun, performOracleSanityRun } from "./core/workspace-render.js";
+import { performRenderRun, performOracleSanityRun, verifyLatestOracleSanity } from "./core/workspace-render.js";
 import { startViewer, stopViewer, viewerStatus } from "./viewer/manager.js";
 import { selectRepairGroup } from "./core/compare.js";
 import { createEvaluationIdentity, EVALUATOR_VERSION, evaluationIdentityHash, MEASUREMENT_VERSION, optionalContractHash } from "./core/identity.js";
@@ -153,7 +153,7 @@ const HELP = `mesh2threejs commands:
   repair-oracle WORKSPACE --config repair.json
   repair-oracle --manifest manifest.json --config repair.json --out repaired-manifest.json
   register WORKSPACE --config expectation.json
-  register --manifest manifest.json --config expectation.json [--out evidence.json]
+  register --manifest manifest.json --config expectation.json [--profile tank|generic] [--out evidence.json]
   oracle-sanity WORKSPACE
   audit-candidate MODULE
   gate WORKSPACE [--global]
@@ -285,17 +285,18 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         if (!path) throw new Error("lock requires a state path");
         const target = await resolveStateTarget(path);
         const { statePath } = target;
+        let livePreparation: Awaited<ReturnType<typeof verifyWorkspaceOraclePreparation>> | undefined;
         if (target.workspaceRoot) {
           const workspace = await resumeWorkspace(target.workspaceRoot);
-          if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
+          if (workspace.project.oracle) livePreparation = await verifyWorkspaceOraclePreparation(workspace);
         }
         const current = await loadTaskState(statePath);
         const phase = parsed.options.phase ?? (target.workspaceRoot ? current.activePhase : undefined);
         if (!phase) throw new Error("lock state-file mode requires --phase");
         if (target.workspaceRoot && phase === "oracle-registration" && current.profile === "tank") {
-          // Registration locking for tank projects requires first-class oracle sanity captures:
-          // a human-inspectable frame board produced from real pipeline output.
-          await latestRunFile(createWorkspaceResolver(target.workspaceRoot).layout.internal.captures, "oracle-sanity", "oracle-sanity-manifest.json");
+          // Registration locking for tank projects requires a sanity board bound to the CURRENT
+          // preparation with capture bytes re-hashed — stale boards cannot satisfy the lock.
+          await verifyLatestOracleSanity(createWorkspaceResolver(target.workspaceRoot).layout.internal.captures, livePreparation!.binding.preparedHash);
         }
         const geometryHash = parsed.options["geometry-hash"] ?? (target.workspaceRoot ? (phase === "oracle-registration" ? current.oracleHash : current.phaseGeometryHashes[phase]) : undefined);
         if (!geometryHash) throw new Error(`no measured geometry is available for phase ${phase}; run registration/gate first or provide --geometry-hash`);
@@ -517,8 +518,10 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           preparationIdentity = oraclePreparationIdentity(manifest);
         }
         const expectation = JSON.parse(await readFile(resolve(required(parsed.options, "config")), "utf8")) as RegistrationExpectation;
+        const registrationProfile = (workspace?.project.profile ?? parsed.options.profile) as "tank" | "generic" | undefined;
+        if (registrationProfile !== undefined && registrationProfile !== "tank" && registrationProfile !== "generic") throw new Error("--profile must be tank or generic");
         const oracle = await loadPreparedOracle(manifest, workspace?.root);
-        const evidence = verifyOracleRegistration(oracle, expectation);
+        const evidence = verifyOracleRegistration(oracle, expectation, { ...(registrationProfile ? { profile: registrationProfile } : {}) });
         const rendered = `${json(evidence)}\n`;
         const registrationRun = workspace ? await createRunDirectory(workspace.layout.internal.evidence, "registration") : undefined;
         const reportPath = registrationRun ? join(workspace!.layout.internal.reports, `${registrationRun.id}.json`) : (parsed.options.out ? resolve(parsed.options.out) : undefined);

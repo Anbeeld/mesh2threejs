@@ -69,7 +69,7 @@ export function createTankFixture(options: {
   if (options.reverse) root.scale.z = -1;
 
   const hull = semanticMesh("hull", options.openHull ? new THREE.PlaneGeometry(3.2, 6) : new THREE.BoxGeometry(3.2, 1.2, 6), [0, 0.4, 0]);
-  const upperHull = semanticMesh("hull-upper", new THREE.BoxGeometry(2.8, 0.6, 3.8), [0, 1.25, -0.2]);
+  const upperHull = semanticMesh("hull-upper", new THREE.BoxGeometry(2.8, 0.6, 3.8), [0, 1.3, -0.2]);
   upperHull.rotation.x = options.hullSlope ?? 0;
   root.add(hull, upperHull);
 

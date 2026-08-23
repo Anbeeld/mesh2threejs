@@ -1,4 +1,4 @@
-import type { Bounds3, CaptureCamera, GateReport, GateRow, SceneComponent, SceneSnapshot, SceneTriangle } from "../types.js";
+import type { Bounds3, CaptureCamera, GateReport, GateRow, Point3, SceneComponent, SceneSnapshot, SceneTriangle } from "../types.js";
 import { rowsToWorkorders, scoreSilhouetteCurves, type CurvePoint } from "../core/compare.js";
 import {
   checkWatertightness,
@@ -96,6 +96,101 @@ function contourBandSpan(contour: ReturnType<typeof sectionContourFromSegments> 
     }
   }
   return Number.isFinite(minColumn) ? ((maxColumn - minColumn + 1) / contour.width) * spanU : 0;
+}
+
+/**
+ * Hull-local fore/aft evidence: the difference between rear and front cross-section areas at
+ * fixed hull fractions. This proves directional asymmetry for a partial candidate that does not
+ * yet carry turret/gun semantics — orientation is never granted for free while deferred.
+ */
+function hullForeAftAreas(snapshot: SceneSnapshot): { rear: number; front: number } | null {
+  const ids = Object.keys(snapshot.components).filter((id) => isHullId(id) && snapshot.components[id]!.triangleIndices.length > 0);
+  if (!ids.length) return null;
+  const bounds = measureBounds(snapshot, isHullComponent);
+  if (!(bounds.size[2] > 0)) return null;
+  const areaAt = (fraction: number): number => {
+    const z = bounds.min[2] + bounds.size[2] * fraction;
+    const contour = sectionContourFromSegments(measureSectionSegments(snapshot, { axis: "z", position: z, semanticIds: ids }));
+    if (!contour) return Number.NaN;
+    let filled = 0;
+    for (const value of contour.mask) filled += value;
+    const cellArea = ((contour.max[0]! - contour.min[0]!) / contour.width) * ((contour.max[1]! - contour.min[1]!) / contour.height);
+    return filled * cellArea;
+  };
+  const rear = areaAt(0.15);
+  const front = areaAt(0.85);
+  if (!Number.isFinite(rear) || !Number.isFinite(front)) return null;
+  return { rear, front };
+}
+
+function hullOrientationRows(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
+  const frameValid = (): boolean => {
+    const hullIds = Object.keys(candidate.components).filter(isHullId);
+    if (!hullIds.length) return false;
+    const wheels = componentsBy(candidate, (c) => c.role === "road-wheel" || c.id.startsWith("road-wheel-"));
+    if (wheels.length >= 4) {
+      const zs = wheels.map((w) => w.bounds.center[2]);
+      const xs = wheels.map((w) => w.bounds.center[0]);
+      const zVar = Math.max(...zs) - Math.min(...zs);
+      const xVar = Math.max(...xs) - Math.min(...xs);
+      if (zVar < xVar) return false;
+    }
+    return true;
+  };
+  const directionalSignature = (snapshot: SceneSnapshot): number => {
+    const hull = snapshot.components.hull;
+    const gun = snapshot.components.gun;
+    const turret = snapshot.components.turret;
+    if (!hull || !gun || !turret) return Number.NaN;
+    return (gun.bounds.center[2] - turret.bounds.center[2]) + 0.25 * (turret.bounds.center[2] - hull.bounds.center[2]);
+  };
+  const frameOk = frameValid();
+  const hasLandmarks = Boolean(candidate.components.turret && candidate.components.gun && oracle.components.turret && oracle.components.gun);
+  if (!hasLandmarks) {
+    // Hull-local proof: a partial candidate must still demonstrate the same physical fore/aft
+    // asymmetry as the oracle. A deferred check is a failure, never a free pass.
+    const oracleAreas = hullForeAftAreas(oracle);
+    const candidateAreas = hullForeAftAreas(candidate);
+    const scale = oracleAreas ? Math.max(oracleAreas.rear, oracleAreas.front, 1e-9) : 1;
+    if (!oracleAreas || !candidateAreas) {
+      return { code: "orientation.physical", phase: "hull", category: "directional-sections", component: "whole-vehicle", passed: false, score: 0, severity: "critical", message: `${!oracleAreas ? "oracle" : "candidate"} lacks sufficient section evidence for a hull-local fore/aft proof` };
+    }
+    const asymmetric = Math.abs(oracleAreas.rear - oracleAreas.front) > scale * 0.05;
+    if (!asymmetric) {
+      return { code: "orientation.physical", phase: "hull", category: "directional-sections", component: "whole-vehicle", passed: false, score: 0, severity: "critical", message: "hull geometry alone does not physically distinguish fore from aft; add directional fittings or map turret/gun semantics before locking hull" };
+    }
+    const passed = frameOk && Math.sign(oracleAreas.rear - oracleAreas.front) === Math.sign(candidateAreas.rear - candidateAreas.front);
+    return {
+      code: "orientation.physical",
+      phase: "hull",
+      category: "directional-sections",
+      component: "whole-vehicle",
+      passed,
+      score: passed ? 100 : 0,
+      severity: "critical",
+      message: passed ? `hull-local fore/aft section signature matches (rear-front ${oracleAreas.rear - oracleAreas.front})`
+        : `hull-local fore/aft section signature reversed: expected ${oracleAreas.rear - oracleAreas.front}, measured ${candidateAreas.rear - candidateAreas.front}`,
+      physicalUnit: "object-unit-squared",
+    };
+  }
+  const oracleDirection = directionalSignature(oracle);
+  const candidateDirection = directionalSignature(candidate);
+  const orientationPassed = frameOk && Number.isFinite(oracleDirection) && Number.isFinite(candidateDirection) && Math.sign(oracleDirection) === Math.sign(candidateDirection);
+  return {
+    code: "orientation.physical",
+    phase: "hull",
+    category: "directional-landmarks",
+    component: "whole-vehicle",
+    passed: orientationPassed,
+    score: orientationPassed ? 100 : 0,
+    severity: "critical",
+    message: !frameOk ? "canonical frame invalid; orientation unavailable"
+      : `physical fore/aft landmark signature expected ${oracleDirection.toFixed(4)}, measured ${candidateDirection.toFixed(4)}; metadata is informational only`,
+    oracleValue: oracleDirection,
+    candidateValue: candidateDirection,
+    deviation: candidateDirection - oracleDirection,
+    physicalUnit: "object-unit",
+  };
 }
 
 function hullSectionsRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
@@ -247,6 +342,57 @@ function hullPlanesRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow
   return { code: "hull.planes", phase: "hull", category: "principal-planes", component: "hull", passed, score, severity: "critical", message: detail ? `hull principal planes: ${detail}` : "hull principal planes match", normalizedDeviation: Math.min(err, 1), physicalUnit: "object-unit" };
 }
 
+/** Deterministic surface-point sample (vertices, stride-capped) used for proximity checks. */
+function componentSurfacePoints(snapshot: SceneSnapshot, semanticId: string, cap = 400): Point3[] {
+  const component = snapshot.components[semanticId]!;
+  const triangles = component.triangleIndices.length;
+  const stride = Math.max(1, Math.ceil(triangles / cap));
+  const points: Point3[] = [];
+  for (let index = 0; index < triangles; index += stride) {
+    const triangle = sceneTriangleAt(snapshot, component.triangleIndices[index]!);
+    if (triangle) points.push(triangle.points[0]!, triangle.points[1]!, triangle.points[2]!);
+  }
+  return points;
+}
+
+/**
+ * Narrow-phase contact test. AABB overlap alone cannot distinguish touching plates from
+ * diagonally displaced pieces whose envelopes intersect, and point-to-point proximity cannot
+ * see coplanar area contact between nested rectangles. Instead, project both components'
+ * surface points onto informative separating axes — the three canonical axes plus the
+ * centroid-connecting direction, which captures diagonal displacement. Contact requires that
+ * NO tested axis separates the point clouds beyond the fabrication tolerance.
+ */
+function surfacesWithinTolerance(snapshot: SceneSnapshot, a: string, b: string, tolerance: number): boolean {
+  const pointsA = componentSurfacePoints(snapshot, a);
+  const pointsB = componentSurfacePoints(snapshot, b);
+  if (!pointsA.length || !pointsB.length) return false;
+  const centerOf = (points: Point3[]): Point3 => points.reduce((sum, point) => [sum[0]! + point[0]! / points.length, sum[1]! + point[1]! / points.length, sum[2]! + point[2]! / points.length], [0, 0, 0]);
+  const centerA = centerOf(pointsA);
+  const centerB = centerOf(pointsB);
+  const centroidAxis = [centerB[0]! - centerA[0]!, centerB[1]! - centerA[1]!, centerB[2]! - centerA[2]!];
+  const length = Math.hypot(...centroidAxis);
+  const directions: Point3[] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  if (length > 1e-9) directions.push([centroidAxis[0]! / length, centroidAxis[1]! / length, centroidAxis[2]! / length]);
+  const projections = (points: Point3[], direction: Point3): { min: number; max: number } => {
+    let min = Number.POSITIVE_INFINITY;
+    let max = Number.NEGATIVE_INFINITY;
+    for (const point of points) {
+      const value = point[0]! * direction[0]! + point[1]! * direction[1]! + point[2]! * direction[2]!;
+      min = Math.min(min, value);
+      max = Math.max(max, value);
+    }
+    return { min, max };
+  };
+  for (const direction of directions) {
+    const pa = projections(pointsA, direction);
+    const pb = projections(pointsB, direction);
+    const gap = Math.max(pb.min - pa.max, pa.min - pb.max);
+    if (gap > tolerance) return false;
+  }
+  return true;
+}
+
 function hullContiguityRow(candidate: SceneSnapshot): GateRow {
   const hullIds = Object.keys(candidate.components).filter((id) => isHullId(id) && candidate.components[id]!.triangleIndices.length > 0);
   if (!hullIds.length) {
@@ -262,7 +408,11 @@ function hullContiguityRow(candidate: SceneSnapshot): GateRow {
     return { code: "hull.contiguity", phase: "hull", component: "hull", passed: true, score: 100, severity: "critical", message: "hull is contiguous" };
   }
   // Contact-graph authority across components: neighboring plates may form a connected chain
-  // while distant plates never touch each other. Only graph connectivity is required.
+  // while distant plates never touch each other. Only graph connectivity is required. AABB
+  // proximity is only a broad phase — an edge additionally requires that no informative
+  // separating axis (canonical axes plus the centroid-connecting direction) splits the surface
+  // point clouds beyond the fabrication tolerance, so diagonally displaced pieces with
+  // overlapping envelopes cannot fake a connection.
   const tolerance = Math.max(0.005 * measureBounds(candidate, isHullComponent).size[2], 1e-4);
   const parent = new Int32Array(hullIds.length);
   for (let index = 0; index < parent.length; index += 1) parent[index] = index;
@@ -271,7 +421,7 @@ function hullContiguityRow(candidate: SceneSnapshot): GateRow {
   for (let i = 0; i < hullIds.length; i += 1) {
     for (let j = i + 1; j < hullIds.length; j += 1) {
       const gap = boundsGap(candidate.components[hullIds[i]!]!.bounds, candidate.components[hullIds[j]!]!.bounds);
-      if (gap <= tolerance) union(i, j);
+      if (gap <= tolerance && surfacesWithinTolerance(candidate, hullIds[i]!, hullIds[j]!, tolerance)) union(i, j);
     }
   }
   const clusters = new Set(hullIds.map((_, index) => find(index)));
@@ -760,51 +910,7 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
     }
   }
   if (want("hull")) {
-    const frameValid = (): boolean => {
-      const hullIds = Object.keys(candidate.components).filter(isHullId);
-      if (!hullIds.length) return false;
-      const wheels = componentsBy(candidate, (c) => c.role === "road-wheel" || c.id.startsWith("road-wheel-"));
-      if (wheels.length >= 4) {
-        const zs = wheels.map((w) => w.bounds.center[2]);
-        const xs = wheels.map((w) => w.bounds.center[0]);
-        const zVar = Math.max(...zs) - Math.min(...zs);
-        const xVar = Math.max(...xs) - Math.min(...xs);
-        if (zVar < xVar) return false;
-      }
-      return true;
-    };
-    const directionalSignature = (snapshot: SceneSnapshot): number => {
-      const hull = snapshot.components.hull;
-      const gun = snapshot.components.gun;
-      const turret = snapshot.components.turret;
-      if (!hull || !gun || !turret) return Number.NaN;
-      return (gun.bounds.center[2] - turret.bounds.center[2]) + 0.25 * (turret.bounds.center[2] - hull.bounds.center[2]);
-    };
-    const oracleDirection = directionalSignature(oracle);
-    const candidateDirection = directionalSignature(candidate);
-    const frameOk = frameValid();
-    // A partial candidate that does not yet carry turret/gun semantics cannot prove fore/aft
-    // landmark direction; the hull stage judges the canonical hull frame now and defers the
-    // landmark signature to the phases that own those semantics (admitted oracle geometry,
-    // never invented candidate construction).
-    const hasForeAftLandmarks = Boolean(candidate.components.turret && candidate.components.gun);
-    const orientationPassed = frameOk && (!hasForeAftLandmarks || (Number.isFinite(oracleDirection) && Number.isFinite(candidateDirection) && Math.sign(oracleDirection) === Math.sign(candidateDirection)));
-    rows.push({
-      code: "orientation.physical",
-      phase: "hull",
-      category: "directional-landmarks",
-      component: "whole-vehicle",
-      passed: orientationPassed,
-      score: orientationPassed ? 100 : 0,
-      severity: "critical",
-      message: !frameOk ? "canonical frame invalid; orientation unavailable"
-        : !hasForeAftLandmarks ? "fore/aft landmark signature deferred: candidate carries hull semantics only"
-        : `physical fore/aft landmark signature expected ${oracleDirection.toFixed(4)}, measured ${candidateDirection.toFixed(4)}; metadata is informational only`,
-      oracleValue: oracleDirection,
-      candidateValue: candidateDirection,
-      deviation: candidateDirection - oracleDirection,
-      physicalUnit: "object-unit",
-    });
+    rows.push(hullOrientationRows(oracle, candidate));
   }
 
   if (want("hull")) {

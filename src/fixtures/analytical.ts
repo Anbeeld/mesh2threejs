@@ -25,7 +25,7 @@ export function analyticalTank(): THREE.Group {
   root.name = "analytical-tank";
   root.userData.forwardAxis = "+z";
   root.add(mesh("hull", new THREE.BoxGeometry(3.2, 1.2, 6), [0, 0.4, 0]));
-  root.add(mesh("hull-upper", new THREE.BoxGeometry(2.8, 0.6, 3.8), [0, 1.25, -0.2]));
+  root.add(mesh("hull-upper", new THREE.BoxGeometry(2.8, 0.6, 3.8), [0, 1.3, -0.2]));
   const turretPivot = new THREE.Group();
   turretPivot.name = "turret-pivot";
   turretPivot.userData.semanticId = "turret-pivot";

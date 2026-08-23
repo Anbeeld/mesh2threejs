@@ -116,10 +116,20 @@ describe("active-phase execution through the workspace CLI", () => {
     const registration = join(parent, "registration.json");
     await writeFile(registration, JSON.stringify({ forwardAxis: "+z", upAxis: "+y", expectedScale: 1, groundY: 0, tolerance: 0.02, requiredSemantics: [], requiredPivots: [] }));
     expect(await runCli(["register", root, "--config", registration], out.io)).toBe(0);
-    // Without a sanity capture the lock must fail closed; after capturing it must succeed.
+    // Without a sanity capture the lock must fail closed; a board captured for an EARLIER
+    // preparation is equally unacceptable; only a fresh board for the live preparation locks.
     const blocked = sink();
     expect(await runCli(["lock", root], blocked.io)).not.toBe(0);
     expect(await runCli(["oracle-sanity", root], out.io)).toBe(0);
+    await writeFile(join(root, "repair.json"), JSON.stringify({ reason: "re-emit preparation to invalidate stale sanity evidence" }));
+    expect(await runCli(["repair-oracle", root, "--config", join(root, "repair.json")], out.io)).toBe(0);
+    const stale = sink();
+    const staleExit = await runCli(["lock", root], stale.io);
+    expect(staleExit).not.toBe(0);
+    expect([...stale.stderr, ...stale.stdout].join("")).toMatch(/different oracle preparation/i);
+    expect(await runCli(["oracle-sanity", root], out.io)).toBe(0);
+    // Repair invalidated prior registration evidence; re-register for the new preparation.
+    expect(await runCli(["register", root, "--config", registration], out.io)).toBe(0);
     const sanityManifestPath = join(root, ".mesh2threejs", "captures", "oracle-sanity-0001", "oracle-sanity-manifest.json");
     const sanityManifest = JSON.parse(await readFile(sanityManifestPath, "utf8")) as { views: string[]; canonicalFrame: Record<string, string> };
     expect(sanityManifest.views).toEqual(expect.arrayContaining(["front", "rear", "left-side", "right-side", "top", "perspective"]));
