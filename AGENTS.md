@@ -8,4 +8,6 @@ Run commands through the host-neutral npm/CLI surface. Preserve source-oracle by
 
 Do not stop after a fixed number of attempts. If three equivalent attempts add no evidence and move no metric, route to diagnosis, identify the failing assumption, and choose a different evidence-backed action.
 
+When current work is ready for user inspection, refresh the full capture first (`mesh2threejs review-ready <workspace>`) and report its paths, then offer the interactive viewer. Never start the persistent viewer server without explicit user approval; it is a non-authoritative inspection surface, not review or certification evidence.
+
 Certification is fail-closed and derives results from current artifact files and the live candidate source. It requires registration, deterministic profile, style, complexity, sampled articulation when the selected profile or subject declares controls, genuine external visual review, and turntable evidence, with no blocking unresolved item. A boolean record, deterministic replay, or process boundary is not review evidence.

@@ -18,6 +18,8 @@ Non-negotiable invariants:
 - Preserve macro geometry, orientation, semantics, articulation, and repeated-part counts. Low-poly style may simplify representation, never truth.
 - A visual reviewer cannot edit. Certification requires a fresh external-vision verdict and verified artifact files; process isolation alone is insufficient.
 
+When current work is ready for the user to inspect, refresh the full model capture first (`mesh2threejs review-ready <workspace>`, or `render`) and report its paths; then offer the interactive viewer. Never start the persistent viewer server without explicit user approval. Viewer inspection and user feedback are non-authoritative: they route back into existing reconstruction phases via the normal reopen/repair lifecycle and never satisfy `visual.review`, gates, or certification.
+
 Route with `mesh2threejs route <task>` and load exactly one role skill from `skills/`: `reconstruct`, `onboard-oracle`, `repair-oracle`, `build`, `visual-review`, `diagnose`, or `finalize`.
 
 Select `profiles/tank/` only for explicit or unmistakable tanks/tracked armored vehicles; otherwise use `profiles/generic/`. Load that profile's executable `contract.json` and `styles/low-poly-faithful.json` unless the task names another validated style.

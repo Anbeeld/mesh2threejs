@@ -104,10 +104,13 @@ node dist/cli.js gate workspaces/demo --global
 node dist/cli.js workorders workspaces/demo
 node dist/cli.js lock workspaces/demo
 node dist/cli.js render workspaces/demo
+node dist/cli.js review-ready workspaces/demo
 node dist/cli.js prepare-review workspaces/demo
 node dist/cli.js review-status workspaces/demo
 node dist/cli.js record-review workspaces/demo --verdict path/to/verdict.json
 node dist/cli.js reopen workspaces/demo --phase primary-mass --reason "proportion regression"
+node dist/cli.js viewer start workspaces/demo
+node dist/cli.js viewer stop workspaces/demo
 node dist/cli.js finalize workspaces/demo
 ```
 
@@ -122,6 +125,26 @@ node dist/cli.js migrate path/to/workspace
 ```
 
 Migration keeps the old layout under `.mesh2threejs/legacy`, retains its history, and invalidates prior oracle-bound evidence so the imported reference is checked again.
+
+## Inspect the current model
+
+Refresh the full capture evidence for the live candidate and report its paths:
+
+```sh
+node dist/cli.js review-ready workspaces/demo
+```
+
+This runs the same render implementation as `node dist/cli.js render workspaces/demo` and returns the capture run directory, render manifest, comparison boards, and turntable for the current gated candidate — always a new `render-NNNN` run, never a reuse of stale output. It never starts the viewer.
+
+For interactive inspection of the same audited candidate — real `WebGLRenderer`, orbit/zoom/pan, canonical camera presets, contract-driven articulation sliders (`setPose`), and automatic reload when the candidate source changes:
+
+```sh
+node dist/cli.js viewer start workspaces/demo
+node dist/cli.js viewer status workspaces/demo
+node dist/cli.js viewer stop workspaces/demo
+```
+
+The viewer is an optional persistent localhost tool that survives the launching process. It serves only the viewer app, vendored Three.js modules, and the exact audited candidate source graph; `refs/`, `.mesh2threejs/`, and the oracle are never web-accessible. Viewer use is human inspection convenience only: it is not certification evidence, does not satisfy visual review, and agents must not start it without explicit user approval.
 
 See the [architecture guide](docs/architecture.md) for the engine design. The `examples/` directory contains generic and tank candidate modules.
 

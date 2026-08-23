@@ -16,12 +16,9 @@ import { getProfileContract, profileContractHash } from "./core/contracts.js";
 import { inspectAllUpstreamDrift } from "./core/upstream.js";
 import type { GenericSubjectContract } from "./profiles/generic.js";
 import { awaitingVisualReview, createVisualReviewPacket, verifyVisualReviewPacketFiles, verifyVisualReviewVerdict, type ReviewFileReference, type VisualReviewPacket, type VisualReviewVerdict } from "./core/review.js";
-import { snapshotScene } from "./core/geometry.js";
-import { measureBounds } from "./core/measurement.js";
-import { compareRegionDiagnostics, createComparisonBoard, createTurntable, deriveCanonicalFrame, standardRenderProfile, writeCapturePng } from "./core/render.js";
-import type { CapturePass } from "./types.js";
+import { performRenderRun } from "./core/workspace-render.js";
+import { startViewer, stopViewer, viewerStatus } from "./viewer/manager.js";
 import { selectRepairGroup } from "./core/compare.js";
-import { renderCapture, type RenderBackend } from "./core/three-render.js";
 import { createEvaluationIdentity, EVALUATOR_VERSION, evaluationIdentityHash, MEASUREMENT_VERSION, optionalContractHash } from "./core/identity.js";
 import { loadStyleContract } from "./styles/low-poly.js";
 
@@ -162,6 +159,10 @@ const HELP = `mesh2threejs commands:
   gate --oracle manifest.json --candidate MODULE --profile tank|generic [--out report.json]
   render WORKSPACE
   render --oracle manifest.json --candidate MODULE --out-dir DIR
+  review-ready WORKSPACE [--renderer auto|deterministic-cpu|three-webgl]
+  viewer start WORKSPACE [--port N|auto]
+  viewer status WORKSPACE
+  viewer stop WORKSPACE
   workorders WORKSPACE
   workorders REPORT.json [--phase PHASE]
   replay-gates PACKET.json [--out result.json]
@@ -661,60 +662,91 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const oracle = await loadPreparedOracle(manifest, workspace?.root);
         const candidateIdentity = workspace ? await verifyWorkspaceCandidateIdentity(workspace) : await inspectCandidateIdentity(resolve(required(parsed.options, "candidate")));
         if (workspace && candidateIdentity.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before rendering");
-        const candidateRuntime = candidateIdentity.runtime;
-        const candidate = candidateRuntime.root;
-        const oracleSnapshot = snapshotScene(oracle);
-        const candidateSnapshot = snapshotScene(candidate);
-        const oracleBounds = measureBounds(oracleSnapshot);
-        const frame = deriveCanonicalFrame(oracleBounds, Number(parsed.options.precision ?? 0.01));
-        const profile = standardRenderProfile({ width: frame.width, height: frame.height });
-        profile.camera.orthographicHeight = frame.orthographicHeight;
-        profile.camera.far = Math.max(profile.camera.far, frame.orthographicHeight * 4);
         const renderRun = workspace ? await createRunDirectory(workspace.layout.internal.captures, "render") : undefined;
         const directory = renderRun?.path ?? resolve(required(parsed.options, "out-dir"));
-        await mkdir(directory, { recursive: true });
-        const passes: CapturePass[] = ["beauty", "alpha-silhouette", "semantic-id", "depth", "normal", "roughness-material-id"];
-        const requestedBackend = (parsed.options.renderer ?? "auto") as RenderBackend;
-        if (!["auto", "deterministic-cpu", "three-webgl"].includes(requestedBackend)) throw new Error("--renderer must be auto, deterministic-cpu, or three-webgl");
-        const captures: Array<{ subject: "oracle" | "candidate"; pass: CapturePass; cameraId: string; path: string; sha256: string }> = [];
-        const boards: string[] = [];
-        for (const cameraId of ["side", "front", "plan"] as const) {
-          for (const pass of passes) {
-            const oracleRendered = renderCapture({ root: oracle, snapshot: oracleSnapshot, profile, camera: frame.cameras[cameraId], pass, backend: requestedBackend });
-            const candidateRendered = renderCapture({ root: candidate, snapshot: candidateSnapshot, profile, camera: frame.cameras[cameraId], pass, backend: requestedBackend });
-            const oracleFrame = oracleRendered.frame;
-            const candidateFrame = candidateRendered.frame;
-            const oraclePath = join(directory, `${cameraId}-oracle-${pass}.png`);
-            const candidatePath = join(directory, `${cameraId}-candidate-${pass}.png`);
-            await writeCapturePng(oraclePath, oracleFrame); await writeCapturePng(candidatePath, candidateFrame);
-            captures.push({ subject: "oracle", pass, cameraId, path: storedArtifactPath(oraclePath, workspace?.root), sha256: sha256(await readFile(oraclePath)) }, { subject: "candidate", pass, cameraId, path: storedArtifactPath(candidatePath, workspace?.root), sha256: sha256(await readFile(candidatePath)) });
-            if (pass === "beauty") { const board = join(directory, `${cameraId}-comparison.png`); await createComparisonBoard(board, oracleFrame, candidateFrame); boards.push(board); }
-          }
-        }
-        const span = Math.max(...oracleBounds.size);
-        const turntable = await createTurntable(join(directory, "turntable"), candidateSnapshot, profile, { frames: 24, radius: span * 2.5, elevation: Math.max(span * 0.35, oracleBounds.size[1] * 0.75), target: oracleBounds.center });
-        const regionDiagnosticsPath = join(directory, "region-diagnostics.json");
-        await writeFile(regionDiagnosticsPath, `${json({ schemaVersion: 1, rows: compareRegionDiagnostics(oracleSnapshot, candidateSnapshot, profile, [frame.cameras.side, frame.cameras.front, frame.cameras.plan]) })}\n`, { flag: "wx" });
-        const regionDiagnostics = { path: storedArtifactPath(regionDiagnosticsPath, workspace?.root), sha256: sha256(await readFile(regionDiagnosticsPath)) };
-        const actualBackend = requestedBackend === "three-webgl" ? "three-webgl" : "deterministic-cpu";
-        const renderManifest = { schemaVersion: 1, kind: `${actualBackend}-render-evidence`, backend: actualBackend, oracleHash: fingerprintScene(oracle), candidateHash: candidateIdentity.candidateHash, styleContractHash: workspace?.state.styleContractHash ?? "unbound", evaluationIdentityHash: workspace?.state.evaluationIdentityHash ?? "unbound", frame, profileHash: sha256(canonicalJson(profile)), captures, comparisonBoards: await Promise.all(boards.map(async (path) => ({ path: storedArtifactPath(path, workspace?.root), sha256: sha256(await readFile(path)) }))), turntable: await Promise.all(turntable.map(async (path) => ({ path: storedArtifactPath(path, workspace?.root), sha256: sha256(await readFile(path)) }))), regionDiagnostics };
-        const outputManifestPath = join(directory, "render-manifest.json");
-        await writeFile(outputManifestPath, `${json(renderManifest)}\n`, { flag: "wx" });
-        if (workspace && renderRun) {
-          let state = await loadTaskState(workspace.layout.internal.state);
-          if (state.oracleHash !== renderManifest.oracleHash || state.candidateHash !== renderManifest.candidateHash) throw new Error("render evidence is bound to geometry that has not passed the current gate run");
-          const evidenceDirectory = join(workspace.layout.internal.evidence, renderRun.id);
-          await mkdir(evidenceDirectory);
-          const configHash = sha256(canonicalJson({ frame: frame.frameHash, profile: renderManifest.profileHash, backend: actualBackend }));
-          state = bindEvidenceConfig(state, "turntable", configHash, "render frame or backend changed");
-          const artifact = createRenderEvidenceArtifact({ id: `${renderRun.id}-turntable`, phase: "visual-review", oracleHash: renderManifest.oracleHash, candidateHash: renderManifest.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash, configHash, manifest: renderManifest });
-          const artifactPath = join(evidenceDirectory, "turntable.json");
-          await writeFile(artifactPath, `${json(artifact)}\n`, { flag: "wx" });
-          state = recordEvidenceArtifact(state, storedArtifactPath(artifactPath, workspace.root), artifact);
-          await saveTaskState(workspace.layout.internal.state, state);
-        }
-        io.stdout(json({ status: `rendered-${actualBackend}`, manifest: outputManifestPath, captures: captures.length, turntable: turntable.length }));
+        const result = await performRenderRun({
+          ...(workspace ? { workspace } : {}),
+          manifest,
+          candidateIdentity,
+          candidate: candidateIdentity.runtime.root,
+          oracle,
+          directory,
+          ...(renderRun ? { runId: renderRun.id } : {}),
+          ...(parsed.options.renderer ? { backend: parsed.options.renderer } : {}),
+          ...(parsed.options.precision ? { precision: Number(parsed.options.precision) } : {}),
+        });
+        io.stdout(json({ status: `rendered-${result.backend}`, manifest: result.manifestPath, captures: result.captureCount, turntable: result.turntable.length }));
         return 0;
+      }
+      case "review-ready": {
+        const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
+        if (!workspaceInput) throw new Error("review-ready requires a workspace path");
+        // User-review handoff: prove the live workspace/oracle/candidate identity, then refresh
+        // the full capture set through the same render implementation as `render`. This command
+        // never starts the interactive viewer; it only reports capture paths and viewer status.
+        const workspace = await resumeWorkspace(workspaceInput);
+        const manifest = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
+        const oracle = await loadPreparedOracle(manifest, workspace.root);
+        const candidateIdentity = await verifyWorkspaceCandidateIdentity(workspace);
+        if (candidateIdentity.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before handing off user-review captures");
+        const renderRun = await createRunDirectory(workspace.layout.internal.captures, "render");
+        const result = await performRenderRun({
+          workspace,
+          manifest,
+          candidateIdentity,
+          candidate: candidateIdentity.runtime.root,
+          oracle,
+          directory: renderRun.path,
+          runId: renderRun.id,
+          ...(parsed.options.renderer ? { backend: parsed.options.renderer } : {}),
+        });
+        const viewer = await viewerStatus(workspace.root);
+        io.stdout(json({
+          status: "ready-for-user-review",
+          candidateHash: candidateIdentity.candidateHash,
+          capture: {
+            run: renderRun.id,
+            directory: storedArtifactPath(renderRun.path, workspace.root),
+            manifest: storedArtifactPath(result.manifestPath, workspace.root),
+            boards: result.comparisonBoards.map((board) => board.path),
+            turntable: `${storedArtifactPath(renderRun.path, workspace.root)}/turntable/`,
+          },
+          viewer: viewer.status === "running"
+            ? { status: "running", url: viewer.record.url }
+            : { status: viewer.status, startCommand: "mesh2threejs viewer start <workspace>" },
+        }));
+        return 0;
+      }
+      case "viewer": {
+        const action = parsed.positional[0];
+        const workspaceInput = parsed.positional[1] ?? parsed.options.workspace;
+        if (!action || !workspaceInput) throw new Error("viewer requires an action (start|status|stop) and a workspace path");
+        const root = resolve(workspaceInput);
+        if (action === "start") {
+          const workspace = await resumeWorkspace(root);
+          const portOption = parsed.options.port ? (parsed.options.port === "auto" ? "auto" as const : Number(parsed.options.port)) : undefined;
+          if (portOption !== undefined && portOption !== "auto" && !Number.isInteger(portOption)) throw new Error("--port must be an integer or auto");
+          const result = await startViewer(root, { ...(portOption !== undefined ? { port: portOption } : {}) });
+          io.stdout(json({ status: result.status, workspace: root, url: result.url, host: result.host, port: result.port, pid: result.pid, candidateHash: workspace.state.candidateHash, model: workspace.project.model }));
+          return 0;
+        }
+        if (action === "status") {
+          const result = await viewerStatus(root);
+          io.stdout(json(result.status === "running"
+            ? { status: "running", url: result.record.url, host: result.record.host, port: result.record.port, pid: result.record.pid }
+            : result.status === "stale-record"
+              ? { status: "stale-record", detail: "runtime metadata exists but the server is not answering; the next start recreates it" }
+              : { status: "not-running" }));
+          return 0;
+        }
+        if (action === "stop") {
+          const result = await stopViewer(root);
+          if (result.status === "stopped") io.stdout(json({ status: "stopped" }));
+          else if (result.status === "stale-record-cleared") io.stdout(json({ status: "stale-record-cleared" }));
+          else io.stdout(json({ status: "not-running" }));
+          return 0;
+        }
+        throw new Error(`unknown viewer action: ${action} (expected start, status, or stop)`);
       }
       case "workorders": {
         const inputPath = parsed.positional[0];

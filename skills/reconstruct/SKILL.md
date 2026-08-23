@@ -12,3 +12,5 @@ description: Route, initialize, and resume a live-oracle procedural Three.js rec
 5. Never build from memory or declare completion outside `finalize`.
 
 Do not import the oracle into candidate source. Do not let repair wording authorize candidate edits or review wording authorize mutation.
+
+Treat "show me the current model", "let me inspect it", or "give me progress renders" as user-review handoffs, not reconstruction mutations: refresh the full capture (`review-ready`), report its paths, and then ask before starting the viewer. "Open/start the viewer" is explicit authorization, so `mesh2threejs viewer start <workspace>` may run directly. Map viewer feedback to the owning phase and route it through the normal reopen/repair lifecycle; it never satisfies gates or visual review.

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mesh2threejs workspace viewer</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1e22; color: #d7dce2; font: 13px/1.45 "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  .panel { position: absolute; background: rgba(20, 23, 27, 0.86); border: 1px solid #3a3f46; border-radius: 6px; padding: 10px 12px; }
+  #stats { top: 10px; left: 10px; min-width: 220px; pointer-events: none; }
+  #stats .row { display: flex; justify-content: space-between; gap: 12px; white-space: nowrap; }
+  #stats .key { color: #8a939d; }
+  #stats .value { font-variant-numeric: tabular-nums; }
+  #views { top: 10px; right: 10px; display: flex; flex-direction: column; gap: 6px; }
+  #views button, #pose button { background: #2a2f36; color: #d7dce2; border: 1px solid #454c55; border-radius: 4px; padding: 5px 10px; cursor: pointer; font: inherit; text-align: left; }
+  #views button:hover, #pose button:hover { background: #353c45; }
+  #pose { bottom: 10px; left: 10px; min-width: 260px; display: none; }
+  #pose .control { margin: 6px 0; }
+  #pose label { display: flex; justify-content: space-between; }
+  #pose input[type="range"] { width: 100%; }
+  #banner { position: absolute; bottom: 10px; right: 10px; background: rgba(90, 62, 12, 0.92); border: 1px solid #8a6a20; border-radius: 6px; padding: 8px 12px; display: none; max-width: 40vw; }
+  #overlay { position: fixed; inset: 0; background: rgba(12, 13, 15, 0.9); display: none; align-items: center; justify-content: center; z-index: 10; }
+  #overlay .card { max-width: 70vw; background: #22262b; border: 1px solid #7a3030; border-radius: 8px; padding: 18px 22px; }
+  #overlay h2 { margin: 0 0 8px; font-size: 15px; color: #e8b7b7; }
+  #overlay pre { white-space: pre-wrap; word-break: break-word; color: #c8b0b0; margin: 0; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three/three.module.js",
+    "three/examples/jsm/": "/vendor/three/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="stats" class="panel"></div>
+<div id="views" class="panel"></div>
+<div id="pose" class="panel"></div>
+<div id="banner"></div>
+<div id="overlay"><div class="card"><h2 id="overlay-title">Candidate failed to load</h2><pre id="overlay-detail"></pre></div></div>
+<script type="module" src="/assets/viewer.js"></script>
+</body>
+</html>
