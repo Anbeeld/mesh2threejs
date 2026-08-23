@@ -2,14 +2,15 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { OracleManifest } from "./oracle.js";
 import type { CandidateIdentity } from "./candidate.js";
+import type { ResumedWorkspace } from "./workspace.js";
+import { createWorkspaceResolver } from "./workspace.js";
 import { fingerprintScene, canonicalJson, sha256 } from "./hashing.js";
 import { snapshotScene } from "./geometry.js";
 import { measureBounds } from "./measurement.js";
 import { compareRegionDiagnostics, createComparisonBoard, createTurntable, deriveCanonicalFrame, standardRenderProfile, writeCapturePng } from "./render.js";
 import { renderCapture, type RenderBackend } from "./three-render.js";
 import { bindEvidenceConfig, createRenderEvidenceArtifact, loadTaskState, recordEvidenceArtifact, saveTaskState } from "./state.js";
-import { createWorkspaceResolver, type ResumedWorkspace } from "./workspace.js";
-import type { CapturePass } from "../types.js";
+import type { CaptureCamera, CapturePass } from "../types.js";
 
 export interface RenderManifestCapture {
   subject: "oracle" | "candidate";
@@ -163,4 +164,81 @@ export async function performRenderRun(options: PerformRenderRunOptions): Promis
     regionDiagnostics,
     captureCount: captures.length,
   };
+}
+
+export interface OracleSanityResult {
+  directory: string;
+  manifestPath: string;
+  views: string[];
+  captureCount: number;
+}
+
+/**
+ * First-class oracle-only sanity evidence for tank onboarding: renders the prepared oracle
+ * alone from front/rear/left/right/top/perspective with canonical-frame metadata. This is
+ * builder/onboarding sanity output — never external visual certification — and registration
+ * locking for tank projects requires it to exist.
+ */
+export async function performOracleSanityRun(workspace: ResumedWorkspace, manifest: OracleManifest, oracle: import("three").Object3D, backend: RenderBackend = "deterministic-cpu"): Promise<OracleSanityResult> {
+  const run = await createSanityRunDirectory(workspace.layout.internal.captures);
+  const snapshot = snapshotScene(oracle);
+  const bounds = measureBounds(snapshot);
+  const frame = deriveCanonicalFrame(bounds, 0.01);
+  const profile = standardRenderProfile({ width: frame.width, height: frame.height });
+  profile.camera.orthographicHeight = frame.orthographicHeight;
+  profile.camera.far = Math.max(profile.camera.far, frame.orthographicHeight * 4);
+  await mkdir(run, { recursive: true });
+  const span = Math.max(...bounds.size);
+  const distance = span * 2.5 + 1;
+  const [x, y, z] = bounds.center;
+  const mirror = (camera: CaptureCamera, id: string): CaptureCamera => ({
+    id,
+    projection: "orthographic",
+    position: [2 * camera.target[0] - camera.position[0], camera.position[1] === camera.target[1] ? camera.position[1] : 2 * camera.target[1] - camera.position[1], 2 * camera.target[2] - camera.position[2]] as const,
+    target: camera.target,
+  });
+  const perspective: CaptureCamera = { id: "perspective", projection: "perspective", position: [x - distance * 0.7, y + distance * 0.35, z - distance * 0.7] as const, target: [x, y, z] as const };
+  const views: Array<{ id: string; camera: CaptureCamera }> = [
+    { id: "front", camera: frame.cameras.front },
+    { id: "rear", camera: mirror(frame.cameras.front, "rear") },
+    { id: "left-side", camera: mirror(frame.cameras.side, "left-side") },
+    { id: "right-side", camera: { ...frame.cameras.side, id: "right-side" } },
+    { id: "top", camera: { ...frame.cameras.plan, id: "top" } },
+    { id: "perspective", camera: perspective },
+  ];
+  const captures: Array<{ view: string; path: string; sha256: string }> = [];
+  for (const view of views) {
+    const rendered = renderCapture({ root: oracle, snapshot, profile, camera: view.camera, pass: "beauty", backend });
+    const path = join(run, `oracle-${view.id}.png`);
+    await writeCapturePng(path, rendered.frame);
+    captures.push({ view: view.id, path, sha256: sha256(await readFile(path)) });
+  }
+  const manifestPayload = {
+    schemaVersion: 1,
+    kind: "oracle-sanity-board",
+    oracleHash: fingerprintScene(oracle),
+    preparedOracleHash: manifest.preparedHash,
+    canonicalFrame: { right: "+X", up: "+Y", forward: "+Z", ground: "minY" },
+    axisLabels: { x: "lateral (right +)", y: "vertical (up +)", z: "longitudinal (forward +)" },
+    frame: frame.frameHash,
+    views: views.map((view) => view.id),
+    captures,
+  };
+  const manifestPath = join(run, "oracle-sanity-manifest.json");
+  await writeFile(manifestPath, `${JSON.stringify(manifestPayload, null, 2)}\n`, { flag: "wx" });
+  return { directory: run, manifestPath, views: views.map((view) => view.id), captureCount: captures.length };
+}
+
+async function createSanityRunDirectory(parent: string): Promise<string> {
+  await mkdir(parent, { recursive: true });
+  for (let sequence = 1; sequence < 1_000_000; sequence += 1) {
+    const path = join(parent, `oracle-sanity-${String(sequence).padStart(4, "0")}`);
+    try {
+      await mkdir(path);
+      return path;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  throw new Error(`no available oracle-sanity run directory under ${parent}`);
 }

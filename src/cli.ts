@@ -16,7 +16,7 @@ import { getProfileContract, profileContractHash } from "./core/contracts.js";
 import { inspectAllUpstreamDrift } from "./core/upstream.js";
 import type { GenericSubjectContract } from "./profiles/generic.js";
 import { awaitingVisualReview, createVisualReviewPacket, verifyVisualReviewPacketFiles, verifyVisualReviewVerdict, type ReviewFileReference, type VisualReviewPacket, type VisualReviewVerdict } from "./core/review.js";
-import { performRenderRun } from "./core/workspace-render.js";
+import { performRenderRun, performOracleSanityRun } from "./core/workspace-render.js";
 import { startViewer, stopViewer, viewerStatus } from "./viewer/manager.js";
 import { selectRepairGroup } from "./core/compare.js";
 import { createEvaluationIdentity, EVALUATOR_VERSION, evaluationIdentityHash, MEASUREMENT_VERSION, optionalContractHash } from "./core/identity.js";
@@ -154,6 +154,7 @@ const HELP = `mesh2threejs commands:
   repair-oracle --manifest manifest.json --config repair.json --out repaired-manifest.json
   register WORKSPACE --config expectation.json
   register --manifest manifest.json --config expectation.json [--out evidence.json]
+  oracle-sanity WORKSPACE
   audit-candidate MODULE
   gate WORKSPACE [--global]
   gate --oracle manifest.json --candidate MODULE --profile tank|generic [--out report.json]
@@ -291,6 +292,11 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const current = await loadTaskState(statePath);
         const phase = parsed.options.phase ?? (target.workspaceRoot ? current.activePhase : undefined);
         if (!phase) throw new Error("lock state-file mode requires --phase");
+        if (target.workspaceRoot && phase === "oracle-registration" && current.profile === "tank") {
+          // Registration locking for tank projects requires first-class oracle sanity captures:
+          // a human-inspectable frame board produced from real pipeline output.
+          await latestRunFile(createWorkspaceResolver(target.workspaceRoot).layout.internal.captures, "oracle-sanity", "oracle-sanity-manifest.json");
+        }
         const geometryHash = parsed.options["geometry-hash"] ?? (target.workspaceRoot ? (phase === "oracle-registration" ? current.oracleHash : current.phaseGeometryHashes[phase]) : undefined);
         if (!geometryHash) throw new Error(`no measured geometry is available for phase ${phase}; run registration/gate first or provide --geometry-hash`);
         const evidenceIds = parsed.options.evidence?.split(",").filter(Boolean) ?? (target.workspaceRoot ? Object.values(current.evidence).filter((item) => item.phase === phase && item.valid && item.verified && item.passed && isAuthoritativeEvidence(item)).map((item) => item.id) : []);
@@ -535,6 +541,22 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         io.stdout(rendered.trimEnd());
         return evidence.passed ? 0 : 4;
       }
+      case "oracle-sanity": {
+        const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
+        if (!workspaceInput) throw new Error("oracle-sanity requires a workspace path");
+        const workspace = await resumeWorkspace(workspaceInput);
+        const manifest = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
+        const oracle = await loadPreparedOracle(manifest, workspace.root);
+        const result = await performOracleSanityRun(workspace, manifest, oracle);
+        io.stdout(json({
+          status: "oracle-sanity-captured",
+          directory: storedArtifactPath(result.directory, workspace.root),
+          manifest: storedArtifactPath(result.manifestPath, workspace.root),
+          views: result.views,
+          note: "builder/onboarding sanity evidence; not external visual certification",
+        }));
+        return 0;
+      }
       case "audit-candidate": {
         const path = parsed.positional[0];
         if (!path) throw new Error("audit-candidate requires a module path");
@@ -561,7 +583,14 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const subjectContractPath = workspace?.resolved.subjectContract ?? (parsed.options["subject-contract"] ? resolve(parsed.options["subject-contract"]) : undefined);
         const subjectContract = subjectContractPath ? JSON.parse(await readFile(subjectContractPath, "utf8")) as GenericSubjectContract : undefined;
         const candidatePath = workspace?.resolved.model ?? resolve(required(parsed.options, "candidate"));
-        const candidateIdentity = await inspectCandidateIdentity(candidatePath, neutralPoseForProfile(profile, subjectContract));
+        const isGlobal = parsed.flags.has("global");
+        const activePhase = workspace?.state.activePhase;
+        const profileContract = getProfileContract(profile);
+        // Phase isolation at identity time: a partial candidate without physical controls is
+        // inspected without applying articulation controls unless this gate actually evaluates
+        // the phase that owns them.
+        const needsNeutralPose = !activePhase || isGlobal || profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === activePhase);
+        const candidateIdentity = await inspectCandidateIdentity(candidatePath, needsNeutralPose ? neutralPoseForProfile(profile, subjectContract) : {});
         const candidateFiles = candidateIdentity.candidateFiles;
         const certification = workspace?.state.certification ?? (manifest.authoritativeDimensions ? "exact-real" : "oracle-relative");
         const selectedStyle = workspace ? { contract: workspace.styleContract, hash: workspace.styleContractHash } : await loadStyleContract(parsed.options.style ?? "low-poly-faithful");
@@ -580,7 +609,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           candidateNeutralHash: candidateIdentity.neutralSceneHash,
         });
         const currentEvaluationHash = evaluationIdentityHash(evaluationIdentity);
-        const cachePath = workspace ? join(workspace.layout.internal.reports, "gate-cache.json") : undefined;
+        const cachePath = workspace && isGlobal ? join(workspace.layout.internal.reports, "gate-cache.json") : undefined;
         let evaluation: PosedEvaluationBundle | undefined;
         if (cachePath) {
           try {
@@ -601,6 +630,9 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
             certification,
             ...(subjectContract ? { subjectContract } : {}),
             ...(manifest.authoritativeDimensions ? { authoritativeDimensions: manifest.authoritativeDimensions } : {}),
+            // Normal workspace gates execute ONLY the active phase and its already-locked
+            // prerequisites; --global remains the explicit whole-object evaluation.
+            ...(workspace && !isGlobal && activePhase ? { phase: activePhase } : {}),
           });
           if (cachePath) {
             const temporary = `${cachePath}.${process.pid}.tmp`;
@@ -624,13 +656,17 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           const run = workspaceGateRun ?? await createRunDirectory(parentDirectory, "gate");
           const directory = run.path;
           const configHash = currentEvaluationHash;
-          for (const kind of ["deterministic-gate", "style", "complexity", ...(evaluation.articulation.rows.length ? ["articulation" as const] : [])] as const) state = bindEvidenceConfig(state, kind, configHash, "canonical evaluation identity changed");
+          const recordsStyle = !activePhase || isGlobal || activePhase === (profile === "tank" ? "style-fabrication" : "style-complexity");
+          for (const kind of ["deterministic-gate", ...(recordsStyle ? ["style", "complexity"] as const : []), ...(evaluation.articulation.rows.length ? ["articulation" as const] : [])] as const) state = bindEvidenceConfig(state, kind, configHash, "canonical evaluation identity changed");
+          // Only phase-relevant new evidence is recorded; locked prerequisite evidence is reused.
           const complexityRows = evaluation.style.rows.filter((row) => row.code.startsWith("style.complexity"));
           const complexityReport = { profile, passed: complexityRows.every((row) => row.passed), score: complexityRows.length ? Math.min(...complexityRows.map((row) => row.score)) : 0, rows: complexityRows, workorders: evaluation.style.workorders.filter((item) => item.errorKind.startsWith("style.complexity")) };
           const artifacts = [
             ...Object.entries(evaluation.phaseGates).map(([phase, report]) => createRuntimeGateEvidenceArtifact({ id: `${run.id}-${phase}`, phase, oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report })),
-            createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-style`, kind: "style", phase: profile === "tank" ? "style-fabrication" : "style-complexity", oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report: evaluation.style }),
-            createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-complexity`, kind: "complexity", phase: profile === "tank" ? "style-fabrication" : "style-complexity", oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report: complexityReport }),
+            ...(recordsStyle ? [
+              createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-style`, kind: "style", phase: profile === "tank" ? "style-fabrication" : "style-complexity", oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report: evaluation.style }),
+              createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-complexity`, kind: "complexity", phase: profile === "tank" ? "style-fabrication" : "style-complexity", oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report: complexityReport }),
+            ] : []),
             ...(evaluation.articulation.rows.length ? [createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-articulation`, kind: "articulation", phase: evaluation.articulation.rows[0]!.phase ?? (profile === "tank" ? "fittings-articulation" : "attachments"), oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report: evaluation.articulation })] : []),
           ];
           for (const artifact of artifacts) {
@@ -642,12 +678,26 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         }
         if (workspace) {
           const outcome = workspaceGateOutcome(evaluation, workspace.state.activePhase);
-          const isGlobal = parsed.flags.has("global");
           if (!isGlobal) {
             const active = workspace.state.activePhase;
             const activeReport = evaluation.phaseGates[active];
-            const filtered = activeReport ? { ...evaluation, deterministic: { ...activeReport, profile: evaluation.deterministic.profile, workorders: activeReport.workorders }, phaseGates: { [active]: activeReport } } : evaluation;
-            io.stdout(json({ ...filtered, ...outcome, activePhase: active, note: "active-phase only; use --global for whole-object diagnostics" }));
+            // Truly phase-local output: no future-phase scores, diagnostics, or global
+            // style/articulation contents leak into the normal gate stream.
+            const filtered = activeReport
+              ? {
+                  profile: evaluation.deterministic.profile,
+                  activePhase: active,
+                  passed: outcome.activePhasePassed,
+                  score: activeReport.score,
+                  deterministic: activeReport,
+                  workorders: activeReport.workorders,
+                  oracleHash: evaluation.oracleHash,
+                  candidateHash: evaluation.candidateHash,
+                  phaseGeometryHashes: evaluation.phaseGeometryHashes[active] ? { [active]: evaluation.phaseGeometryHashes[active] } : {},
+                  note: "active-phase only; use --global for whole-object diagnostics",
+                }
+              : evaluation;
+            io.stdout(json(filtered));
           } else {
             io.stdout(json({ ...evaluation, ...outcome }));
           }

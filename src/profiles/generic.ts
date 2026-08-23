@@ -24,6 +24,8 @@ export interface GenericSubjectContract {
 export interface GenericProfileOptions {
   certification?: "exact-real" | "oracle-relative";
   authoritativeDimensions?: { width: number; height: number; depth: number };
+  /** When present, only rows tagged with these phases are emitted. */
+  phases?: ReadonlySet<string>;
 }
 
 function semanticPatternMatches(value: string, pattern: string): boolean {
@@ -255,12 +257,13 @@ export function evaluateGenericProfile(oracle: SceneSnapshot, candidate: SceneSn
     return { code: `repeat.${item.role}`, component: item.role, passed, score: passed ? 100 : 0, severity: "critical", message: `${item.role} repeat count/order ${actual.length}/${expected.length}` };
   });
   const rows = [...dimensions, orientation, ...silhouetteRows(oracle, candidate), ...semanticRows(oracle, candidate), ...attachments, ...criticalRows(oracle, candidate), ...declaredSemantics, ...declaredCritical, ...sectionRows, ...landmarkRows, ...connectivityRows, ...repeatRows];
+  const scopedRows = options.phases ? rows.filter((row) => !row.phase || options.phases!.has(row.phase)) : rows;
   return {
     profile: "generic",
-    passed: rows.every((row) => row.passed),
-    score: Math.min(...rows.map((row) => row.score)),
-    rows,
-    workorders: rowsToWorkorders(rows),
+    passed: scopedRows.every((row) => row.passed),
+    score: Math.min(...scopedRows.map((row) => row.score)),
+    rows: scopedRows,
+    workorders: rowsToWorkorders(scopedRows),
   };
 }
 

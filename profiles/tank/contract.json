@@ -7,6 +7,7 @@
     "critical": ["hull", "turret", "gun", "turret-pivot", "gun-pivot"]
   },
   "operators": ["adaptive-orthographic-curves", "articulation-poses", "bounds-robust", "connectivity", "critical-semantics", "fabrication", "landmarks", "physical-orientation", "repeated-instances", "sections", "track-course", "style-contract", "complexity-budget"],
+  "roles": ["road-wheel", "sprocket", "idler", "return-roller", "track-course"],
   "phases": [
     {"id":"oracle-registration","dependsOn":[],"owner":"oracle","requiredGates":["registration.complete"]},
     {"id":"hull","dependsOn":["oracle-registration"],"owner":"builder","requiredGates":["curves.hull","hull.sections","hull.planes","hull.contiguity","dimensions.hull-length","orientation.physical"]},

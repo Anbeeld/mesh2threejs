@@ -48,6 +48,13 @@ function semanticOwner(object: THREE.Object3D): { id: string; parent?: string; r
       id = current.userData.semanticId;
       if (typeof current.userData.semanticRole === "string") role = current.userData.semanticRole;
       critical = current.userData.critical === true;
+      // Semantic ownership resolution order: the semantic object's own explicit logical owner
+      // (prepared overlay) wins, then the actual semantic ancestor in the authored hierarchy.
+      // A flat source hierarchy with a prepared ownership overlay therefore measures as
+      // logically nested without physically reparenting any mesh.
+      if (typeof current.userData.logicalOwner === "string" && current.userData.logicalOwner !== id) {
+        return { id, parent: current.userData.logicalOwner, ...(role ? { role } : {}), critical };
+      }
       let parent = current.parent;
       while (parent) {
         if (typeof parent.userData.semanticId === "string") {
@@ -233,7 +240,8 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
     const box = new THREE.Box3().setFromObject(object);
     const min: Point3 = [box.min.x, box.min.y, box.min.z];
     const max: Point3 = [box.max.x, box.max.y, box.max.z];
-    const parent = object.parent && typeof object.parent.userData.semanticId === "string" ? object.parent.userData.semanticId : undefined;
+    const logicalOwner = typeof object.userData.logicalOwner === "string" && object.userData.logicalOwner !== id ? object.userData.logicalOwner : undefined;
+    const parent = logicalOwner ?? (object.parent && typeof object.parent.userData.semanticId === "string" ? object.parent.userData.semanticId : undefined);
     components[id] = {
       id,
       name: object.name || id,

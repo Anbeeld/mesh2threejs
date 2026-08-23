@@ -61,7 +61,7 @@ async function buildReviewReadyWorkspace(): Promise<string> {
   expect(await runCli(["lock", root], sink)).toBe(0);
   const model = join(root, "model", "model.mjs");
   await writeFile(model, candidateSource("void 0;"));
-  expect(await runCli(["gate", root], sink)).toBe(0);
+  expect(await runCli(["gate", root, "--global"], sink)).toBe(0);
   expect(await runCli(["render", root], sink)).toBe(0);
   expect(await runCli(["prepare-review", root], sink)).toBe(0);
   return root;

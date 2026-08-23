@@ -22,8 +22,7 @@ interface RuntimeGateBinding {
   excludePrefixes?: string[];
 }
 
-const RUNTIME_GATE_BINDINGS: Record<string, RuntimeGateBinding> = {
-  "registration.complete": { operator: "critical-semantics", source: "workflow" },
+export const RUNTIME_GATE_BINDINGS: Record<string, RuntimeGateBinding> = {  "registration.complete": { operator: "critical-semantics", source: "workflow" },
   "registration.frame": { operator: "physical-orientation", source: "deterministic", exact: ["registration.frame"] },
   "registration.ownership": { operator: "connectivity", source: "deterministic", exact: ["registration.ownership"] },
   "curves.hull": { operator: "adaptive-orthographic-curves", source: "deterministic", exact: ["curves.hull"] },
@@ -80,6 +79,8 @@ export interface ProfileContract {
   id: ProfileId;
   semantics: { required: string[]; optional: string[]; critical: string[] };
   operators: ExecutableOperator[];
+  /** Structured semantic-role vocabulary used as executable authority for repeated parts. */
+  roles?: string[];
   phases: ProfilePhaseContract[];
   gates: ProfileGateContract[];
   dimensions: string[];

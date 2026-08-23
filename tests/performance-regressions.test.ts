@@ -20,7 +20,7 @@ describe("operator performance instrumentation", () => {
     const report = performance.report();
     const names = report.operators.map((row) => row.operator);
     expect(report).toMatchObject({ schemaVersion: 1, peakObservedRssBytes: expect.any(Number) });
-    expect(names).toEqual(expect.arrayContaining(["oracle-snapshot-construction", "candidate-snapshot-construction", "whole-hull-turret-silhouette", "fourteen-hull-stations", "running-gear-matching", "track-diagnostics", "watertightness-connected-islands", "neutral-style-evaluation"]));
+    expect(names).toEqual(expect.arrayContaining(["oracle-snapshot-construction", "candidate-snapshot-construction", "silhouette-curves", "fourteen-hull-stations", "running-gear-matching", "track-diagnostics", "watertightness-connected-islands", "neutral-style-evaluation"]));
     expect(names.filter((name) => name.startsWith("articulation."))).toHaveLength(6);
     expect(report.operators.every((row) => row.elapsedMs >= 0 && row.peakObservedRssBytes > 0)).toBe(true);
   });

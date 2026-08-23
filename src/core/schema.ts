@@ -130,6 +130,17 @@ export const oracleManifestSchema = {
     authoritativeDimensions: { anyOf: [{ type: "null" }, { type: "object", additionalProperties: { type: "number", exclusiveMinimum: 0 } }] },
     dimensionSources: { type: "array", items: { type: "string" } },
     repairHistory: { type: "array", items: { type: "object" } },
+    sourceFrame: {
+      type: "object",
+      required: ["right", "up", "forward"],
+      properties: {
+        right: { enum: ["+x", "-x", "+y", "-y", "+z", "-z"] },
+        up: { enum: ["+x", "-x", "+y", "-y", "+z", "-z"] },
+        forward: { enum: ["+x", "-x", "+y", "-y", "+z", "-z"] },
+      },
+      additionalProperties: false,
+    },
+    logicalOwnership: { type: "object", additionalProperties: { type: "string", minLength: 1 } },
   },
   allOf: [
     { if: { properties: { referenceMode: { const: "copy" } }, required: ["referenceMode"] }, then: { properties: { portable: { const: true } } } },

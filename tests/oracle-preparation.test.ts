@@ -123,7 +123,7 @@ describe("live oracle preparation identity", () => {
     const fixture = await prepareWorkspace();
     await onboardAndRegister(fixture);
     await writeFile(join(fixture.root, "model", "model.mjs"), candidateSource);
-    expect(await runCli(["gate", fixture.root], sink().io)).toBe(0);
+    expect(await runCli(["gate", fixture.root, "--global"], sink().io)).toBe(0);
     const oldIdentity = (await loadTaskState(join(fixture.root, ".mesh2threejs", "state.json"))).oraclePreparation!.identity;
 
     const projectPath = join(fixture.root, "project.json");
@@ -195,7 +195,7 @@ describe("live oracle preparation identity", () => {
     const fixture = await prepareWorkspace();
     await onboardAndRegister(fixture);
     await writeFile(join(fixture.root, "model", "model.mjs"), candidateSource);
-    expect(await runCli(["gate", fixture.root], sink().io)).toBe(0);
+    expect(await runCli(["gate", fixture.root, "--global"], sink().io)).toBe(0);
 
     const preparedPath = join(fixture.root, ".mesh2threejs", "oracle", "prepared.json");
     const tampered = JSON.parse(await readFile(preparedPath, "utf8"));
@@ -214,7 +214,7 @@ describe("live oracle preparation identity", () => {
     const fixture = await prepareWorkspace();
     await onboardAndRegister(fixture);
     await writeFile(join(fixture.root, "model", "model.mjs"), candidateSource);
-    expect(await runCli(["gate", fixture.root], sink().io)).toBe(0);
+    expect(await runCli(["gate", fixture.root, "--global"], sink().io)).toBe(0);
     expect(await runCli(["render", fixture.root], sink().io)).toBe(0);
     expect(await runCli(["prepare-review", fixture.root], sink().io)).toBe(0);
     const beforeRepair = await loadTaskState(join(fixture.root, ".mesh2threejs", "state.json"));
@@ -251,7 +251,7 @@ describe("live oracle preparation identity", () => {
     await writeFile(registration, JSON.stringify(registrationExpectation));
     expect(await runCli(["register", fixture.root, "--config", registration], sink().io)).toBe(0);
     expect(await runCli(["lock", fixture.root], sink().io)).toBe(0);
-    expect(await runCli(["gate", fixture.root], sink().io)).toBe(0);
+    expect(await runCli(["gate", fixture.root, "--global"], sink().io)).toBe(0);
   }, 60_000);
 
   test("bindOraclePreparation invalidates the complete downstream chain exactly once", async () => {

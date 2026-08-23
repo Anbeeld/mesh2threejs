@@ -162,6 +162,100 @@ function accessorBounds(parsed: ParsedGlb, accessorIndex: number): { min: Point3
 
 export type SemanticReadiness = "reliable" | "partial" | "insufficient" | "manual-map-required";
 
+/** A signed canonical axis label: one of the six axis directions. */
+export type SignedAxis = "+x" | "-x" | "+y" | "-y" | "+z" | "-z";
+const SIGNED_AXES: readonly SignedAxis[] = ["+x", "-x", "+y", "-y", "+z", "-z"];
+/**
+ * Explicit physical frame declaration for source geometry. The declared axes are the source
+ * geometry's own axes expressed in the source coordinate system; preparation converts them into
+ * the canonical tank frame (canonical +X = right, +Y = up, +Z = forward).
+ */
+export interface PhysicalFrame {
+  right: SignedAxis;
+  up: SignedAxis;
+  forward: SignedAxis;
+}
+
+/**
+ * Validates a declared physical frame and derives the rigid source-to-canonical transform.
+ * Each field names the signed SOURCE axis that plays that canonical role (e.g.
+ * forward: "+x" means vehicle forward points along source +X and must map to canonical +Z).
+ * Fails closed on non-axis labels, repeated unsigned axes, contradictory mappings, and
+ * reflection-requiring (left-handed relative to canonical) declarations: a reflected frame is
+ * rejected rather than silently mirrored, keeping face winding and normals trustworthy.
+ */
+export function sourceFrameTransform(frame: unknown): { matrix: THREE.Matrix4; validated: PhysicalFrame } {
+  const raw = asObject(frame ?? null, "sourceFrame");
+  const read = (key: string): SignedAxis => {
+    const value = raw[key];
+    if (typeof value !== "string" || !SIGNED_AXES.includes(value as SignedAxis)) {
+      throw new Error(`sourceFrame.${key} must be one of ${SIGNED_AXES.join(", ")}`);
+    }
+    return value as SignedAxis;
+  };
+  const validated: PhysicalFrame = { right: read("right"), up: read("up"), forward: read("forward") };
+  const unsigned = new Set([validated.right, validated.up, validated.forward].map((axis) => axis[1]!.toLowerCase()));
+  if (unsigned.size !== 3) throw new Error(`sourceFrame axes must use three distinct unsigned axes; got ${[validated.right, validated.up, validated.forward].join(", ")}`);
+  // Column i is the canonical image of source basis vector e_i, assigned by role:
+  // right role -> canonical +X, up role -> canonical +Y, forward role -> canonical +Z.
+  const columns: Array<[number, number, number]> = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  const assign = (axis: SignedAxis, canonical: [number, number, number]): void => {
+    const index = { x: 0, y: 1, z: 2 }[axis[1]!.toLowerCase() as "x" | "y" | "z"]!;
+    const sign = axis[0] === "+" ? 1 : -1;
+    columns[index] = [canonical[0]! * sign, canonical[1]! * sign, canonical[2]! * sign];
+  };
+  assign(validated.right, [1, 0, 0]);
+  assign(validated.up, [0, 1, 0]);
+  assign(validated.forward, [0, 0, 1]);
+  const matrix = new THREE.Matrix4().set(
+    columns[0]![0], columns[1]![0], columns[2]![0], 0,
+    columns[0]![1], columns[1]![1], columns[2]![1], 0,
+    columns[0]![2], columns[1]![2], columns[2]![2], 0,
+    0, 0, 0, 1,
+  );
+  if (matrix.determinant() < 0) {
+    throw new Error(`sourceFrame ${JSON.stringify(validated)} requires a reflection relative to the canonical frame; declare a proper-rotation frame (handedness policy rejects mirrored geometry)`);
+  }
+  return { matrix, validated };
+}
+
+function parseFrameRecord(value: unknown): PhysicalFrame | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  return sourceFrameTransform(value).validated;
+}
+
+/**
+ * General logical-ownership graph validator. Rejects self ownership, cycles, references that do
+ * not resolve to known semantics or declared pivots or the root, forbidden ownership edges
+ * (major masses owned by turret/gun fittings), and gun ownership inconsistent with its pivot.
+ */
+export function validateLogicalOwnership(ownership: Record<string, string>, semanticMap: Record<string, string>, articulationMap: Record<string, string>): void {
+  const knownSemantics = new Set([...Object.keys(semanticMap), ...Object.values(semanticMap)]);
+  const declaredPivots = new Set(Object.values(articulationMap));
+  const resolvable = (target: string): boolean => knownSemantics.has(target) || declaredPivots.has(target) || target === "root";
+  const forbiddenOwners = (child: string): readonly string[] => {
+    if (/^hull/u.test(child)) return ["turret", "turret-pivot", "gun", "gun-pivot", "cupola"];
+    if (/^track|^track-/u.test(child)) return ["turret", "turret-pivot", "gun", "gun-pivot", "cupola"];
+    return [];
+  };
+  for (const [child, parent] of Object.entries(ownership)) {
+    if (child === parent) throw new Error(`ownership cycle: ${child} owns itself`);
+    if (!resolvable(parent)) throw new Error(`ownership target does not resolve to semantics or a pivot: ${child} -> ${parent}`);
+    const forbidden = forbiddenOwners(child);
+    if (forbidden.includes(parent)) throw new Error(`${child} cannot be owned by ${parent}`);
+    if (child === "gun" && parent !== "gun-pivot" && articulationMap.gun === "gun-pivot") throw new Error("gun must remain under gun-pivot when the articulation map declares that pivot");
+  }
+  for (const start of Object.keys(ownership)) {
+    const chain = new Set<string>();
+    let current: string | undefined = start;
+    while (current && ownership[current]) {
+      if (chain.has(current)) throw new Error(`ownership cycle includes ${current}`);
+      chain.add(current);
+      current = ownership[current];
+    }
+  }
+}
+
 export interface GlbProbe {
   schemaVersion: 1;
   kind: "glb-oracle-probe";
@@ -377,7 +471,7 @@ export interface OracleManifest {
   semanticMap: Record<string, string>;
   articulationMap: Record<string, string>;
   normalization: { translation: Point3; rotationEuler: Point3; scale: number };
-  sourceFrame?: { up: string; forward: string; right: string };
+  sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
   authoritativeDimensions: Record<string, number> | null;
   dimensionSources: string[];
@@ -389,7 +483,7 @@ export interface OnboardOracleInput extends Omit<OracleManifest, "schemaVersion"
   workspaceRoot?: string;
   sourceOriginalPath?: string;
   referenceMode?: "copy" | "external";
-  sourceFrame?: { up: string; forward: string; right: string };
+  sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
 }
 
@@ -401,7 +495,7 @@ interface PreparedRecipe {
   semanticMap: Record<string, string>;
   articulationMap: Record<string, string>;
   normalization: { translation: Point3; rotationEuler: Point3; scale: number };
-  sourceFrame?: { up: string; forward: string; right: string };
+  sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
   repair?: { parentPreparedHash: string; reason: string };
   preparedHash?: string;
@@ -435,22 +529,12 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
   const sourcePath = storedPath(input.sourcePath, input.workspaceRoot);
   const preparedPath = storedPath(input.preparedPath, input.workspaceRoot);
   const bytes = await readFile(sourceFile);
-  const probe = probeGlb(bytes);
+   const probe = probeGlb(bytes);
   const sourceHash = sha256(bytes);
+  // A declared source frame must be executable: validate it before any authority is written.
+  if (input.sourceFrame) sourceFrameTransform(input.sourceFrame);
   if (input.logicalOwnership) {
-    for (const [child, parent] of Object.entries(input.logicalOwnership)) {
-      if (child === parent) throw new Error(`ownership cycle: ${child} owns itself`);
-      if (child === "hull" && parent === "turret-pivot") throw new Error("hull cannot be owned by turret-pivot");
-      if (child.startsWith("track-") && parent === "gun-pivot") throw new Error("track cannot be owned by gun-pivot");
-    }
-    const seen = new Set<string>();
-    for (const parent of Object.values(input.logicalOwnership)) {
-      if (seen.has(parent) && input.logicalOwnership[parent]) { /* allow */ }
-      const chain = new Set<string>();
-      let cur: string | undefined = parent;
-      while (cur && input.logicalOwnership[cur]) { if (chain.has(cur)) throw new Error(`ownership cycle includes ${cur}`); chain.add(cur); cur = input.logicalOwnership[cur]; }
-    }
-    for (const p of Object.values(input.logicalOwnership)) if (!input.semanticMap[p] && !Object.values(input.semanticMap).includes(p) && p !== "root" && p !== "turret-pivot" && p !== "gun-pivot") throw new Error(`missing pivot ${p}`);
+    validateLogicalOwnership(input.logicalOwnership, input.semanticMap, input.articulationMap);
   }
   const baseRecipe: PreparedRecipe = {
     schemaVersion: 1,
@@ -531,9 +615,25 @@ export async function verifyOraclePreparation(manifest: OracleManifest, workspac
   return oraclePreparationBinding(manifest);
 }
 
+/** Structured role vocabulary used as executable authority by registration and evaluation. */
+export const TANK_ROLE_VOCABULARY = ["road-wheel", "sprocket", "idler", "return-roller", "track-course"] as const;
+
+/**
+ * Resolves the executable role of a semantic id: the declared semanticRole wins, otherwise the
+ * structured role vocabulary applies. Naming is only a fallback for the prepared overlay; both
+ * registration and evaluation read roles through this one function.
+ */
+export function resolveSemanticRole(semanticId: string | undefined, declared?: unknown): string | undefined {
+  if (typeof declared === "string" && declared.trim()) return declared;
+  if (!semanticId) return undefined;
+  return TANK_ROLE_VOCABULARY.find((role) => semanticId === role || semanticId.startsWith(`${role}-`) || semanticId.startsWith(`${role}_`) || semanticId.startsWith(`${role} `));
+}
+
 export async function loadPreparedOracle(manifest: OracleManifest, workspaceRoot?: string): Promise<THREE.Group> {
   const recipe = await readVerifiedRecipe(manifest, workspaceRoot);
   const sourceBytes = await readVerifiedSourceBytes(manifest, workspaceRoot);
+  // Validate again at load time: a stored recipe can never smuggle an unexecutable frame.
+  const frameTransform = recipe.sourceFrame ? sourceFrameTransform(recipe.sourceFrame) : undefined;
   const source = loadGlbScene(sourceBytes);
   const nameCounts = new Map<string, number>();
   source.traverse((object) => nameCounts.set(object.name, (nameCounts.get(object.name) ?? 0) + 1));
@@ -541,16 +641,30 @@ export async function loadPreparedOracle(manifest: OracleManifest, workspaceRoot
     const stableId = typeof object.userData.oracleNodeId === "string" ? object.userData.oracleNodeId : undefined;
     if ((nameCounts.get(object.name) ?? 0) > 1 && recipe.semanticMap[object.name]) throw new Error(`ambiguous semantic map key ${object.name}; use stable node:N identity`);
     const semantic = (stableId ? recipe.semanticMap[stableId] : undefined) ?? recipe.semanticMap[object.name];
-    if (semantic) object.userData.semanticId = semantic;
+    if (semantic) {
+      object.userData.semanticId = semantic;
+      const role = resolveSemanticRole(semantic, object.userData.semanticRole);
+      if (role) object.userData.semanticRole = role;
+    }
     const articulationPivot = recipe.articulationMap[object.name] ?? (semantic ? recipe.articulationMap[semantic] : undefined);
     if (articulationPivot) object.userData.articulationPivot = articulationPivot;
     if (semantic && recipe.logicalOwnership?.[semantic]) object.userData.logicalOwner = recipe.logicalOwnership[semantic];
   });
+  // The declared source frame becomes geometry here: it is applied before user normalization so
+  // canonical-frame claims in the manifest are mechanically enforced on every load.
+  let normalizedSource: THREE.Object3D = source;
+  if (frameTransform) {
+    const frameGroup = new THREE.Group();
+    frameGroup.name = "prepared-oracle-source-frame";
+    frameGroup.setRotationFromMatrix(frameTransform.matrix);
+    frameGroup.add(source);
+    normalizedSource = frameGroup;
+  }
   const frame = new THREE.Group();
   frame.name = "prepared-oracle-normalization-frame";
   frame.position.set(...recipe.normalization.translation);
   frame.rotation.set(...recipe.normalization.rotationEuler);
-  frame.add(source);
+  frame.add(normalizedSource);
   const root = new THREE.Group();
   root.name = manifest.id;
   root.scale.setScalar(recipe.normalization.scale);
@@ -567,10 +681,14 @@ export interface RepairPreparedOracleInput {
   semanticMap?: Record<string, string>;
   articulationMap?: Record<string, string>;
   normalization?: { translation: Point3; rotationEuler: Point3; scale: number };
+  sourceFrame?: PhysicalFrame;
+  logicalOwnership?: Record<string, string>;
 }
 
 export async function repairPreparedOracle(manifest: OracleManifest, input: RepairPreparedOracleInput, workspaceRoot?: string): Promise<OracleManifest> {
   if (!input.reason.trim()) throw new Error("oracle repair requires a reason");
+  if (input.sourceFrame) sourceFrameTransform(input.sourceFrame);
+  if (input.logicalOwnership) validateLogicalOwnership(input.logicalOwnership, input.semanticMap ?? manifest.semanticMap, input.articulationMap ?? manifest.articulationMap);
   await verifyOraclePreparation(manifest, workspaceRoot);
   const preparedFile = workspaceFile(input.preparedPath, workspaceRoot, "preparedPath");
   const preparedPath = storedPath(input.preparedPath, workspaceRoot);
@@ -582,6 +700,10 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     semanticMap: input.semanticMap ?? manifest.semanticMap,
     articulationMap: input.articulationMap ?? manifest.articulationMap,
     normalization: input.normalization ?? manifest.normalization,
+    // Frame and ownership authority survive repair unless the caller explicitly changes them:
+    // a repaired recipe must never claim different authoritative frame/ownership state silently.
+    ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : manifest.sourceFrame ? { sourceFrame: manifest.sourceFrame } : {}),
+    ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : manifest.logicalOwnership ? { logicalOwnership: manifest.logicalOwnership } : {}),
     repair: { parentPreparedHash: manifest.preparedHash, reason: input.reason.trim() },
   };
   const preparedHash = sha256(canonicalJson(baseRecipe));
@@ -594,6 +716,8 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     semanticMap: baseRecipe.semanticMap,
     articulationMap: baseRecipe.articulationMap,
     normalization: baseRecipe.normalization,
+    ...(baseRecipe.sourceFrame ? { sourceFrame: baseRecipe.sourceFrame } : {}),
+    ...(baseRecipe.logicalOwnership ? { logicalOwnership: baseRecipe.logicalOwnership } : {}),
     repairHistory: [...manifest.repairHistory, { reason: input.reason.trim(), recipeHash: preparedHash }],
   };
 }
@@ -615,18 +739,81 @@ export interface RegistrationEvidence {
   rows: Array<{ code: string; passed: boolean; expected: string | number; actual: string | number }>;
 }
 
+interface RegisteredComponent {
+  semanticId: string;
+  role?: string;
+  box: THREE.Box3;
+  object: THREE.Object3D;
+}
+
+function collectRegisteredComponents(root: THREE.Object3D): { components: RegisteredComponent[]; pivots: Map<string, THREE.Vector3> } {
+  const bySemantic = new Map<string, THREE.Object3D[]>();
+  const pivots = new Map<string, THREE.Vector3>();
+  root.updateMatrixWorld(true);
+  root.traverse((object) => {
+    const pivot = typeof object.userData.articulationPivot === "string" ? object.userData.articulationPivot : undefined;
+    if (pivot && !pivots.has(pivot)) {
+      const position = new THREE.Vector3();
+      object.getWorldPosition(position);
+      pivots.set(pivot, position);
+    }
+    const semanticId = typeof object.userData.semanticId === "string" ? object.userData.semanticId : undefined;
+    if (!semanticId) return;
+    // Only geometry-bearing objects contribute frame evidence; empty semantic markers do not.
+    let hasGeometry = false;
+    object.traverse((child) => { if ((child as THREE.Mesh).isMesh && (child as THREE.Mesh).geometry?.getAttribute("position")) hasGeometry = true; });
+    if (!hasGeometry) return;
+    const list = bySemantic.get(semanticId) ?? [];
+    list.push(object);
+    bySemantic.set(semanticId, list);
+  });
+  const components: RegisteredComponent[] = [];
+  for (const [semanticId, objects] of bySemantic) {
+    const declaredRole = objects.map((object) => object.userData.semanticRole).find((role): role is string => typeof role === "string");
+    const box = new THREE.Box3();
+    for (const object of objects) box.expandByObject(object);
+    if (box.isEmpty()) continue;
+    const role = resolveSemanticRole(semanticId, declaredRole);
+    components.push({ semanticId, ...(role !== undefined ? { role } : {}), box, object: objects[0]! });
+  }
+  return { components, pivots };
+}
+
+function worldVertexDirectionFrom(origin: THREE.Vector3, component: RegisteredComponent): THREE.Vector3 | null {
+  let farthest: THREE.Vector3 | null = null;
+  let farthestDistance = 0;
+  const consider = (candidate: THREE.Vector3, distance: number): void => {
+    if (distance > farthestDistance) { farthestDistance = distance; farthest = candidate; }
+  };
+  component.object.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.geometry?.getAttribute("position")) return;
+    const position = mesh.geometry.getAttribute("position");
+    const vertex = new THREE.Vector3();
+    for (let index = 0; index < position.count; index += 1) {
+      vertex.fromBufferAttribute(position, index);
+      mesh.localToWorld(vertex);
+      consider(vertex.clone(), vertex.distanceTo(origin));
+    }
+  });
+  return farthest !== null ? (farthest as THREE.Vector3).sub(origin).normalize() : null;
+}
+
+/**
+ * Verifies prepared-oracle registration. Metadata rows (declared axes, scale, grounding,
+ * required semantics/pivots) are checked first; then, whenever available tank semantics exist,
+ * the physical canonical-frame rows become MANDATORY: a required proof that cannot be evaluated
+ * fails registration ("manual-map-required") instead of being omitted. Wheels prove
+ * longitudinal/lateral/ground contact, paired track courses prove Z-span/X-separation, and a
+ * gun with a pivot proves neutral barrel alignment with canonical +Z geometrically.
+ */
 export function verifyOracleRegistration(root: THREE.Object3D, expected: RegistrationExpectation): RegistrationEvidence {
   root.updateMatrixWorld(true);
   const bounds = new THREE.Box3().setFromObject(root);
-  const semantics = new Set<string>();
+  const { components, pivots } = collectRegisteredComponents(root);
+  const semantics = new Set(components.map((component) => component.semanticId));
   const names = new Set<string>();
-  const pivots = new Set<string>();
-  const semanticObjects: THREE.Object3D[] = [];
-  root.traverse((object) => {
-    names.add(object.name);
-    if (typeof object.userData.semanticId === "string") { semantics.add(object.userData.semanticId); semanticObjects.push(object); }
-    if (typeof object.userData.articulationPivot === "string") pivots.add(object.userData.articulationPivot);
-  });
+  root.traverse((object) => names.add(object.name));
   const uniformScale = root.scale.x;
   const rows: RegistrationEvidence["rows"] = [
     { code: "registration.forward", passed: root.userData.forwardAxis === expected.forwardAxis, expected: expected.forwardAxis, actual: String(root.userData.forwardAxis ?? "missing") },
@@ -636,23 +823,67 @@ export function verifyOracleRegistration(root: THREE.Object3D, expected: Registr
     ...expected.requiredSemantics.map((semantic) => ({ code: `registration.semantic.${semantic}`, passed: semantics.has(semantic), expected: "present", actual: semantics.has(semantic) ? "present" : "missing" })),
     ...expected.requiredPivots.map((pivot) => ({ code: `registration.pivot.${pivot}`, passed: names.has(pivot) || pivots.has(pivot), expected: "present", actual: names.has(pivot) || pivots.has(pivot) ? "present" : "missing" })),
   ];
-  try {
-    const roadWheels = semanticObjects.filter((o) => o.userData.semanticId?.startsWith("road-wheel"));
-    if (roadWheels.length >= 4) {
-      const zs = roadWheels.map((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.z; });
-      const xs = roadWheels.map((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.x; });
-      const zVar = Math.max(...zs) - Math.min(...zs);
-      const xVar = Math.max(...xs) - Math.min(...xs);
-      const longitudinalOk = zVar > xVar * 1.5;
-      rows.push({ code: "registration.frame.longitudinal", passed: longitudinalOk, expected: "Z variance >> X variance", actual: `zVar ${zVar.toFixed(2)} xVar ${xVar.toFixed(2)}` });
-      const left = roadWheels.filter((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.x < 0; }).length;
-      const right = roadWheels.filter((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.x > 0; }).length;
-      rows.push({ code: "registration.frame.lateral", passed: left > 0 && right > 0, expected: "left+right wheels separated on X", actual: `L${left} R${right}` });
-      const groundY = bounds.min.y;
-      const wheelYs = roadWheels.map((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.y; });
-      const nearGround = wheelYs.every((y) => Math.abs(y - groundY) < 1.5);
-      rows.push({ code: "registration.frame.ground-contact", passed: nearGround, expected: "wheels near ground", actual: nearGround ? "near ground" : "elevated" });
+  const failRow = (code: string, reason: string): void => { rows.push({ code, passed: false, expected: "mechanically proven", actual: `manual-map-required: ${reason}` }); };
+
+  const wheels = components.filter((component) => component.role === "road-wheel" || component.role === "sprocket" || component.role === "idler");
+  if (wheels.length >= 4) {
+    const centers = wheels.map((wheel) => wheel.box.getCenter(new THREE.Vector3()));
+    const zVar = Math.max(...centers.map((center) => center.z)) - Math.min(...centers.map((center) => center.z));
+    const xVar = Math.max(...centers.map((center) => center.x)) - Math.min(...centers.map((center) => center.x));
+    rows.push({ code: "registration.frame.longitudinal", passed: zVar > xVar * 1.5, expected: "wheel-chain spread along canonical Z >> X", actual: `zSpan ${zVar.toFixed(2)} xSpan ${xVar.toFixed(2)}` });
+    const left = centers.filter((center) => center.x < 0).length;
+    const right = centers.filter((center) => center.x > 0).length;
+    rows.push({ code: "registration.frame.lateral", passed: left > 0 && right > 0, expected: "left/right running gear separated on canonical X", actual: `L${left} R${right}` });
+    const span = Math.max(bounds.max.x - bounds.min.x, bounds.max.z - bounds.min.z);
+    const groundTolerance = Math.max(1.5, span * 0.15);
+    const elevated = wheels.some((wheel) => wheel.box.min.y - bounds.min.y > groundTolerance);
+    rows.push({ code: "registration.frame.ground-contact", passed: !elevated, expected: "running gear near ground plane", actual: elevated ? "elevated above ground" : "near ground" });
+  } else if (components.some((component) => /^hull|^turret|^gun/u.test(component.semanticId)) && components.some((component) => component.role === undefined && /wheel|sprocket|idler|roller/u.test(component.semanticId))) {
+    failRow("registration.frame.longitudinal", "wheel-like semantics are mapped without the road-wheel role; declare structured roles");
+  }
+
+  const tracks = components.filter((component) => component.role === "track-course" || /^track[-_ ]/u.test(component.semanticId));
+  if (tracks.length === 2) {
+    const a = tracks[0]!.box;
+    const b = tracks[1]!.box;
+    const size = (box: THREE.Box3): [number, number, number] => [box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z];
+    const aSize = size(a);
+    const bSize = size(b);
+    const majorZ = Math.max(aSize[2], bSize[2]) > Math.max(aSize[0], bSize[0]) * 1.5;
+    const centerA = a.getCenter(new THREE.Vector3());
+    const centerB = b.getCenter(new THREE.Vector3());
+    const separationX = Math.abs(centerA.x - centerB.x);
+    const separationOther = Math.max(Math.abs(centerA.y - centerB.y), Math.abs(centerA.z - centerB.z));
+    rows.push({
+      code: "registration.frame.track-pair",
+      passed: majorZ && separationX > separationOther,
+      expected: "two courses spanning canonical Z, separated along canonical X",
+      actual: `zSpan ${Math.max(aSize[2], bSize[2]).toFixed(2)} xSpan ${Math.max(aSize[0], bSize[0]).toFixed(2)} separation x ${separationX.toFixed(2)} other ${separationOther.toFixed(2)}`,
+    });
+  } else if (tracks.length > 2) {
+    failRow("registration.frame.track-pair", `expected two track courses, found ${tracks.length}`);
+  }
+
+  const gun = components.find((component) => component.semanticId === "gun" || component.semanticId.startsWith("gun-"));
+  if (gun) {
+    const origin = pivots.get("gun-pivot");
+    if (!origin) {
+      failRow("registration.frame.gun-forward", "gun semantics present but no resolvable gun-pivot origin");
+    } else {
+      const direction = worldVertexDirectionFrom(origin, gun);
+      if (!direction || !Number.isFinite(direction.z)) {
+        failRow("registration.frame.gun-forward", "gun geometry produced no barrel direction");
+      } else {
+        const cosine = direction.z;
+        rows.push({
+          code: "registration.frame.gun-forward",
+          passed: cosine >= Math.cos(Math.PI / 6),
+          expected: "neutral barrel axis aligned with canonical +Z within 30 degrees",
+          actual: `+Z cosine ${cosine.toFixed(4)}`,
+        });
+      }
     }
-  } catch {}
+  }
+
   return { schemaVersion: 1, kind: "oracle-registration", passed: rows.every((row) => row.passed), rows };
 }

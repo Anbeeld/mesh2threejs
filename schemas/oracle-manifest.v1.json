@@ -29,7 +29,18 @@
     "normalization": { "$ref": "#/$defs/normalization" },
     "authoritativeDimensions": { "type": ["object", "null"], "additionalProperties": { "type": "number", "exclusiveMinimum": 0 } },
     "dimensionSources": { "type": "array", "items": { "type": "string" } },
-    "repairHistory": { "type": "array", "items": { "type": "object", "required": ["reason", "recipeHash"], "properties": { "reason": { "type": "string", "minLength": 1 }, "recipeHash": { "$ref": "#/$defs/hash" } }, "additionalProperties": false } }
+    "repairHistory": { "type": "array", "items": { "type": "object", "required": ["reason", "recipeHash"], "properties": { "reason": { "type": "string", "minLength": 1 }, "recipeHash": { "$ref": "#/$defs/hash" } }, "additionalProperties": false } },
+    "sourceFrame": {
+      "type": "object",
+      "required": ["right", "up", "forward"],
+      "properties": {
+        "right": { "enum": ["+x", "-x", "+y", "-y", "+z", "-z"] },
+        "up": { "enum": ["+x", "-x", "+y", "-y", "+z", "-z"] },
+        "forward": { "enum": ["+x", "-x", "+y", "-y", "+z", "-z"] }
+      },
+      "additionalProperties": false
+    },
+    "logicalOwnership": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } }
   },
   "$defs": {
     "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },

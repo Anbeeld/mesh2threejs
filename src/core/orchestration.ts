@@ -9,7 +9,7 @@ import { captureSemanticTransforms, checkArticulation } from "./measurement.js";
 import type { CandidateRuntime, GateRow } from "../types.js";
 import { composeCandidateHash } from "./candidate.js";
 import { canonicalJson, sha256 } from "./hashing.js";
-import { evaluateProfileContractGates, getProfileContract } from "./contracts.js";
+import { evaluateProfileContractGates, getProfileContract, RUNTIME_GATE_BINDINGS } from "./contracts.js";
 import type { PerformanceRecorder } from "./performance.js";
 
 export interface EvaluationBundle {
@@ -21,6 +21,21 @@ export interface EvaluationBundle {
   phaseGates: Record<string, GateReport>;
   passed: boolean;
   phaseGeometryHashes: Record<string, string>;
+}
+
+export interface EvaluateCandidateInput {
+  oracle: THREE.Object3D;
+  candidate: THREE.Object3D;
+  profile: ProfileId;
+  style?: StyleContract;
+  authoritativeDimensions?: Record<string, number>;
+  certification?: "exact-real" | "oracle-relative";
+  subjectContract?: GenericSubjectContract;
+  candidateSourceHash?: string;
+  candidateNeutralHash?: string;
+  performance?: PerformanceRecorder;
+  /** When present, evaluation is scoped to exactly this phase. */
+  phase?: string;
 }
 
 function splitContractGatesByPhase(profile: ProfileId, report: GateReport): Record<string, GateReport> {
@@ -74,48 +89,79 @@ export interface PosedEvaluationBundle extends EvaluationBundle {
   articulation: GateReport;
 }
 
-function evaluateSnapshots(input: Parameters<typeof evaluateCandidate>[0], oracleSnapshot: ReturnType<typeof snapshotScene>, candidateSnapshot: ReturnType<typeof snapshotScene>): EvaluationBundle {
+/** True when the given phase's contract requires this gate code; drives scoped execution. */
+function phaseOwnsGate(profile: ProfileId, phase: string, codes: readonly string[]): boolean {
+  const gates = getProfileContract(profile).gates;
+  return codes.some((code) => gates.some((gate) => gate.code === code && gate.phase === phase));
+}
+
+/**
+ * Filters deterministic rows to those matched by gate bindings of the selected phases. For the
+ * tank profile the evaluator already computes only in-scope rows; this filter additionally
+ * covers generic-profile rows and any diagnostic row emitted outside the scope.
+ */
+function rowsForPhases(profile: ProfileId, rows: GateRow[], phases: ReadonlySet<string> | undefined): GateRow[] {
+  if (!phases) return rows;
+  const patterns = getProfileContract(profile).gates
+    .filter((gate) => phases.has(gate.phase))
+    .flatMap((gate) => {
+      const binding = RUNTIME_GATE_BINDINGS[gate.code];
+      return binding?.source === "deterministic" ? [...(binding.exact ?? []), ...(binding.prefixes ?? [])] : [];
+    });
+  if (!patterns.length) return [];
+  return rows.filter((row) => patterns.some((pattern) => row.code === pattern || row.code.startsWith(pattern)));
+}
+
+const emptyReport = (profile: ProfileId): GateReport => ({ profile, passed: true, score: 100, rows: [], workorders: [] });
+
+function evaluateSnapshots(input: EvaluateCandidateInput, oracleSnapshot: ReturnType<typeof snapshotScene>, candidateSnapshot: ReturnType<typeof snapshotScene>): EvaluationBundle {
+  const phases = input.phase ? new Set([input.phase]) : undefined;
   const deterministic = input.profile === "tank"
     ? evaluateTankProfile(oracleSnapshot, candidateSnapshot, {
         certification: input.certification ?? "oracle-relative",
         ...(input.authoritativeDimensions ? { authoritativeDimensions: input.authoritativeDimensions as { hullLength: number; overallLength: number; width: number; height: number } } : {}),
         ...(input.performance ? { performance: input.performance } : {}),
+        ...(phases ? { phases } : {}),
       })
     : evaluateGenericProfile(oracleSnapshot, candidateSnapshot, input.subjectContract, {
         certification: input.certification ?? "oracle-relative",
         ...(input.authoritativeDimensions && ["width", "height", "depth"].every((key) => Number.isFinite(input.authoritativeDimensions![key])) ? { authoritativeDimensions: input.authoritativeDimensions as { width: number; height: number; depth: number } } : {}),
+        ...(phases ? { phases } : {}),
       });
+  // Style and contract gates are only evaluated when the active phase requires them.
   const stylePhase = input.profile === "tank" ? "style-fabrication" : "style-complexity";
-  const style = input.performance?.measure("neutral-style-evaluation", () => evaluateLowPolyStyle(oracleSnapshot, candidateSnapshot, input.style ?? lowPolyFaithful, stylePhase)) ?? evaluateLowPolyStyle(oracleSnapshot, candidateSnapshot, input.style ?? lowPolyFaithful, stylePhase);
-  const contractGates = evaluateProfileContractGates(getProfileContract(input.profile), { deterministic: deterministic.rows, style: style.rows });
+  const includeStyle = !input.phase || phaseOwnsGate(input.profile, input.phase, ["style.contract", "style.complexity"]);
+  const style = !includeStyle ? emptyReport(input.profile)
+    : input.performance?.measure("neutral-style-evaluation", () => evaluateLowPolyStyle(oracleSnapshot, candidateSnapshot, input.style ?? lowPolyFaithful, stylePhase)) ?? evaluateLowPolyStyle(oracleSnapshot, candidateSnapshot, input.style ?? lowPolyFaithful, stylePhase);
+  const contract = getProfileContract(input.profile);
+  const scopedContract = input.phase ? { ...contract, gates: contract.gates.filter((gate) => gate.phase === input.phase) } : contract;
+  const deterministicRows = rowsForPhases(input.profile, deterministic.rows, phases);
+  const scopedDeterministic: GateReport = { ...deterministic, rows: deterministicRows, passed: deterministicRows.every((row) => row.passed), score: deterministicRows.length ? Math.min(...deterministicRows.map((row) => row.score)) : 100 };
+  const contractGates = evaluateProfileContractGates(scopedContract, { ...(includeStyle ? { style: style.rows } : {}), deterministic: deterministicRows });
   return {
     oracleHash: fingerprintSnapshot(oracleSnapshot),
     candidateHash: input.candidateSourceHash ? composeCandidateHash(input.candidateNeutralHash ?? fingerprintSnapshot(candidateSnapshot), input.candidateSourceHash) : fingerprintSnapshot(candidateSnapshot),
-    deterministic, style, contractGates,
+    deterministic: scopedDeterministic, style, contractGates,
     phaseGates: splitContractGatesByPhase(input.profile, contractGates),
-    passed: deterministic.passed && style.passed && contractGates.passed,
+    passed: scopedDeterministic.passed && style.passed && contractGates.passed,
     phaseGeometryHashes: phaseGeometryHashes(input.profile, candidateSnapshot, input.subjectContract, input.candidateSourceHash),
   };
 }
 
-export function evaluateCandidate(input: {
-  oracle: THREE.Object3D;
-  candidate: THREE.Object3D;
-  profile: ProfileId;
-  style?: StyleContract;
-  authoritativeDimensions?: Record<string, number>;
-  certification?: "exact-real" | "oracle-relative";
-  subjectContract?: GenericSubjectContract;
-  candidateSourceHash?: string;
-  candidateNeutralHash?: string;
-  performance?: PerformanceRecorder;
-}): EvaluationBundle {
+export function evaluateCandidate(input: EvaluateCandidateInput): EvaluationBundle {
   const oracleSnapshot = input.performance?.measure("oracle-snapshot-construction", () => snapshotScene(input.oracle)) ?? snapshotScene(input.oracle);
   const candidateSnapshot = input.performance?.measure("candidate-snapshot-construction", () => snapshotScene(input.candidate)) ?? snapshotScene(input.candidate);
   return evaluateSnapshots(input, oracleSnapshot, candidateSnapshot);
 }
 
-export async function evaluateCandidateWithPoses(input: Omit<Parameters<typeof evaluateCandidate>[0], "candidate"> & { candidate: CandidateRuntime }): Promise<PosedEvaluationBundle> {
+export type EvaluateCandidateWithPosesInput = Omit<EvaluateCandidateInput, "candidate"> & { candidate: CandidateRuntime };
+
+/**
+ * Full evaluation with pose sampling. When `phase` is present, evaluation is scoped to that
+ * phase: articulation controls are only exercised (and therefore only required of the
+ * candidate) when the phase owns the articulation gate.
+ */
+export async function evaluateCandidateWithPoses(input: EvaluateCandidateWithPosesInput): Promise<PosedEvaluationBundle> {
   const evaluationInput = { ...input, candidate: input.candidate.root, ...(input.candidate.sourceHash ? { candidateSourceHash: input.candidate.sourceHash } : {}) };
   const oracleSnapshot = input.performance?.measure("oracle-snapshot-construction", () => snapshotScene(input.oracle)) ?? snapshotScene(input.oracle);
   const candidateSnapshot = input.performance?.measure("candidate-snapshot-construction", () => snapshotScene(input.candidate.root)) ?? snapshotScene(input.candidate.root);
@@ -124,7 +170,10 @@ export async function evaluateCandidateWithPoses(input: Omit<Parameters<typeof e
   const profileContract = getProfileContract(input.profile);
   const controls = input.profile === "generic" ? input.subjectContract?.articulation ?? [] : profileContract.articulation;
   const articulationPhase = profileContract.gates.find((gate) => gate.code === "articulation.poses")?.phase ?? "attachments";
-  if (controls.length) {
+  // Phase isolation: a phase that does not own the articulation gate never touches setPose(),
+  // so a plain partial candidate without physical controls can be gated during earlier phases.
+  const includeArticulation = !input.phase || input.phase === articulationPhase;
+  if (includeArticulation && controls.length) {
     const semanticSnapshot = snapshotScene(input.candidate.root);
     const allSemantics = Object.keys(semanticSnapshot.components);
     const neutral = Object.fromEntries(controls.map((control) => [control.control, 0]));
@@ -170,13 +219,23 @@ export async function evaluateCandidateWithPoses(input: Omit<Parameters<typeof e
     }
   }
   const articulation: GateReport = { profile: input.profile, passed: rows.every((row) => row.passed), score: rows.length ? Math.min(...rows.map((row) => row.score)) : 100, rows, workorders: [] };
-  const contractGates = evaluateProfileContractGates(getProfileContract(input.profile), { deterministic: base.deterministic.rows, articulation: articulation.rows, style: base.style.rows });
+  const contract = input.phase ? { ...profileContract, gates: profileContract.gates.filter((gate) => gate.phase === input.phase) } : profileContract;
+  const contractGates = evaluateProfileContractGates(contract, { deterministic: base.deterministic.rows, ...(includeArticulation ? { articulation: articulation.rows } : {}), style: base.style.rows });
   const phaseGates = splitContractGatesByPhase(input.profile, contractGates);
-  if (input.profile === "generic" && controls.length) {
+  if (input.profile === "generic" && includeArticulation && controls.length) {
     const current = phaseGates[articulationPhase] ?? { profile: input.profile, passed: true, score: 100, rows: [], workorders: [] };
     phaseGates[articulationPhase] = { ...current, passed: current.passed && articulation.passed, score: Math.min(current.score, articulation.score), rows: [...current.rows, ...articulation.rows] };
   }
-  return { ...base, articulation, contractGates, phaseGates, passed: base.deterministic.passed && base.style.passed && articulation.passed && contractGates.passed };
+  return { ...base, articulation, contractGates, phaseGates, passed: base.passed && (includeArticulation ? base.style.passed && articulation.passed : true) && contractGates.passed };
+}
+
+/**
+ * Phase-scoped evaluation entry point: evaluates only what the requested phase requires.
+ * Equivalent to evaluateCandidateWithPoses with `phase` set; kept as an explicit API so
+ * callers cannot accidentally run whole-vehicle diagnostics for an active-phase gate.
+ */
+export function evaluateCandidateForPhase(input: EvaluateCandidateWithPosesInput & { phase: string }): Promise<PosedEvaluationBundle> {
+  return evaluateCandidateWithPoses({ ...input, phase: input.phase });
 }
 
 export function neutralPoseForProfile(profile: ProfileId, subjectContract?: GenericSubjectContract): Record<string, number> {

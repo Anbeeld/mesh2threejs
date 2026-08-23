@@ -42,8 +42,11 @@ export function auditCandidateSource(source: string): CandidateAudit {
   if (/data:(?:model\/gltf-binary|application\/octet-stream);base64/iu.test(source)) {
     findings.push({ code: "embedded-oracle", message: "candidate source embeds binary model data" });
   }
+  // Dense-payload detection is structural only: element counts, byte size, and embedded
+  // binary/base64 payloads. Source-character length is never topology authority, so a small
+  // explicit control cage is legal whether it is written as a plain array or a typed array.
   const typedArrayElements = [...source.matchAll(/new\s+(?:Float32|Uint16|Uint32)Array\s*\(\s*\[([\s\S]*?)\]/gu)].reduce((sum, m) => sum + (m[1]?.split(",").filter((s) => s.trim()).length ?? 0), 0);
-  const hasDensePayload = /(?:Buffer\.from|atob)\s*\([^,)]{256,}(?:base64|["'])/isu.test(source) || typedArrayElements > 5000 || /new\s+(?:Float32|Uint16|Uint32)Array\s*\(\s*\[[\s\S]{4000,}?\]/u.test(source);
+  const hasDensePayload = /(?:Buffer\.from|atob)\s*\([^,)]{256,}(?:base64|["'])/isu.test(source) || typedArrayElements > 5000;
   if (hasDensePayload) findings.push({ code: "dense-binary-payload", message: "candidate contains a dense binary/topology payload" });
   const numericLiteralCount = (source.match(/(?:^|[,[\s])-?\d+(?:\.\d+)?(?=\s*[,\]])/gu) ?? []).length;
   if (numericLiteralCount > 2000 || typedArrayElements > 20000) {
