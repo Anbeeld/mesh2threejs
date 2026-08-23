@@ -1,6 +1,6 @@
 ---
 name: mesh2threejs
-description: Reconstruct rigid hard-surface live GLB references as independently authored procedural Three.js, with executable profile contracts, deterministic gates, durable phase locks, and genuine visual review. Use for tank or generic reconstruction tasks in this repository.
+description: Reconstruct rigid hard-surface GLB references as procedural Three.js via derived-seed or clean-room strategy, with executable profile contracts, deterministic gates, durable phase locks, and genuine visual review. Use for tank or generic tasks in this repository.
 metadata:
   version: '1.0.0'
   prompting-standard: 'PROMPTING.md v1.1.0'
@@ -12,13 +12,17 @@ Hydrate `project.json` and `.mesh2threejs/state.json` before acting. Never rely 
 
 Non-negotiable invariants:
 
-- Treat the admitted live source/prepared oracle as geometry truth; never embed it in the candidate.
-- Keep source oracle bytes immutable. Only onboarding/repair may write prepared-oracle state.
-- Produce native procedural Three.js source and bind every gate result to oracle/candidate hashes.
-- Preserve macro geometry, orientation, semantics, articulation, and repeated-part counts. Low-poly style may simplify representation, never truth.
-- A visual reviewer cannot edit. Certification requires a fresh external-vision verdict and verified artifact files; process isolation alone is insufficient.
+- Keep every workspace-related file inside its workspace (scratch under `.mesh2threejs/tmp/`); never write to repo root or other workspaces.
+- Candidate never loads `refs/oracle/*` or `.mesh2threejs/oracle/*` at runtime.
+- Derived mode (default for new 3D-oracle workspaces): trusted tools may derive `model/.generated/` from the prepared oracle at build time, bound by `.mesh2threejs/derived/` manifests.
+- Independent mode: measure but never reuse source topology; author procedurally.
+- Hand-authored modules never carry dense payloads; only verified generated modules may.
+- Keep source oracle bytes immutable; only onboarding/repair writes prepared state.
+- Produce native procedural Three.js and bind every gate to oracle/candidate hashes.
+- Preserve macro geometry, orientation, semantics, articulation, and repeated counts; low-poly may simplify, never distort truth.
+- Visual reviewer cannot edit; certification needs fresh external-vision verdict and verified artifacts.
 
-When current work is ready for the user to inspect, refresh the full model capture first (`mesh2threejs review-ready <workspace>`, or `render`) and report its paths; then offer the interactive viewer. Never start the persistent viewer server without explicit user approval. Viewer inspection and user feedback are non-authoritative: they route back into existing reconstruction phases via the normal reopen/repair lifecycle and never satisfy `visual.review`, gates, or certification.
+When ready for inspection, refresh full capture (`mesh2threejs review-ready <workspace>` or `render`) and report paths; then offer viewer. Never start viewer without approval. Viewer is non-authoritative and never satisfies `visual.review`, gates, or certification.
 
 Route with `mesh2threejs route <task>` and load exactly one role skill from `skills/`: `reconstruct`, `onboard-oracle`, `repair-oracle`, `build`, `visual-review`, `diagnose`, or `finalize`.
 

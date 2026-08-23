@@ -85,6 +85,7 @@ export const projectManifestSchema = {
     referenceMode: { enum: ["copy", "external"] },
     portable: { type: "boolean" },
     subjectContract: { type: "string", minLength: 1 },
+    authorshipMode: { enum: ["derived", "independent"] },
   },
   additionalProperties: false,
 } as const;
@@ -141,6 +142,29 @@ export const oracleManifestSchema = {
       additionalProperties: false,
     },
     logicalOwnership: { type: "object", additionalProperties: { type: "string", minLength: 1 } },
+    scaleAuthority: {
+      anyOf: [
+        {
+          type: "object",
+          required: ["mode"],
+          properties: { mode: { const: "oracle-units" } },
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          required: ["mode", "id", "target", "unit"],
+          properties: {
+            mode: { const: "dimension-anchor" },
+            id: { type: "string", minLength: 1 },
+            target: { type: "number", exclusiveMinimum: 0 },
+            unit: { const: "m" },
+            source: { type: "string" },
+            locator: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+      ],
+    },
   },
   allOf: [
     { if: { properties: { referenceMode: { const: "copy" } }, required: ["referenceMode"] }, then: { properties: { portable: { const: true } } } },

@@ -166,6 +166,82 @@ export async function performRenderRun(options: PerformRenderRunOptions): Promis
   };
 }
 
+export interface QuickDiagnosticResult {
+  backend: "deterministic-cpu" | "three-webgl";
+  directory: string;
+  manifestPath: string;
+  boards: HashedArtifactPath[];
+  captures: number;
+}
+
+/**
+ * Cheap agent-side sanity captures for the ACTIVE phase: one side comparison, one front
+ * comparison, and one perspective comparison, beauty pass only. This is a builder diagnostic
+ * surface — it never records visual-review evidence, never emits a turntable, and its run
+ * directories are deliberately invisible to user-review packet assembly (`quick-*` vs `render-*`).
+ */
+export async function performQuickDiagnosticRun(workspace: ResumedWorkspace, manifest: OracleManifest, oracle: import("three").Object3D, candidateIdentity: CandidateIdentity, candidate: import("three").Object3D, backend: RenderBackend = "deterministic-cpu"): Promise<QuickDiagnosticResult> {
+  const directory = await createPrefixedRunDirectory(workspace.layout.internal.captures, "quick");
+  const oracleSnapshot = snapshotScene(oracle);
+  const candidateSnapshot = snapshotScene(candidate);
+  const bounds = measureBounds(oracleSnapshot);
+  const frame = deriveCanonicalFrame(bounds, 0.01);
+  const profile = standardRenderProfile({ width: frame.width, height: frame.height });
+  profile.camera.orthographicHeight = frame.orthographicHeight;
+  profile.camera.far = Math.max(profile.camera.far, frame.orthographicHeight * 4);
+  await mkdir(directory, { recursive: true });
+  const span = Math.max(...bounds.size);
+  const [x, y, z] = bounds.center;
+  const distance = span * 2.5 + 1;
+  const perspective: CaptureCamera = { id: "perspective", projection: "perspective", position: [x - distance * 0.7, y + distance * 0.35, z - distance * 0.7] as const, target: [x, y, z] as const };
+  const views: Array<{ id: string; camera: CaptureCamera }> = [
+    { id: "side", camera: frame.cameras.side },
+    { id: "front", camera: frame.cameras.front },
+    { id: "perspective", camera: perspective },
+  ];
+  let captures = 0;
+  const boards: HashedArtifactPath[] = [];
+  for (const view of views) {
+    const oracleFrame = renderCapture({ root: oracle, snapshot: oracleSnapshot, profile, camera: view.camera, pass: "beauty", backend }).frame;
+    const candidateFrame = renderCapture({ root: candidate, snapshot: candidateSnapshot, profile, camera: view.camera, pass: "beauty", backend }).frame;
+    const oraclePath = join(directory, `${view.id}-oracle-beauty.png`);
+    const candidatePath = join(directory, `${view.id}-candidate-beauty.png`);
+    await writeCapturePng(oraclePath, oracleFrame);
+    await writeCapturePng(candidatePath, candidateFrame);
+    captures += 2;
+    const board = join(directory, `${view.id}-comparison.png`);
+    await createComparisonBoard(board, oracleFrame, candidateFrame);
+    boards.push({ path: board, sha256: sha256(await readFile(board)) });
+  }
+  const manifestPayload = {
+    schemaVersion: 1,
+    kind: "quick-agent-diagnostic",
+    builderDiagnosticOnly: true,
+    backend,
+    oracleHash: fingerprintScene(oracle),
+    candidateHash: candidateIdentity.candidateHash,
+    views: views.map((view) => view.id),
+    boards: boards.map((board) => ({ path: board.path, sha256: board.sha256 })),
+  };
+  const manifestPath = join(directory, "quick-manifest.json");
+  await writeFile(manifestPath, `${JSON.stringify(manifestPayload, null, 2)}\n`, { flag: "wx" });
+  return { backend: backend === "three-webgl" ? "three-webgl" : "deterministic-cpu", directory, manifestPath, boards, captures };
+}
+
+async function createPrefixedRunDirectory(parent: string, prefix: string): Promise<string> {
+  await mkdir(parent, { recursive: true });
+  for (let sequence = 1; sequence < 1_000_000; sequence += 1) {
+    const path = join(parent, `${prefix}-${String(sequence).padStart(4, "0")}`);
+    try {
+      await mkdir(path);
+      return path;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  throw new Error(`no available ${prefix} run directory under ${parent}`);
+}
+
 export interface OracleSanityResult {
   directory: string;
   manifestPath: string;

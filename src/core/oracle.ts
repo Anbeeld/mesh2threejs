@@ -256,6 +256,25 @@ export function validateLogicalOwnership(ownership: Record<string, string>, sema
   }
 }
 
+export interface GlbProbeNodeFact {
+  nodeId: string;
+  name: string;
+  parent: { nodeId: string; name: string } | null;
+  worldBounds: { min: Point3; max: Point3; center: Point3 };
+  triangleCount: number;
+  /** Longest extent axis of the node's world AABB. */
+  principalAxis: "x" | "y" | "z";
+  elongatedHint: boolean;
+  radialityHint: boolean;
+}
+
+export interface GlbProbeSuggestion {
+  kind: "likely-hull" | "likely-turret" | "likely-gun" | "likely-track-pair" | "likely-repeated-wheel-chain" | "likely-forward-axis";
+  target: string;
+  confidence: "high" | "medium" | "low";
+  evidence: string;
+}
+
 export interface GlbProbe {
   schemaVersion: 1;
   kind: "glb-oracle-probe";
@@ -266,6 +285,11 @@ export interface GlbProbe {
   names: string[];
   semanticIdentities: Array<{ id: string; name: string; parentId: string | null }>;
   bounds: Bounds3 | null;
+  /** Deterministic per-node geometry facts for multipart sources; empty for single-mesh GLBs. */
+  nodes: GlbProbeNodeFact[];
+  repeatedNameFamilies: Array<{ family: string; count: number }>;
+  /** Non-authoritative onboarding hints; the agent still writes the semantic map and register verifies it. */
+  suggestions: GlbProbeSuggestion[];
   semanticReadiness: SemanticReadiness;
   warnings: string[];
 }
@@ -299,6 +323,150 @@ export function probeGlb(input: Uint8Array): GlbProbe {
   const sceneRoot = meshes.length ? loadGlbScene(input) : null;
   const worldBox = sceneRoot ? new THREE.Box3().setFromObject(sceneRoot) : null;
   const bounds = worldBox && !worldBox.isEmpty() ? { min: [worldBox.min.x, worldBox.min.y, worldBox.min.z] as Point3, max: [worldBox.max.x, worldBox.max.y, worldBox.max.z] as Point3, size: [worldBox.max.x - worldBox.min.x, worldBox.max.y - worldBox.min.y, worldBox.max.z - worldBox.min.z] as Point3, center: [(worldBox.min.x + worldBox.max.x) / 2, (worldBox.min.y + worldBox.max.y) / 2, (worldBox.min.z + worldBox.max.z) / 2] as Point3 } : null;
+
+  // Deterministic per-node geometry facts for multipart sources. These make onboarding less
+  // blind without pretending to recognize semantics; register remains the authority.
+  const nodeFacts: GlbProbeNodeFact[] = [];
+  const familyCounts = new Map<string, number>();
+  if (sceneRoot && nodes.length > 1) {
+    const meshTriangleCount = (object: THREE.Object3D): number => {
+      let total = 0;
+      object.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.geometry?.getAttribute("position")) return;
+        total += Math.floor((mesh.geometry.index ? mesh.geometry.index.count : mesh.geometry.getAttribute("position").count) / 3);
+      });
+      return total;
+    };
+    sceneRoot.updateMatrixWorld(true);
+    sceneRoot.traverse((object) => {
+      if (!(object instanceof THREE.Group)) return;
+      const nodeId = typeof object.userData.oracleNodeId === "string" ? object.userData.oracleNodeId : undefined;
+      if (!nodeId || object === sceneRoot) return;
+      const hasDirectMesh = object.children.some((child) => (child as THREE.Mesh).isMesh);
+      if (!hasDirectMesh && object.children.length > 0) {
+        // Group nodes whose meshes live deeper still carry aggregate geometry; keep them only
+        // when they directly parent meshes so facts stay per-node rather than per-branch.
+      }
+      if (!hasDirectMesh) return;
+      const box = new THREE.Box3().setFromObject(object);
+      if (box.isEmpty()) return;
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const axes: Array<"x" | "y" | "z"> = ["x", "y", "z"];
+      const sizes = axes.map((axis) => size[axis]);
+      const principalAxis = axes[sizes.indexOf(Math.max(...sizes))]!;
+      const sortedSizes = [...sizes].sort((a, b) => a - b);
+      const elongatedHint = sortedSizes[2]! >= Math.max(sortedSizes[1]!, 1e-9) * 2.5;
+      // Radiality hint: thin along one lateral axis and even across the wheel plane.
+      const spreadSamples: number[] = [];
+      const sums = [0, 0, 0];
+      let sampled = 0;
+      object.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.geometry?.getAttribute("position")) return;
+        const attribute = mesh.geometry.getAttribute("position");
+        const stride = Math.max(1, Math.floor(attribute.count / 512));
+        const vertex = new THREE.Vector3();
+        for (let index = 0; index < attribute.count; index += stride) {
+          vertex.fromBufferAttribute(attribute, index);
+          mesh.localToWorld(vertex);
+          for (let axis = 0; axis < 3; axis += 1) sums[axis]! += vertex.getComponent(axis);
+          spreadSamples.push(vertex.x, vertex.y, vertex.z);
+          sampled += 1;
+        }
+      });
+      let radialityHint = false;
+      if (sampled >= 12) {
+        const means = sums.map((sum) => sum / sampled);
+        const variances = [0, 1, 2].map((axis) => {
+          let variance = 0;
+          for (let item = 0; item < sampled; item += 1) {
+            const value = spreadSamples[item * 3 + axis]! - means[axis]!;
+            variance += value * value;
+          }
+          return Math.sqrt(variance / sampled);
+        });
+        const orderedVariances = [...variances].sort((a, b) => a - b);
+        radialityHint = orderedVariances[0]! < orderedVariances[2]! * 0.4 && orderedVariances[1]! < orderedVariances[2]! * 1.35;
+      }
+      const parentObject = object.parent;
+      const parentFact = parentObject && typeof parentObject.userData.oracleNodeId === "string"
+        ? { nodeId: parentObject.userData.oracleNodeId, name: parentObject.name }
+        : null;
+      const name = typeof object.name === "string" ? object.name : nodeId;
+      nodeFacts.push({
+        nodeId,
+        name,
+        ...(parentFact ? { parent: parentFact } : { parent: null }),
+        worldBounds: {
+          min: [box.min.x, box.min.y, box.min.z],
+          max: [box.max.x, box.max.y, box.max.z],
+          center: [(box.min.x + box.max.x) / 2, (box.min.y + box.max.y) / 2, (box.min.z + box.max.z) / 2],
+        },
+        triangleCount: meshTriangleCount(object),
+        principalAxis,
+        elongatedHint,
+        radialityHint,
+      });
+    });
+    for (const fact of nodeFacts) {
+      const family = fact.name.replace(/[-_ ]?\d+$/u, "");
+      familyCounts.set(family, (familyCounts.get(family) ?? 0) + 1);
+    }
+  }
+
+  // Non-authoritative onboarding suggestions derived only from the facts above.
+  const suggestions: GlbProbeSuggestion[] = [];
+  if (nodeFacts.length >= 2) {
+    const volumes = nodeFacts.map((fact) => fact.worldBounds.max[0] * fact.worldBounds.max[1] * fact.worldBounds.max[2]);
+    const groundY = Math.min(...nodeFacts.map((fact) => fact.worldBounds.min[1]));
+    const hullIndex = volumes.indexOf(Math.max(...volumes));
+    const hull = nodeFacts[hullIndex];
+    const hullVolume = hull ? volumes[hullIndex]! : 0;
+    if (hull && hull.worldBounds.min[1] <= groundY + (hull.worldBounds.max[1] - hull.worldBounds.min[1]) * 0.25) {
+      suggestions.push({ kind: "likely-hull", target: `${hull.nodeId} (${hull.name})`, confidence: hullVolume >= volumes.reduce((sum, value) => sum + value, 0) * 0.4 ? "high" : "medium", evidence: `largest volume (${((hullVolume / Math.max(volumes.reduce((sum, value) => sum + value, 0), 1e-9)) * 100).toFixed(0)}% of measured volume) resting near the ground plane` });
+      const hullTop = hull.worldBounds.max[1];
+      for (const [index, fact] of nodeFacts.entries()) {
+        if (index === hullIndex) continue;
+        const height = fact.worldBounds.max[1] - fact.worldBounds.min[1];
+        const aboveHullMiddle = fact.worldBounds.center[1] > (hull.worldBounds.min[1] + hullTop) / 2;
+        if (!aboveHullMiddle || volumes[index]! > hullVolume * 0.5) continue;
+        const withinFootprint = Math.abs(fact.worldBounds.center[0] - hull.worldBounds.center[0]!) < hull.worldBounds.max[0] - hull.worldBounds.min[0]
+          && Math.abs(fact.worldBounds.center[2] - hull.worldBounds.center[2]!) < hull.worldBounds.max[2] - hull.worldBounds.min[2];
+        if (!withinFootprint) continue;
+        if (fact.elongatedHint && (fact.worldBounds.max[0] - fact.worldBounds.min[0]) < height * 2 && (fact.worldBounds.max[0] - fact.worldBounds.min[0]) * 2 < (fact.worldBounds.max[2] - fact.worldBounds.min[2])) {
+          suggestions.push({ kind: "likely-gun", target: `${fact.nodeId} (${fact.name})`, confidence: "low", evidence: `elongated ${fact.principalAxis}-axis piece seated above the hull mass` });
+          continue;
+        }
+        if (fact.worldBounds.min[1] >= hullTop - height * 0.5) {
+          suggestions.push({ kind: "likely-turret", target: `${fact.nodeId} (${fact.name})`, confidence: "medium", evidence: "box seated on the upper hull surface inside the hull footprint" });
+        }
+      }
+    }
+    const trackCandidates = nodeFacts.filter((fact) => {
+      const sizeZ = fact.worldBounds.max[2] - fact.worldBounds.min[2];
+      const sizeX = fact.worldBounds.max[0] - fact.worldBounds.min[0];
+      const sizeY = fact.worldBounds.max[1] - fact.worldBounds.min[1];
+      return sizeZ > sizeX * 1.5 && fact.worldBounds.min[1] <= groundY + sizeY * 0.5;
+    });
+    const leftTracks = trackCandidates.filter((fact) => fact.worldBounds.center[0] < 0);
+    const rightTracks = trackCandidates.filter((fact) => fact.worldBounds.center[0] > 0);
+    if (leftTracks.length === 1 && rightTracks.length === 1) {
+      suggestions.push({ kind: "likely-track-pair", target: `${leftTracks[0]!.nodeId}+${rightTracks[0]!.nodeId}`, confidence: "high", evidence: "two ground-level Z-spanning pieces separated along X on opposite sides" });
+    } else if (trackCandidates.length === 2) {
+      suggestions.push({ kind: "likely-track-pair", target: trackCandidates.map((fact) => fact.nodeId).join("+"), confidence: "medium", evidence: "two ground-level longitudinal pieces" });
+    }
+    const wheelFamilies = [...familyCounts.entries()].filter(([family, count]) => count >= 3 && family && nodeFacts.filter((fact) => fact.name.replace(/[-_ ]?\d+$/u, "") === family).every((fact) => fact.radialityHint));
+    for (const [family, count] of wheelFamilies.slice(0, 4)) {
+      suggestions.push({ kind: "likely-repeated-wheel-chain", target: family, confidence: count >= 4 ? "high" : "medium", evidence: `${count} radial repeated instances sharing the "${family}" naming family` });
+    }
+    if (bounds) {
+      const forwardAxis = bounds.size[2] >= bounds.size[0] ? "+z" : "+x";
+      suggestions.push({ kind: "likely-forward-axis", target: forwardAxis, confidence: "low", evidence: `longest horizontal vehicle extent lies along ${forwardAxis}` });
+    }
+  }
+
   const names = [...nodes, ...meshes].map((item, index) => {
     const object = asObject(item, `named glTF item ${index}`);
     return typeof object.name === "string" ? object.name : "";
@@ -339,6 +507,9 @@ export function probeGlb(input: Uint8Array): GlbProbe {
     names,
     semanticIdentities,
     bounds,
+    nodes: nodeFacts,
+    repeatedNameFamilies: [...familyCounts.entries()].filter(([, count]) => count >= 3).map(([family, count]) => ({ family, count })).sort((a, b) => b.count - a.count),
+    suggestions,
     semanticReadiness,
     warnings,
   };
@@ -447,6 +618,25 @@ export function oraclePreparationBinding(manifest: OracleManifest): OraclePrepar
   return { identity: oraclePreparationIdentity(manifest), sourceHash: manifest.sourceHash, preparedHash: manifest.preparedHash };
 }
 
+export type ScaleAuthority =
+  | { mode: "oracle-units" }
+  | { mode: "dimension-anchor"; id: string; target: number; unit: "m"; source?: string; locator?: string };
+
+/**
+ * Structured scale/authority decision recorded inside the prepared-oracle record. It removes
+ * the ambiguity that let two agents independently pick different anchors from the same spec:
+ * onboarding derives it once from authoritative documents, preparation identity binds it, and
+ * mechanical registration verifies actual scale against it.
+ */
+export function validateScaleAuthority(value: ScaleAuthority | undefined): void {
+  if (!value) return;
+  if (value.mode === "oracle-units") return;
+  if (value.mode !== "dimension-anchor") throw new Error("scaleAuthority.mode must be \"dimension-anchor\" or \"oracle-units\"");
+  if (!value.id.trim()) throw new Error("dimension-anchor scaleAuthority requires a non-empty anchor id");
+  if (!Number.isFinite(value.target) || value.target <= 0) throw new Error("dimension-anchor scaleAuthority.target must be a positive number");
+  if (value.unit !== "m") throw new Error("dimension-anchor scaleAuthority.unit must be \"m\"");
+}
+
 export interface OracleManifest {
   schemaVersion: 1;
   id: string;
@@ -473,6 +663,7 @@ export interface OracleManifest {
   normalization: { translation: Point3; rotationEuler: Point3; scale: number };
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
+  scaleAuthority?: ScaleAuthority;
   authoritativeDimensions: Record<string, number> | null;
   dimensionSources: string[];
   repairHistory: Array<{ reason: string; recipeHash: string }>;
@@ -497,6 +688,7 @@ interface PreparedRecipe {
   normalization: { translation: Point3; rotationEuler: Point3; scale: number };
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
+  scaleAuthority?: ScaleAuthority;
   repair?: { parentPreparedHash: string; reason: string };
   preparedHash?: string;
 }
@@ -536,6 +728,7 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
   if (input.logicalOwnership) {
     validateLogicalOwnership(input.logicalOwnership, input.semanticMap, input.articulationMap);
   }
+  validateScaleAuthority(input.scaleAuthority);
   const baseRecipe: PreparedRecipe = {
     schemaVersion: 1,
     kind: "prepared-oracle-recipe",
@@ -546,6 +739,7 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     normalization: input.normalization,
     ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : {}),
     ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : {}),
+    ...(input.scaleAuthority ? { scaleAuthority: input.scaleAuthority } : {}),
   };
   const preparedHash = sha256(canonicalJson(baseRecipe));
   await mkdir(dirname(preparedFile), { recursive: true });
@@ -576,6 +770,7 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     normalization: input.normalization,
     ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : {}),
     ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : {}),
+    ...(input.scaleAuthority ? { scaleAuthority: input.scaleAuthority } : {}),
     authoritativeDimensions: input.authoritativeDimensions,
     dimensionSources: input.dimensionSources,
     repairHistory: [],
@@ -683,12 +878,14 @@ export interface RepairPreparedOracleInput {
   normalization?: { translation: Point3; rotationEuler: Point3; scale: number };
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
+  scaleAuthority?: ScaleAuthority;
 }
 
 export async function repairPreparedOracle(manifest: OracleManifest, input: RepairPreparedOracleInput, workspaceRoot?: string): Promise<OracleManifest> {
   if (!input.reason.trim()) throw new Error("oracle repair requires a reason");
   if (input.sourceFrame) sourceFrameTransform(input.sourceFrame);
   if (input.logicalOwnership) validateLogicalOwnership(input.logicalOwnership, input.semanticMap ?? manifest.semanticMap, input.articulationMap ?? manifest.articulationMap);
+  validateScaleAuthority(input.scaleAuthority ?? manifest.scaleAuthority);
   await verifyOraclePreparation(manifest, workspaceRoot);
   const preparedFile = workspaceFile(input.preparedPath, workspaceRoot, "preparedPath");
   const preparedPath = storedPath(input.preparedPath, workspaceRoot);
@@ -700,10 +897,11 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     semanticMap: input.semanticMap ?? manifest.semanticMap,
     articulationMap: input.articulationMap ?? manifest.articulationMap,
     normalization: input.normalization ?? manifest.normalization,
-    // Frame and ownership authority survive repair unless the caller explicitly changes them:
-    // a repaired recipe must never claim different authoritative frame/ownership state silently.
+    // Frame, ownership, and scale authority survive repair unless the caller explicitly
+    // changes them: a repaired recipe must never silently change authoritative decisions.
     ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : manifest.sourceFrame ? { sourceFrame: manifest.sourceFrame } : {}),
     ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : manifest.logicalOwnership ? { logicalOwnership: manifest.logicalOwnership } : {}),
+    ...(input.scaleAuthority ? { scaleAuthority: input.scaleAuthority } : manifest.scaleAuthority ? { scaleAuthority: manifest.scaleAuthority } : {}),
     repair: { parentPreparedHash: manifest.preparedHash, reason: input.reason.trim() },
   };
   const preparedHash = sha256(canonicalJson(baseRecipe));
@@ -718,6 +916,7 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     normalization: baseRecipe.normalization,
     ...(baseRecipe.sourceFrame ? { sourceFrame: baseRecipe.sourceFrame } : {}),
     ...(baseRecipe.logicalOwnership ? { logicalOwnership: baseRecipe.logicalOwnership } : {}),
+    ...(baseRecipe.scaleAuthority ? { scaleAuthority: baseRecipe.scaleAuthority } : {}),
     repairHistory: [...manifest.repairHistory, { reason: input.reason.trim(), recipeHash: preparedHash }],
   };
 }
@@ -828,6 +1027,12 @@ export interface RegistrationOptions {
    * never required to satisfy tank conventions. Defaults to "generic".
    */
   profile?: "tank" | "generic";
+  /**
+   * Structured scale authority admitted at onboarding. When a dimension anchor is declared,
+   * registration mechanically verifies the actual prepared scale against it, so two agents
+   * cannot silently register different scale bases from the same source and spec.
+   */
+  scaleAuthority?: ScaleAuthority;
 }
 
 /**
@@ -922,5 +1127,35 @@ export function verifyOracleRegistration(root: THREE.Object3D, expected: Registr
     }
   }
 
+  const scaleAuthorityRow = options.scaleAuthority ? verifyScaleAuthorityRow(components, options.scaleAuthority) : null;
+  if (scaleAuthorityRow) rows.push(scaleAuthorityRow);
+
   return { schemaVersion: 1, kind: "oracle-registration", passed: rows.every((row) => row.passed), rows };
+
+}
+
+/**
+ * Mechanically verifies a declared dimension anchor against the prepared geometry. The anchor
+ * id resolves to the longest registered semantic that prefixes it (for example
+ * "hull-structural-length" anchors the hull semantics); its largest physical extent must match
+ * the admitted target within 2%. A missing or mismatching anchor fails registration instead of
+ * silently admitting an alternative scale basis.
+ */
+export function verifyScaleAuthorityRow(components: RegisteredComponent[], authority: ScaleAuthority): RegistrationEvidence["rows"][number] | null {
+  if (authority.mode !== "dimension-anchor") return null;
+  const candidates = components
+    .filter((component) => `${component.semanticId}-`.startsWith(`${authority.id}-`) || authority.id === component.semanticId || authority.id.startsWith(`${component.semanticId}-`))
+    .sort((a, b) => b.semanticId.length - a.semanticId.length);
+  const anchor = candidates[0];
+  if (!anchor) {
+    return { code: "registration.scale-authority", passed: false, expected: `${authority.id} = ${authority.target}${authority.unit}`, actual: "manual-map-required: no registered semantic matches the dimension anchor" };
+  }
+  const measured = Math.max(...anchor.box.getSize(new THREE.Vector3()).toArray());
+  const deviation = Math.abs(measured - authority.target) / authority.target;
+  return {
+    code: "registration.scale-authority",
+    passed: deviation <= 0.02,
+    expected: `${authority.id} = ${authority.target}${authority.unit}`,
+    actual: `semantic ${anchor.semanticId} measures ${measured.toFixed(4)} (${(deviation * 100).toFixed(2)}% off)`,
+  };
 }

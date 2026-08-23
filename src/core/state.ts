@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import type { CertificationLevel, GateReport, ProfileId } from "../types.js";
+import type { AuthorshipMode, CertificationLevel, GateReport, ProfileId } from "../types.js";
 import type { Route } from "./routing.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
@@ -92,6 +92,13 @@ export interface AttemptRecord {
   createdAt: string;
 }
 
+/** Binding of one trusted pipeline-generated module to the preparation it was derived from. */
+export interface DerivedBinding {
+  manifestHash: string;
+  generatedModuleHash: string;
+  oraclePreparationIdentity: string;
+}
+
 export interface TaskState {
   schemaVersion: 1;
   taskId: string;
@@ -128,6 +135,9 @@ export interface TaskState {
   visualReviewStatus: "awaiting" | "passed" | "failed";
   evidenceConfigHashes: Partial<Record<EvidenceRecord["kind"], string>>;
   phaseGeometryHashes: Record<string, string>;
+  authorshipMode: AuthorshipMode;
+  /** Trusted generated modules recorded by the derive pipeline, keyed by generated module path. */
+  derivedBindings: Record<string, DerivedBinding>;
 }
 
 function lifecycle(profile: ProfileId): { phases: string[]; dependencies: Record<string, string[]> } {
@@ -159,7 +169,7 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-export function createTaskState(input: { taskId: string; profile: ProfileId; style: string; certification?: CertificationLevel; styleContractHash?: string; projectConfigurationHash?: string; subjectContractHash?: string | null; articulationRequired?: boolean }): TaskState {
+export function createTaskState(input: { taskId: string; profile: ProfileId; style: string; certification?: CertificationLevel; styleContractHash?: string; projectConfigurationHash?: string; subjectContractHash?: string | null; articulationRequired?: boolean; authorshipMode?: AuthorshipMode }): TaskState {
   const contract = getProfileContract(input.profile);
   const styleContractHash = input.styleContractHash ?? getStyleContract(input.style).hash;
   const phases = contract.phases.map((phase) => phase.id);
@@ -199,6 +209,8 @@ export function createTaskState(input: { taskId: string; profile: ProfileId; sty
     visualReviewStatus: "awaiting",
     evidenceConfigHashes: {},
     phaseGeometryHashes: {},
+    authorshipMode: input.authorshipMode ?? "independent",
+    derivedBindings: {},
   };
 }
 
@@ -303,6 +315,9 @@ export function bindOraclePreparation(state: TaskState, preparation: OraclePrepa
   next.evaluationIdentityHash = null;
   next.locks = {};
   next.phaseGeometryHashes = {};
+  // Generated modules are bound to the preparation they were derived from; a new preparation
+  // makes every recorded derivation binding stale.
+  next.derivedBindings = {};
   next.phaseStatus = Object.fromEntries(phases.map((phase, index) => [phase, index === 0 ? "active" : "pending"]));
   next.activePhase = phases[0]!;
   next.visualReviewStatus = "awaiting";
@@ -667,6 +682,10 @@ export async function loadTaskState(path: string): Promise<TaskState> {
   state.evaluationIdentity ??= null;
   state.evaluationIdentityHash ??= null;
   state.oraclePreparation ??= null;
+  // Legacy compatibility rule: states created before derived authorship existed keep
+  // independent behavior until the project is explicitly rebound with a declared mode.
+  state.authorshipMode ??= "independent";
+  state.derivedBindings ??= {};
   const lacksEvidenceAuthority = Object.values(state.evidence).some((evidence) => evidence.valid && evidence.verified && (!evidence.authority || !evidence.generatorVersion));
   if (lacksEvidenceAuthority) {
     const contract = getProfileContract(state.profile);

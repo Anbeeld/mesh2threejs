@@ -2,7 +2,15 @@
 
 `mesh2threejs` is an agentic pipeline for recreating a reference GLB as editable, procedural Three.js code. It records the reference with provenance and hashes, measures it, guides the agent through construction and repair, renders matched comparisons, and keeps enough evidence to resume or verify the work later.
 
-It is intended for rigid hard-surface subjects such as vehicles, tanks, buildings, machines, and props. It is not a mesh converter. The finished model is independently authored from Three.js primitives, procedural geometry, transforms, materials, named parts, and real articulation controls. It does not load or embed the source mesh.
+It is intended for rigid hard-surface subjects such as vehicles, tanks, buildings, machines, and props. It is not a mesh converter.
+
+The architecture is strategy-neutral about how geometry is authored:
+
+- **source oracle at runtime** — forbidden. The finished candidate never loads or embeds `refs/oracle/*` or `.mesh2threejs/oracle/*`.
+- **source-derived build seed** — default for new 3D-oracle projects (`authorshipMode: "derived"`). Trusted pipeline tools simplify prepared-oracle geometry into generated modules under `model/.generated/`, hash-bound to the current preparation, so the agent repairs already-correct low-poly shape instead of reconstructing from zero.
+- **independent clean-room rebuild** — optional (`init ... --authorship independent`). Source topology may be measured but never reused; the agent authors everything procedurally.
+
+In both modes the hand-authored source stays under the ordinary topology-dump audit; only verified derivation manifests make dense generated modules legal.
 
 ## What to give the agent
 
@@ -99,11 +107,13 @@ node dist/cli.js status workspaces/demo
 node dist/cli.js next workspaces/demo
 node dist/cli.js onboard workspaces/demo --config path/to/onboard.json
 node dist/cli.js register workspaces/demo --config path/to/registration.json
+node dist/cli.js derive workspaces/demo
 node dist/cli.js gate workspaces/demo
 node dist/cli.js gate workspaces/demo --global
 node dist/cli.js workorders workspaces/demo
 node dist/cli.js lock workspaces/demo
 node dist/cli.js render workspaces/demo
+node dist/cli.js render workspaces/demo --phase active --quick
 node dist/cli.js review-ready workspaces/demo
 node dist/cli.js prepare-review workspaces/demo
 node dist/cli.js review-status workspaces/demo
@@ -114,7 +124,9 @@ node dist/cli.js viewer stop workspaces/demo
 node dist/cli.js finalize workspaces/demo
 ```
 
-The `onboard` configuration supplies provenance, coordinate-frame, normalization, semantic-map, and ownership facts. A declared `sourceFrame` is executable: onboarding validates it and every prepared-oracle load applies the derived source-to-canonical rotation before user normalization, so a frame declaration always transforms geometry or fails closed. A `logicalOwnership` overlay is validated as a graph (no cycles, no contradictory containment) and consumed by measurement, so a flat source hierarchy measures as logically nested. `gate` executes only the active phase and its already-locked prerequisites: future phases are neither evaluated nor recorded, a partial candidate without articulation controls can be gated until the phase that owns them, and output stays phase-local. Use `--global` for the explicit complete evaluation, which requires those controls. Tank registration additionally proves the physical canonical frame mechanically — wheel-chain spread, track-pair separation, neutral gun-forward alignment, ground contact — and locking tank registration requires an `oracle-sanity` capture board of the prepared oracle. `workorders` selects the next repair group for the active phase, and `lock` uses that phase's measured geometry and authoritative evidence by default. `render` records captures, region diagnostics, and turntable evidence. `prepare-review` builds a packet from the current workspace and checks every referenced file before an external reviewer inspects it. Low-level manifest, module, and state-file arguments remain available for scripts; run `node dist/cli.js help` for the complete command list.
+The `onboard` configuration supplies provenance, coordinate-frame, normalization, semantic-map, and ownership facts. A declared `sourceFrame` is executable: onboarding validates it and every prepared-oracle load applies the derived source-to-canonical rotation before user normalization, so a frame declaration always transforms geometry or fails closed. A `logicalOwnership` overlay is validated as a graph (no cycles, no contradictory containment) and consumed by measurement, so a flat source hierarchy measures as logically nested. An onboarded `scaleAuthority` block (a preferred dimension anchor or explicit oracle-units mode) becomes part of preparation identity and registration verifies actual scale against it. `gate` executes only the active phase and its already-locked prerequisites: future phases are neither evaluated nor recorded, a partial candidate without articulation controls can be gated until the phase that owns them, and output stays phase-local. Tank gates additionally refuse future-phase semantics in the live candidate (phase-scope check), and every failed active gate automatically feeds the attempt/stagnation state, so three equivalent no-progress failures route to diagnose without manual bookkeeping. Use `--global` for the explicit complete evaluation, which requires those controls. Tank registration additionally proves the physical canonical frame mechanically — wheel-chain spread, track-pair separation, neutral gun-forward alignment, ground contact — and locking tank registration requires an `oracle-sanity` capture board of the prepared oracle. `workorders` selects the next repair group for the active phase, and `lock` uses that phase's measured geometry and authoritative evidence by default.
+
+In derived-mode workspaces, `derive` creates the best cheap source-derived seed for the active phase: hull/turret use bounded-tier `meshoptimizer` simplification of the prepared semantic geometry (with conservative component pruning), running gear uses measured radial fits, tracks regenerate continuous courses, and gun regenerates from its measured pivot/axis/length. Tiers are selected by running the real deterministic gates; the simplest passing tier wins, otherwise the best tier is retained with failing workorders. Generated modules land in `model/.generated/` with provenance manifests under `.mesh2threejs/derived/`, are legal only while bound to the current preparation, and keep the candidate runtime-independent. `render --phase active --quick` captures side/front/perspective comparison boards as agent-only diagnostics; they record no evidence and never satisfy visual review. `render` records captures, region diagnostics, and turntable evidence. `prepare-review` builds a packet from the current workspace and checks every referenced file before an external reviewer inspects it. Low-level manifest, module, and state-file arguments remain available for scripts; run `node dist/cli.js help` for the complete command list.
 
 `project.json`, profile contracts, style contracts, and subject contracts are hash-bound to state. After an intentional configuration or referenced-contract change, run `node dist/cli.js rebind workspaces/demo`; this archives the active oracle preparation under `.mesh2threejs/oracle/archive/`, discards prior authority, and starts a clean evidence chain. Ordinary candidate edits use the normal gate/reopen lifecycle and do not require project rebinding. Oracle repair follows the same rule in place: the repaired preparation replaces the bound one, and registration plus all downstream evidence is invalidated automatically.
 
@@ -152,8 +164,10 @@ This repository is development-validated through its protected regression suite 
 
 ## Credits
 
-Tank measurement, construction, and comparison ideas were adapted from [Kevin B. Liu's Claude-of-Tanks](https://github.com/Kevin-Liu-01/Claude-of-Tanks), licensed under MIT.
+Reference-GLB oracle handling, vertex extraction/workorders, and tank gate doctrine were adapted from [Kevin B. Liu's Claude-of-Tanks](https://github.com/Kevin-Liu-01/Claude-of-Tanks), licensed under MIT.
 
-GLB intake, semantic-readiness, durable-state, and shared-rendering ideas were adapted from [img2threejs](https://github.com/img2threejs/img2threejs), licensed under Apache-2.0.
+GLB probe/readiness, durable state/render contracts, and staged pass/self-correction concepts were adapted from [img2threejs](https://github.com/img2threejs/img2threejs), licensed under Apache-2.0. Mesh simplification in derived mode uses [meshoptimizer](https://github.com/zeux/meshoptimizer), licensed under MIT.
+
+Neither upstream project supplies the derived-seed mechanism; that is a mesh2threejs-specific correction built on the observed failure modes of fully independent reconstruction. The upstream sources do not copy source geometry into their products, and mesh2threejs keeps that runtime boundary while making build-time derivation an explicit, audited strategy.
 
 This repository is MIT-licensed. [NOTICE](NOTICE) and the [upstream source map](docs/upstream-map.md) record exact audited revisions, licenses, and file-level adaptation details. Third-party reference assets keep their own licenses.

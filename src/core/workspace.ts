@@ -1,7 +1,7 @@
 import { access, copyFile, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
-import type { CertificationLevel, ProfileId } from "../types.js";
+import type { AuthorshipMode, CertificationLevel, ProfileId } from "../types.js";
 import { determineNextAction, loadTaskState, saveTaskState, createTaskState, type TaskState } from "./state.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { validateOracleManifest, validateProjectManifest, validateReferenceIndex } from "./schema.js";
@@ -30,6 +30,8 @@ export interface ProjectManifest {
   referenceMode: ReferenceMode;
   portable: boolean;
   subjectContract?: string;
+  /** Build-time authorship strategy; absent on legacy projects, which behave as "independent". */
+  authorshipMode?: AuthorshipMode;
 }
 
 export interface ReferenceRecord {
@@ -90,6 +92,7 @@ export interface InitializeWorkspaceInput {
   referenceMode?: ReferenceMode;
   model?: string;
   subjectContract?: string;
+  authorshipMode?: AuthorshipMode;
 }
 
 export interface WorkspaceLayout {
@@ -251,7 +254,7 @@ async function planCopiedReference(
   return { kind, mode: "copy", operationalPath: resolver.toProjectPath(destination), originalPath: absolute, sha256: hash, source: absolute, destination };
 }
 
-const MODEL_SCAFFOLD = `import * as THREE from "three";
+export const MODEL_SCAFFOLD = `import * as THREE from "three";
 
 export function createCandidate() {
   return new THREE.Group();
@@ -315,6 +318,9 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
   const subjectContractRecord = input.subjectContract
     ? [...records].reverse().find((record) => record.kind === "document" && record.originalPath === resolve(input.subjectContract!))
     : undefined;
+  // New 3D-oracle workspaces default to derived authorship; an explicit clean-room project
+  // declares "independent". Projects without a 3D oracle stay independent.
+  const authorshipMode: AuthorshipMode = input.authorshipMode ?? (oracleRecord ? "derived" : "independent");
   const project: ProjectManifest = {
     schemaVersion: 1,
     id: input.id,
@@ -328,6 +334,7 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
     certification: input.certification ?? "oracle-relative",
     referenceMode: mode,
     portable: records.every((record) => record.mode === "copy"),
+    authorshipMode,
     ...(subjectContractRecord ? { subjectContract: subjectContractRecord.operationalPath } : {}),
   };
   const referenceIndex: ReferenceIndex = { schemaVersion: 1, records: records.map(({ source: _source, destination: _destination, ...record }) => record) };
@@ -350,7 +357,7 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
     }
     if (!await pathExists(modelPath)) { await mkdir(dirname(modelPath), { recursive: true }); await writeFile(modelPath, MODEL_SCAFFOLD, { flag: "wx" }); created.push(modelPath); }
     await writeFile(layout.internal.references, `${JSON.stringify(referenceIndex, null, 2)}\n`, { flag: "wx" }); created.push(layout.internal.references);
-    await saveTaskState(layout.internal.state, createTaskState({ taskId: project.id, profile: project.profile, style: project.style, certification: project.certification, styleContractHash: style.hash, projectConfigurationHash: configurationHash, subjectContractHash, articulationRequired })); created.push(layout.internal.state);
+    await saveTaskState(layout.internal.state, createTaskState({ taskId: project.id, profile: project.profile, style: project.style, certification: project.certification, styleContractHash: style.hash, projectConfigurationHash: configurationHash, subjectContractHash, articulationRequired, ...(project.authorshipMode ? { authorshipMode: project.authorshipMode } : {}) })); created.push(layout.internal.state);
     await writeFile(layout.project, `${JSON.stringify(project, null, 2)}\n`, { flag: "wx" }); created.push(layout.project);
   } catch (error) {
     for (const path of created.reverse()) await rm(path, { force: true });
@@ -483,17 +490,18 @@ export async function resumeWorkspace(input: string): Promise<ResumedWorkspace> 
   const currentProjectHash = projectConfigurationHash(project, referenceIndex);
   if (!state.projectConfigurationHash) throw new Error("workspace state has no bound project configuration; run an explicit migration or rebind");
   if (state.projectConfigurationHash !== currentProjectHash || state.profile !== project.profile || state.style !== project.style || state.certification !== project.certification) throw new Error("project configuration differs from state; run an explicit migration or rebind");
+  if (state.authorshipMode !== (project.authorshipMode ?? "independent")) throw new Error("project authorship mode differs from state; run an explicit rebind to change the authorship strategy");
   if (state.profileContractHash !== profileContractHash(getProfileContract(project.profile))) throw new Error("profile contract differs from state; rebind before continuing");
   if (state.styleContractHash !== style.hash) throw new Error("style contract differs from state; rebind before continuing");
   if (state.subjectContractHash !== subjectContractHash || state.articulationRequired !== (getProfileContract(project.profile).articulation.length > 0 || Boolean(subjectContractValue?.articulation?.length))) throw new Error("subject articulation contract differs from state; rebind before continuing");
   return { root, layout: resolver.layout, project, references: referenceIndex, state, styleContract: style.contract, styleContractHash: style.hash, resolved: { oracle, model, images: resolveListed(project.images, "image"), documents: resolveListed(project.documents, "document"), ...(subjectContract ? { subjectContract } : {}) }, nextAction: determineNextAction(state) };
 }
 
-export async function verifyWorkspaceCandidateIdentity(workspace: ResumedWorkspace): Promise<CandidateIdentity> {
+export async function verifyWorkspaceCandidateIdentity(workspace: ResumedWorkspace, auditOptions?: import("./candidate.js").CandidateAuditOptions): Promise<CandidateIdentity> {
   const subjectContract = workspace.resolved.subjectContract
     ? JSON.parse(await readFile(workspace.resolved.subjectContract, "utf8")) as GenericSubjectContract
     : undefined;
-  return inspectCandidateIdentity(workspace.resolved.model, neutralPoseForProfile(workspace.project.profile, subjectContract));
+  return inspectCandidateIdentity(workspace.resolved.model, neutralPoseForProfile(workspace.project.profile, subjectContract), auditOptions);
 }
 
 /** Explicitly starts a new evidence chain for the current project and reference bytes. */
@@ -529,6 +537,7 @@ export async function rebindWorkspace(input: string): Promise<ResumedWorkspace> 
     projectConfigurationHash: projectConfigurationHash(project, reboundReferences),
     subjectContractHash: optionalContractHash(subjectContract),
     articulationRequired: getProfileContract(project.profile).articulation.length > 0 || Boolean(subjectContract?.articulation?.length),
+    ...(project.authorshipMode ? { authorshipMode: project.authorshipMode } : {}),
   });
   next.systemDecisions.push({ id: "workspace-rebind", value: next.projectConfigurationHash, reason: "explicit rebind started a new evidence chain for current project configuration and reference bytes" });
   const archivedPreparation = await archiveWorkspacePreparation(root);
@@ -592,6 +601,11 @@ export async function migrateWorkspace(directory: string, options: { oracle?: st
     await rm(resolver.layout.model, { recursive: true, force: true });
     throw error;
   }
+  // Migrated legacy workspaces keep clean-room behavior: their project and durable state use
+  // independent authorship regardless of the oracle-present default for new workspaces.
+  initialized.project.authorshipMode = "independent";
+  const migratedConfigurationHash = projectConfigurationHash(initialized.project, initialized.references);
+  await writeFile(initialized.layout.project, `${JSON.stringify(initialized.project, null, 2)}\n`);
   for (const evidence of Object.values(legacyState.evidence)) evidence.artifact = rebaseEvidencePath(evidence.artifact, root, resolver);
   for (const lock of Object.values(legacyState.locks)) for (const evidence of lock.evidence) evidence.artifact = rebaseEvidencePath(evidence.artifact, root, resolver);
   legacyState.oracleHash = null;
@@ -611,7 +625,7 @@ export async function migrateWorkspace(directory: string, options: { oracle?: st
   legacyState.certification = initializedState.certification;
   legacyState.profileContractHash = initializedState.profileContractHash;
   legacyState.styleContractHash = initializedState.styleContractHash;
-  legacyState.projectConfigurationHash = initializedState.projectConfigurationHash;
+  legacyState.projectConfigurationHash = migratedConfigurationHash;
   legacyState.systemDecisions.push({ id: "workspace-layout-migration", value: "oracle-revalidation-required", reason: "reference paths changed during migration; historical evidence was retained but invalidated" });
   await saveTaskState(resolver.layout.internal.state, legacyState);
   for (const name of ["evidence", "reports", "captures", "visual-review"] as const) {

@@ -40,7 +40,30 @@
       },
       "additionalProperties": false
     },
-    "logicalOwnership": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } }
+    "logicalOwnership": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
+    "scaleAuthority": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": ["mode"],
+          "properties": { "mode": { "const": "oracle-units" } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode", "id", "target", "unit"],
+          "properties": {
+            "mode": { "const": "dimension-anchor" },
+            "id": { "type": "string", "minLength": 1 },
+            "target": { "type": "number", "exclusiveMinimum": 0 },
+            "unit": { "const": "m" },
+            "source": { "type": "string" },
+            "locator": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
   },
   "$defs": {
     "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },

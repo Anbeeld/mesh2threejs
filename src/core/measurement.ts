@@ -501,11 +501,19 @@ export function extractPrincipalPlanes(snapshot: SceneSnapshot, options: Princip
     if (cross < 1e-12) return;
     const area = cross / 2;
     nx /= cross; ny /= cross; nz /= cross;
-    // Snap floating-point noise on near-degenerate components so canonical orientation and
-    // quantized buckets are stable across tessellations.
-    nx = Math.abs(nx) < 1e-6 ? 0 : nx; ny = Math.abs(ny) < 1e-6 ? 0 : ny; nz = Math.abs(nz) < 1e-6 ? 0 : nz;
-    // Canonicalize orientation so opposite-facing coincident planes merge.
-    if (ny < 0 || (Math.abs(ny) < 1e-12 && (nx < 0 || (Math.abs(nx) < 1e-12 && nz < 0)))) { nx = -nx; ny = -ny; nz = -nz; }
+    // Canonicalize unoriented plane normals by dominant axis: n and -n deterministically
+    // map to the same orientation without relying on tiny secondary components that
+    // float32 noise can flip. This keeps vertical hull sides from splitting into +X/-X.
+    {
+      const absNx = Math.abs(nx);
+      const absNy = Math.abs(ny);
+      const absNz = Math.abs(nz);
+      let dominant = 0;
+      if (absNy > absNx && absNy >= absNz) dominant = 1;
+      else if (absNz > absNx && absNz > absNy) dominant = 2;
+      const dominantValue = dominant === 0 ? nx : dominant === 1 ? ny : nz;
+      if (dominantValue < 0) { nx = -nx; ny = -ny; nz = -nz; }
+    }
     const centroid: Point3 = [(a[0]! + b[0]! + c[0]!) / 3, (a[1]! + b[1]! + c[1]!) / 3, (a[2]! + b[2]! + c[2]!) / 3];
     const offset = -(nx * a[0]! + ny * a[1]! + nz * a[2]!);
     const grid = 12;
@@ -573,8 +581,16 @@ export function extractPrincipalPlanes(snapshot: SceneSnapshot, options: Princip
       const cross = Math.hypot(nx, ny, nz);
       if (cross < 1e-12) return;
       nx /= cross; ny /= cross; nz /= cross;
-      nx = Math.abs(nx) < 1e-6 ? 0 : nx; ny = Math.abs(ny) < 1e-6 ? 0 : ny; nz = Math.abs(nz) < 1e-6 ? 0 : nz;
-      if (ny < 0 || (Math.abs(ny) < 1e-12 && (nx < 0 || (Math.abs(nx) < 1e-12 && nz < 0)))) { nx = -nx; ny = -ny; nz = -nz; }
+      {
+        const absNx = Math.abs(nx);
+        const absNy = Math.abs(ny);
+        const absNz = Math.abs(nz);
+        let dominant = 0;
+        if (absNy > absNx && absNy >= absNz) dominant = 1;
+        else if (absNz > absNx && absNz > absNy) dominant = 2;
+        const dv = dominant === 0 ? nx : dominant === 1 ? ny : nz;
+        if (dv < 0) { nx = -nx; ny = -ny; nz = -nz; }
+      }
       if (nx * draft.nx + ny * draft.ny + nz * draft.nz < angularCosLocal) return;
       const offset = -(nx * a[0]! + ny * a[1]! + nz * a[2]!);
       if (Math.abs(draft.offset - offset) > offsetTolerance) return;

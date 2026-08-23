@@ -10,6 +10,19 @@ export interface CandidateAudit {
   findings: Array<{ code: string; message: string }>;
 }
 
+/** Findings that a verified pipeline-generated module is allowed to carry: density itself is expected tool output. */
+const GENERATED_WAIVABLE_FINDINGS = new Set(["dense-binary-payload", "topology-dump", "opaque-topology-payload"]);
+
+export interface CandidateAuditOptions {
+  /**
+   * Verified derivation manifests keyed by ABSOLUTE generated-module path, produced by the
+   * workspace derivation loader for the CURRENT oracle preparation. Files in this map are
+   * audited as trusted pipeline output (density waived); everything else remains subject to
+   * the ordinary hand-authored topology restrictions.
+   */
+  trustedGeneratedModules?: ReadonlyMap<string, unknown>;
+}
+
 export interface CandidateSourceFile {
   path: string;
   sha256: string;
@@ -19,6 +32,8 @@ export interface CandidateModuleAudit extends CandidateAudit {
   files: string[];
   candidateFiles: CandidateSourceFile[];
   sourceHash: string;
+  /** Absolute paths audited as trusted pipeline-generated modules via verified derivation manifests. */
+  trustedGeneratedModules: string[];
 }
 
 export interface CandidateIdentity {
@@ -48,6 +63,12 @@ export function auditCandidateSource(source: string): CandidateAudit {
   const typedArrayElements = [...source.matchAll(/new\s+(?:Float32|Uint16|Uint32)Array\s*\(\s*\[([\s\S]*?)\]/gu)].reduce((sum, m) => sum + (m[1]?.split(",").filter((s) => s.trim()).length ?? 0), 0);
   const hasDensePayload = /(?:Buffer\.from|atob)\s*\([^,)]{256,}(?:base64|["'])/isu.test(source) || typedArrayElements > 5000;
   if (hasDensePayload) findings.push({ code: "dense-binary-payload", message: "candidate contains a dense binary/topology payload" });
+  // Opaque encoded-topology route: very large hex/base64-like string literals decoded at
+  // runtime into geometry (the demonstrated evasion encodes hull vertices as HULL_HEX and
+  // feeds them through DataView into a BufferGeometry). Detection is deliberately narrow:
+  // unbroken hex/base64-ish literals of the size only encoded topology produces.
+  const opaqueLiteral = /["'](?:[0-9a-fA-F]{1024,}|[A-Za-z0-9+/=]{2048,})["']/u.test(source);
+  if (opaqueLiteral) findings.push({ code: "opaque-topology-payload", message: "candidate embeds and decodes a large opaque hex/base64-like payload" });
   const numericLiteralCount = (source.match(/(?:^|[,[\s])-?\d+(?:\.\d+)?(?=\s*[,\]])/gu) ?? []).length;
   if (numericLiteralCount > 2000 || typedArrayElements > 20000) {
     findings.push({ code: "topology-dump", message: `candidate contains ${numericLiteralCount} numeric literals / ${typedArrayElements} typed elements, consistent with a topology dump` });
@@ -55,17 +76,27 @@ export function auditCandidateSource(source: string): CandidateAudit {
   return { passed: findings.length === 0, findings };
 }
 
-export async function auditCandidateModule(entryPath: string): Promise<CandidateModuleAudit> {
+export async function auditCandidateModule(entryPath: string, options: CandidateAuditOptions = {}): Promise<CandidateModuleAudit> {
   const visited = new Set<string>();
   const sources = new Map<string, string>();
   const findings: CandidateAudit["findings"] = [];
+  const trusted = options.trustedGeneratedModules ?? new Map<string, unknown>();
+  const trustedGeneratedModules: string[] = [];
   const visit = async (path: string): Promise<void> => {
     const absolute = resolve(path);
     if (visited.has(absolute)) return;
     visited.add(absolute);
     const source = await readFile(absolute, "utf8");
     sources.set(absolute, source);
-    findings.push(...auditCandidateSource(source).findings.map((finding) => ({ ...finding, message: `${absolute}: ${finding.message}` })));
+    const fileFindings = auditCandidateSource(source).findings;
+    if (trusted.has(absolute)) {
+      // Verified derivation manifest bound to the current preparation: this file is pipeline
+      // tool output, so density findings are waived while structural/security ones remain.
+      trustedGeneratedModules.push(absolute);
+      findings.push(...fileFindings.filter((finding) => !GENERATED_WAIVABLE_FINDINGS.has(finding.code)).map((finding) => ({ ...finding, message: `${absolute}: ${finding.message}` })));
+    } else {
+      findings.push(...fileFindings.map((finding) => ({ ...finding, message: `${absolute}: ${finding.message}` })));
+    }
     // Candidate-local imports must be static. The staged source graph is removed once the module is instantiated,
     // so a dynamic import inside createCandidate()/setPose() would resolve into a deleted directory and produce
     // runtime behavior that the audited bytes do not determine.
@@ -93,7 +124,7 @@ export async function auditCandidateModule(entryPath: string): Promise<Candidate
     sha256: sha256(sources.get(file) ?? ""),
   }));
   const sourceHash = sha256(canonicalJson(candidateFiles));
-  return { passed: findings.length === 0, findings, files, candidateFiles, sourceHash };
+  return { passed: findings.length === 0, findings, files, candidateFiles, sourceHash, trustedGeneratedModules };
 }
 
 function commonAncestor(files: string[]): string {
@@ -169,8 +200,8 @@ export async function loadCandidateRuntime(path: string, suppliedAudit?: Candida
   return { root: built, sourceHash, setPose: () => { throw new Error("candidate does not expose physical articulation controls"); } };
 }
 
-export async function inspectCandidateIdentity(path: string, neutralPose: Record<string, number> = {}): Promise<CandidateIdentity> {
-  const audit = await auditCandidateModule(path);
+export async function inspectCandidateIdentity(path: string, neutralPose: Record<string, number> = {}, auditOptions?: CandidateAuditOptions): Promise<CandidateIdentity> {
+  const audit = await auditCandidateModule(path, auditOptions);
   const runtime = await loadCandidateRuntime(path, audit);
   if (Object.keys(neutralPose).length) await runtime.setPose(neutralPose);
   runtime.root.updateMatrixWorld(true);

@@ -4,6 +4,13 @@ export type Point3 = [number, number, number];
 export type Axis = "x" | "y" | "z";
 export type ProfileId = "tank" | "generic";
 export type CertificationLevel = "exact-real" | "oracle-relative";
+/**
+ * Build-time authorship strategy. "derived" permits pipeline tools to simplify prepared-oracle
+ * geometry into trusted generated seed modules; "independent" forbids any build-time reuse of
+ * source topology. Both modes share the same runtime invariant: the candidate never loads the
+ * oracle at runtime. A missing field on legacy projects/states behaves as "independent".
+ */
+export type AuthorshipMode = "derived" | "independent";
 export type CapturePass =
   | "beauty"
   | "alpha-silhouette"

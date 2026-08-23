@@ -16,7 +16,8 @@
     "certification": { "enum": ["exact-real", "oracle-relative"] },
     "referenceMode": { "enum": ["copy", "external"] },
     "portable": { "type": "boolean" },
-    "subjectContract": { "type": "string", "minLength": 1 }
+    "subjectContract": { "type": "string", "minLength": 1 },
+    "authorshipMode": { "enum": ["derived", "independent"] }
   },
   "additionalProperties": false
 }

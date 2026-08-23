@@ -16,11 +16,14 @@ import { getProfileContract, profileContractHash } from "./core/contracts.js";
 import { inspectAllUpstreamDrift } from "./core/upstream.js";
 import type { GenericSubjectContract } from "./profiles/generic.js";
 import { awaitingVisualReview, createVisualReviewPacket, verifyVisualReviewPacketFiles, verifyVisualReviewVerdict, type ReviewFileReference, type VisualReviewPacket, type VisualReviewVerdict } from "./core/review.js";
-import { performRenderRun, performOracleSanityRun, verifyLatestOracleSanity } from "./core/workspace-render.js";
+import { performRenderRun, performOracleSanityRun, performQuickDiagnosticRun, verifyLatestOracleSanity } from "./core/workspace-render.js";
 import { startViewer, stopViewer, viewerStatus } from "./viewer/manager.js";
 import { selectRepairGroup } from "./core/compare.js";
 import { createEvaluationIdentity, EVALUATOR_VERSION, evaluationIdentityHash, MEASUREMENT_VERSION, optionalContractHash } from "./core/identity.js";
 import { loadStyleContract } from "./styles/low-poly.js";
+import { derivePhaseSeed, trustedGeneratedAuditOptions } from "./core/derive.js";
+import { snapshotScene } from "./core/geometry.js";
+import type { TaskState } from "./core/state.js";
 
 interface CliIo {
   stdout: (value: string) => void;
@@ -48,7 +51,7 @@ function parseOptions(args: string[]): { positional: string[]; options: Record<s
       continue;
     }
     const key = value.slice(2);
-    if (key === "global") {
+    if (key === "global" || key === "quick") {
       flags.add(key);
       continue;
     }
@@ -82,6 +85,45 @@ function workspacePath(path: string, root?: string): string {
 function storedArtifactPath(path: string, root?: string): string {
   if (!root) return path;
   try { return createWorkspaceResolver(root).toProjectPath(path); } catch { return resolve(path); }
+}
+
+/**
+ * Cumulative active-phase semantic scope for the tank profile: a phase may carry its own
+ * semantics plus everything earlier phases legitimately contributed. Future-phase geometry
+ * (a box turret parked in a hull-phase candidate) is refused with a phase-scope error before
+ * any gate runs, so placeholders cannot survive merely by being ignored by active gates.
+ */
+const TANK_PHASE_SEMANTIC_SCOPE: Record<string, (id: string) => boolean> = {
+  hull: (id) => /^hull/u.test(id),
+  turret: (id) => /^hull/u.test(id) || id === "turret" || id === "turret-pivot",
+  gun: (id) => (/^hull/u.test(id) || id === "turret" || id === "turret-pivot" || id === "gun" || id === "gun-pivot"),
+  "running-gear": (id) => (/^hull/u.test(id) || id === "turret" || id === "turret-pivot" || id === "gun" || id === "gun-pivot" || /^(road-wheel|sprocket|idler|return-roller)/u.test(id)),
+  tracks: (id) => (/^hull/u.test(id) || id === "turret" || id === "turret-pivot" || id === "gun" || id === "gun-pivot" || /^(road-wheel|sprocket|idler|return-roller|track)/u.test(id)),
+};
+
+export function assertPhaseSemanticScope(profile: ProfileId, activePhase: string | undefined, root: import("three").Object3D): void {
+  if (profile !== "tank" || !activePhase) return;
+  const allows = TANK_PHASE_SEMANTIC_SCOPE[activePhase];
+  if (!allows) return; // fittings-articulation and later phases admit remaining semantics.
+  const snapshot = snapshotScene(root);
+  const violations = Object.keys(snapshot.components).filter((id) => !allows(id));
+  if (violations.length) throw new Error(`phase-scope violation: active phase ${activePhase} does not permit future-phase semantics ${violations.join(", ")}; remove the placeholder or advance to that phase first`);
+}
+
+/**
+ * Automatically feeds every failed active-phase gate into the existing attempt/stagnation
+ * machinery so three equivalent no-progress failures route to diagnose without the agent
+ * having to remember manual bookkeeping.
+ */
+async function recordFailedGateAttempt(statePath: string, state: TaskState, phase: string, report: { rows: Array<{ code: string; passed: boolean }>; score?: number } | undefined): Promise<TaskState> {
+  const failingCodes = (report?.rows ?? []).filter((row) => !row.passed).map((row) => row.code).sort();
+  const next = recordAttempt(state, {
+    action: `gate:${phase}`,
+    evidenceHash: sha256(canonicalJson({ phase, failingCodes })),
+    score: report ? report.score ?? 0 : 0,
+  });
+  await saveTaskState(statePath, next);
+  return next;
 }
 
 async function optionalWorkspace(input: string): Promise<Awaited<ReturnType<typeof resumeWorkspace>> | undefined> {
@@ -128,7 +170,7 @@ async function latestSequentialFile(parent: string, prefix: string): Promise<str
 }
 
 const HELP = `mesh2threejs commands:
-  init WORKSPACE --id ID --goal TEXT --profile tank|generic [--ref PATH ...] [--oracle GLB] [--reference-mode copy|external]
+  init WORKSPACE --id ID --goal TEXT --profile tank|generic [--ref PATH ...] [--oracle GLB] [--reference-mode copy|external] [--authorship derived|independent]
   migrate WORKSPACE [--oracle GLB] [--reference-mode copy|external]
   rebind WORKSPACE
   status WORKSPACE|STATE.json
@@ -156,9 +198,10 @@ const HELP = `mesh2threejs commands:
   register --manifest manifest.json --config expectation.json [--profile tank|generic] [--out evidence.json]
   oracle-sanity WORKSPACE
   audit-candidate MODULE
+  derive WORKSPACE [--quality aggressive|balanced|conservative]
   gate WORKSPACE [--global]
   gate --oracle manifest.json --candidate MODULE --profile tank|generic [--out report.json]
-  render WORKSPACE
+  render WORKSPACE [--phase active --quick]
   render --oracle manifest.json --candidate MODULE --out-dir DIR
   review-ready WORKSPACE [--renderer auto|deterministic-cpu|three-webgl]
   viewer start WORKSPACE [--port N|auto]
@@ -186,6 +229,8 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         if (!workspace) throw new Error("init requires a workspace path");
         const referenceMode = parsed.options["reference-mode"] ?? "copy";
         if (referenceMode !== "copy" && referenceMode !== "external") throw new Error("--reference-mode must be copy or external");
+        const authorship = parsed.options.authorship;
+        if (authorship !== undefined && authorship !== "derived" && authorship !== "independent") throw new Error("--authorship must be derived or independent");
         const result = await initializeWorkspace(workspace, {
           id: required(parsed.options, "id"),
           goal: required(parsed.options, "goal"),
@@ -199,6 +244,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           referenceMode,
           ...(parsed.options.model ? { model: parsed.options.model } : {}),
           ...(parsed.options["subject-contract"] ? { subjectContract: parsed.options["subject-contract"] } : {}),
+          ...(authorship ? { authorshipMode: authorship } : {}),
         });
         io.stdout(json({ status: "initialized", taskId: required(parsed.options, "id"), ...result }));
         return 0;
@@ -338,7 +384,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           const renderManifestPath = await latestRunFile(workspace.layout.internal.captures, "render", "render-manifest.json");
           const renderManifest = JSON.parse(await readFile(renderManifestPath, "utf8")) as { oracleHash: string; candidateHash: string; styleContractHash: string; evaluationIdentityHash: string; captures: Array<{ path: string; sha256: string; pass: string; cameraId: string }>; comparisonBoards: Array<{ path: string; sha256: string }>; turntable: Array<{ path: string; sha256: string }>; regionDiagnostics?: { path: string; sha256: string } };
           const state = await loadTaskState(workspace.layout.internal.state);
-          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace);
+          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
           if (liveCandidate.candidateHash !== state.candidateHash || liveCandidate.candidateHash !== renderManifest.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
           if (state.oracleHash !== renderManifest.oracleHash || state.candidateHash !== renderManifest.candidateHash || state.styleContractHash !== renderManifest.styleContractHash || state.evaluationIdentityHash !== renderManifest.evaluationIdentityHash) throw new Error("latest render manifest is stale for the workspace state or evaluation configuration");
           const currentEvidence = Object.values(state.evidence).filter((item) => item.valid && item.verified && item.passed && isAuthoritativeEvidence(item) && (item.kind === "registration" || item.candidateHash === state.candidateHash));
@@ -423,7 +469,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         if (target.workspaceRoot) {
           const workspace = await resumeWorkspace(target.workspaceRoot);
           if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
-          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace);
+          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
           if (liveCandidate.candidateHash !== state.candidateHash || liveCandidate.candidateHash !== packet.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
         }
         if (state.oracleHash !== packet.oracleHash || state.candidateHash !== packet.candidateHash || state.profileContractHash !== packet.profileContractHash || state.styleContractHash !== packet.styleContractHash || state.evaluationIdentityHash !== packet.evaluationIdentityHash) throw new Error("visual review is bound to stale state or evaluation configuration");
@@ -521,7 +567,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const registrationProfile = (workspace?.project.profile ?? parsed.options.profile) as "tank" | "generic" | undefined;
         if (registrationProfile !== undefined && registrationProfile !== "tank" && registrationProfile !== "generic") throw new Error("--profile must be tank or generic");
         const oracle = await loadPreparedOracle(manifest, workspace?.root);
-        const evidence = verifyOracleRegistration(oracle, expectation, { ...(registrationProfile ? { profile: registrationProfile } : {}) });
+        const evidence = verifyOracleRegistration(oracle, expectation, { ...(registrationProfile ? { profile: registrationProfile } : {}), ...(manifest.scaleAuthority ? { scaleAuthority: manifest.scaleAuthority } : {}) });
         const rendered = `${json(evidence)}\n`;
         const registrationRun = workspace ? await createRunDirectory(workspace.layout.internal.evidence, "registration") : undefined;
         const reportPath = registrationRun ? join(workspace!.layout.internal.reports, `${registrationRun.id}.json`) : (parsed.options.out ? resolve(parsed.options.out) : undefined);
@@ -567,6 +613,15 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         io.stdout(json(result));
         return result.passed ? 0 : 3;
       }
+      case "derive": {
+        const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
+        if (!workspaceInput) throw new Error("derive requires a workspace path");
+        const quality = parsed.options.quality;
+        if (quality !== undefined && !["aggressive", "balanced", "conservative"].includes(quality)) throw new Error("--quality must be aggressive, balanced, or conservative");
+        const result = await derivePhaseSeed(workspaceInput, { ...(quality ? { quality: quality as "aggressive" | "balanced" | "conservative" } : {}) });
+        io.stdout(json({ status: result.status, phase: result.phase, operator: result.operator, tiers: result.tiers, ...(result.generatedModule ? { generatedModule: result.generatedModule } : {}), ...(result.manifest ? { manifest: result.manifest } : {}), ...(result.selected ? { selected: result.selected } : {}), wiring: result.wiring ?? undefined, ...(result.note ? { note: result.note } : {}) }));
+        return result.status === "seed-passing" ? 0 : 4;
+      }
       case "gate": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
@@ -593,7 +648,9 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         // inspected without applying articulation controls unless this gate actually evaluates
         // the phase that owns them.
         const needsNeutralPose = !activePhase || isGlobal || profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === activePhase);
-        const candidateIdentity = await inspectCandidateIdentity(candidatePath, needsNeutralPose ? neutralPoseForProfile(profile, subjectContract) : {});
+        const candidateAuditOptions = workspace ? await trustedGeneratedAuditOptions(workspace, preparationIdentity) : undefined;
+        const candidateIdentity = await inspectCandidateIdentity(candidatePath, needsNeutralPose ? neutralPoseForProfile(profile, subjectContract) : {}, candidateAuditOptions);
+        if (workspace && !isGlobal) assertPhaseSemanticScope(profile, activePhase, candidateIdentity.runtime.root);
         const candidateFiles = candidateIdentity.candidateFiles;
         const certification = workspace?.state.certification ?? (manifest.authoritativeDimensions ? "exact-real" : "oracle-relative");
         const selectedStyle = workspace ? { contract: workspace.styleContract, hash: workspace.styleContractHash } : await loadStyleContract(parsed.options.style ?? "low-poly-faithful");
@@ -649,6 +706,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         if (reportPath) { await mkdir(dirname(reportPath), { recursive: true }); await writeFile(reportPath, rendered, { flag: "wx" }); }
         const stateOption = workspace?.layout.internal.state ?? parsed.options.state;
         const artifactOption = workspace?.layout.internal.evidence ?? parsed.options["artifact-dir"];
+        let postGateState: TaskState | undefined;
         if (stateOption || artifactOption) {
           if (!stateOption || !artifactOption) throw new Error("gate state recording requires both --state and --artifact-dir");
           const statePath = resolve(stateOption);
@@ -678,9 +736,17 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
             state = recordEvidenceArtifact(state, storedArtifactPath(artifactPath, workspace?.root), artifact);
           }
           await saveTaskState(statePath, state);
+          postGateState = state;
         }
         if (workspace) {
           const outcome = workspaceGateOutcome(evaluation, workspace.state.activePhase);
+          // A failed active-phase gate is automatically an attempt record: three equivalent
+          // no-progress failures now reach diagnose without manual `attempt` bookkeeping.
+          if (!isGlobal && !outcome.activePhasePassed && postGateState) {
+            const activeReport = evaluation.phaseGates[workspace.state.activePhase];
+            const updated = await recordFailedGateAttempt(resolve(workspace.layout.internal.state), postGateState, workspace.state.activePhase, activeReport ? { rows: activeReport.rows, score: activeReport.score } : undefined);
+            postGateState = updated;
+          }
           if (!isGlobal) {
             const active = workspace.state.activePhase;
             const activeReport = evaluation.phaseGates[active];
@@ -713,6 +779,25 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "render": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
+        if (parsed.flags.has("quick")) {
+          if (!workspace) throw new Error("render --quick requires a workspace path");
+          const requestedPhase = parsed.options.phase;
+          if (requestedPhase && requestedPhase !== "active") throw new Error("--phase must be \"active\" for quick diagnostics");
+          const manifestQuick = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
+          const oracleQuick = await loadPreparedOracle(manifestQuick, workspace.root);
+          const candidateIdentityQuick = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
+          if (candidateIdentityQuick.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before rendering");
+          const resultQuick = await performQuickDiagnosticRun(workspace, manifestQuick, oracleQuick, candidateIdentityQuick, candidateIdentityQuick.runtime.root);
+          io.stdout(json({
+            status: "quick-diagnostic-captured",
+            directory: storedArtifactPath(resultQuick.directory, workspace.root),
+            manifest: storedArtifactPath(resultQuick.manifestPath, workspace.root),
+            views: ["side", "front", "perspective"],
+            boards: resultQuick.boards.map((board) => storedArtifactPath(board.path, workspace.root)),
+            note: "builder diagnostic only; never satisfies visual.review and records no evidence",
+          }));
+          return 0;
+        }
         let manifest: OracleManifest;
         if (workspace) {
           manifest = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
@@ -721,7 +806,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
         }
         const oracle = await loadPreparedOracle(manifest, workspace?.root);
-        const candidateIdentity = workspace ? await verifyWorkspaceCandidateIdentity(workspace) : await inspectCandidateIdentity(resolve(required(parsed.options, "candidate")));
+        const candidateIdentity = workspace ? await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace)) : await inspectCandidateIdentity(resolve(required(parsed.options, "candidate")));
         if (workspace && candidateIdentity.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before rendering");
         const renderRun = workspace ? await createRunDirectory(workspace.layout.internal.captures, "render") : undefined;
         const directory = renderRun?.path ?? resolve(required(parsed.options, "out-dir"));
@@ -748,7 +833,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const workspace = await resumeWorkspace(workspaceInput);
         const manifest = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
         const oracle = await loadPreparedOracle(manifest, workspace.root);
-        const candidateIdentity = await verifyWorkspaceCandidateIdentity(workspace);
+        const candidateIdentity = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
         if (candidateIdentity.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before handing off user-review captures");
         const renderRun = await createRunDirectory(workspace.layout.internal.captures, "render");
         const result = await performRenderRun({
@@ -838,7 +923,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         if (target.workspaceRoot) {
           const workspace = await resumeWorkspace(target.workspaceRoot);
           if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
-          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace);
+          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
           if (liveCandidate.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
         }
         const certified = await certifyStateFromArtifacts(await loadTaskState(target.statePath), target.workspaceRoot);

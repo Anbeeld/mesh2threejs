@@ -4,6 +4,8 @@ export * from "./core/calibration.js";
 export * from "./core/cache.js";
 export * from "./core/compare.js";
 export * from "./core/contracts.js";
+export * from "./core/derive.js";
+export * from "./core/derivation.js";
 export * from "./core/replay.js";
 export * from "./core/geometry.js";
 export * from "./core/hashing.js";

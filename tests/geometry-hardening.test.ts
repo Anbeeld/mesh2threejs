@@ -91,11 +91,11 @@ describe("hull contiguity contact graph", () => {
     expect(report.rows.find((row) => row.code === "hull.contiguity")?.passed).toBe(true);
   });
 
-  test("two disconnected hull clusters fail the contact graph", () => {
+  test("two disconnected hull clusters fail against the contiguous oracle", () => {
     const candidate = snapshotScene(plateChain(10, 0.55, 4));
     const report = evaluateTankProfile(snapshotScene(createSlopedTank()), candidate, { certification: "oracle-relative" });
     expect(report.rows.find((row) => row.code === "hull.contiguity")?.passed).toBe(false);
-    expect(report.rows.find((row) => row.code === "hull.contiguity")?.message).toMatch(/disconnected clusters/i);
+    expect(report.rows.find((row) => row.code === "hull.contiguity")?.message).toMatch(/unexplained pieces|no significant oracle counterpart/iu);
   });
 
   test("one semantic id containing two islands fails internally", () => {

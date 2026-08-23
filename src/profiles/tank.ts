@@ -393,49 +393,204 @@ function surfacesWithinTolerance(snapshot: SceneSnapshot, a: string, b: string, 
   return true;
 }
 
-function hullContiguityRow(candidate: SceneSnapshot): GateRow {
-  const hullIds = Object.keys(candidate.components).filter((id) => isHullId(id) && candidate.components[id]!.triangleIndices.length > 0);
-  if (!hullIds.length) {
-    const marker = Object.keys(candidate.components).find(isHullId);
-    return { code: "hull.contiguity", phase: "hull", component: "hull", passed: false, score: 0, severity: "critical", message: marker ? `hull component ${marker} carries no geometry` : "hull missing" };
+/** A geometric connected piece of one or more hull semantic components, characterized physically. */
+interface HullIsland {
+  triangleCount: number;
+  area: number;
+  bounds: Bounds3;
+  centroid: Point3;
+}
+
+/**
+ * Splits hull geometry into geometric connected pieces by welding shared vertices across all
+ * hull semantics at once. Characterization is physical — surface area, bounds, centroid — so
+ * tessellation density plays no part.
+ */
+function hullGeometricIslands(snapshot: SceneSnapshot): HullIsland[] {
+  const owners = new Map<string, number>();
+  const trianglesByComponent = new Map<string, Array<{ points: [Point3, Point3, Point3] }>>();
+  for (const component of Object.values(snapshot.components)) {
+    if (!isHullId(component.id) || !component.triangleIndices.length) continue;
+    const list: Array<{ points: [Point3, Point3, Point3] }> = [];
+    for (const localIndex of component.triangleIndices) {
+      const offset = localIndex * 9;
+      const read = (vertex: number): Point3 => [
+        snapshot.triangleData.positions[offset + vertex * 3]!,
+        snapshot.triangleData.positions[offset + vertex * 3 + 1]!,
+        snapshot.triangleData.positions[offset + vertex * 3 + 2]!,
+      ];
+      list.push({ points: [read(0), read(1), read(2)] });
+    }
+    trianglesByComponent.set(component.id, list);
   }
-  // Per-component internal islands remain a failure: one semantic id must be one physical piece.
-  const islandFailures = hullIds.filter((id) => countConnectedIslands(candidate, id) !== 1);
-  if (islandFailures.length) {
-    return { code: "hull.contiguity", phase: "hull", component: "hull", passed: false, score: 0, severity: "critical", message: `hull components contain disconnected internal islands: ${islandFailures.join(", ")}` };
-  }
-  if (hullIds.length === 1) {
-    return { code: "hull.contiguity", phase: "hull", component: "hull", passed: true, score: 100, severity: "critical", message: "hull is contiguous" };
-  }
-  // Contact-graph authority across components: neighboring plates may form a connected chain
-  // while distant plates never touch each other. Only graph connectivity is required. AABB
-  // proximity is only a broad phase — an edge additionally requires that no informative
-  // separating axis (canonical axes plus the centroid-connecting direction) splits the surface
-  // point clouds beyond the fabrication tolerance, so diagonally displaced pieces with
-  // overlapping envelopes cannot fake a connection.
-  const tolerance = Math.max(0.005 * measureBounds(candidate, isHullComponent).size[2], 1e-4);
-  const parent = new Int32Array(hullIds.length);
+  const parent = new Int32Array([...trianglesByComponent.values()].reduce((sum, list) => sum + list.length, 0));
   for (let index = 0; index < parent.length; index += 1) parent[index] = index;
   const find = (value: number): number => { let root = value; while (parent[root] !== root) root = parent[root]!; while (parent[value] !== value) { const next = parent[value]!; parent[value] = root; value = next; } return root; };
   const union = (a: number, b: number): void => { const ra = find(a); const rb = find(b); if (ra !== rb) parent[rb] = ra; };
-  for (let i = 0; i < hullIds.length; i += 1) {
-    for (let j = i + 1; j < hullIds.length; j += 1) {
-      const gap = boundsGap(candidate.components[hullIds[i]!]!.bounds, candidate.components[hullIds[j]!]!.bounds);
-      if (gap <= tolerance && surfacesWithinTolerance(candidate, hullIds[i]!, hullIds[j]!, tolerance)) union(i, j);
+  let cursor = 0;
+  const indexRanges = new Map<string, [number, number]>();
+  for (const [id, list] of trianglesByComponent) {
+    indexRanges.set(id, [cursor, cursor + list.length]);
+    for (const triangle of list) {
+      for (const point of triangle.points) {
+        const key = point.map((value) => value.toFixed(7)).join(",");
+        const owner = owners.get(key);
+        if (owner === undefined) owners.set(key, cursor);
+        else union(owner, cursor);
+      }
+      cursor += 1;
     }
   }
-  const clusters = new Set(hullIds.map((_, index) => find(index)));
-  const connected = clusters.size === 1;
-  return {
+  const islands: HullIsland[] = [];
+  const groups = new Map<number, Array<{ points: [Point3, Point3, Point3] }>>();
+  for (const [id, list] of trianglesByComponent) {
+    const [from] = indexRanges.get(id)!;
+    list.forEach((triangle, offset) => {
+      const root = find(from + offset);
+      const group = groups.get(root);
+      if (group) group.push(triangle);
+      else groups.set(root, [triangle]);
+    });
+  }
+  for (const group of groups.values()) {
+    let area = 0;
+    const min: Point3 = [Infinity, Infinity, Infinity];
+    const max: Point3 = [-Infinity, -Infinity, -Infinity];
+    const weighted: Point3 = [0, 0, 0];
+    for (const { points } of group) {
+      const [a, b, c] = points;
+      const triArea = Math.hypot(
+        (b[1]! - a[1]!) * (c[2]! - a[2]!) - (b[2]! - a[2]!) * (c[1]! - a[1]!),
+        (b[2]! - a[2]!) * (c[0]! - a[0]!) - (b[0]! - a[0]!) * (c[2]! - a[2]!),
+        (b[0]! - a[0]!) * (c[1]! - a[1]!) - (b[1]! - a[1]!) * (c[0]! - a[0]!),
+      ) / 2;
+      area += triArea;
+      const cx = (a[0]! + b[0]! + c[0]!) / 3;
+      const cy = (a[1]! + b[1]! + c[1]!) / 3;
+      const cz = (a[2]! + b[2]! + c[2]!) / 3;
+      weighted[0] += cx * triArea;
+      weighted[1] += cy * triArea;
+      weighted[2] += cz * triArea;
+      for (const point of points) {
+        min[0] = Math.min(min[0]!, point[0]!); min[1] = Math.min(min[1]!, point[1]!); min[2] = Math.min(min[2]!, point[2]!);
+        max[0] = Math.max(max[0]!, point[0]!); max[1] = Math.max(max[1]!, point[1]!); max[2] = Math.max(max[2]!, point[2]!);
+      }
+    }
+    const size: Point3 = [max[0]! - min[0]!, max[1]! - min[1]!, max[2]! - min[2]!];
+    const center: Point3 = area > 1e-12 ? [weighted[0] / area, weighted[1] / area, weighted[2] / area] : [0, 0, 0];
+    islands.push({ triangleCount: group.length, area, bounds: { min: [...min] as Point3, max: [...max] as Point3, size, center }, centroid: [...center] as Point3 });
+  }
+  return islands.sort((a, b) => b.area - a.area);
+}
+
+function significantIslands(islands: HullIsland[]): HullIsland[] {
+  if (!islands.length) return islands;
+  const totalArea = islands.reduce((sum, island) => sum + island.area, 0);
+  return islands.filter((island) => island.area >= totalArea * 0.02);
+}
+
+function islandsMatch(candidate: HullIsland, oracle: HullIsland): boolean {
+  const cDiag = Math.hypot(...candidate.bounds.size);
+  const oDiag = Math.hypot(...oracle.bounds.size);
+  const distance = Math.hypot(
+    candidate.centroid[0]! - oracle.centroid[0]!,
+    candidate.centroid[1]! - oracle.centroid[1]!,
+    candidate.centroid[2]! - oracle.centroid[2]!,
+  );
+  const scale = Math.min(cDiag, oDiag);
+  if (distance > scale * 0.5) return false;
+  const areaRatio = candidate.area / Math.max(oracle.area, 1e-9);
+  if (areaRatio < 0.3 || areaRatio > 3.0) return false;
+  const diagRatio = cDiag / Math.max(oDiag, 1e-9);
+  if (diagRatio < 0.4 || diagRatio > 2.5) return false;
+  return true;
+}
+
+/** True when the oracle piece lies inside the candidate piece inflated by a small fabrication margin. */
+function islandCovers(candidate: HullIsland, oracle: HullIsland): boolean {
+  const margin = Math.max(Math.hypot(...candidate.bounds.size) * 0.2, 1e-4);
+  return [0, 1, 2].every((axis) =>
+    oracle.bounds.min[axis]! >= candidate.bounds.min[axis]! - margin
+    && oracle.bounds.max[axis]! <= candidate.bounds.max[axis]! + margin);
+}
+
+/**
+ * Oracle-relative connectivity sanity instead of strict candidate connectedness. Source-faithful
+ * hull geometry legitimately contains disconnected pieces (fenders, sponsons), and demanding
+ * candidate connectedness manufactured hidden stitches. The gate now compares SIGNIFICANT
+ * geometric component structure against the oracle:
+ *
+ * - candidate may preserve legitimate disconnected oracle pieces (equal counts, matched);
+ * - candidate may merge source pieces into one simpler shell (fewer counts, dominant covered);
+ * - tiny insignificant pieces may disappear silently;
+ * - splitting the dominant shell into MORE significant unexplained pieces fails;
+ * - large floaters with no oracle counterpart fail.
+ *
+ * Arbitrary connecting triangles earn nothing: merging is already legal without them.
+ */
+function hullContiguityRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
+  const row = (passed: boolean, message: string, deviation?: number): GateRow => ({
     code: "hull.contiguity",
     phase: "hull",
     component: "hull",
-    passed: connected,
-    score: connected ? 100 : 0,
-    severity: "critical",
-    message: connected ? "hull contact graph is connected" : `hull contact graph splits into ${clusters.size} disconnected clusters within fabrication tolerance ${tolerance.toFixed(4)}`,
-    normalizedDeviation: connected ? 0 : clusters.size / hullIds.length,
-  };
+    passed,
+    score: passed ? 100 : 0,
+    severity: "critical" as const,
+    message,
+    ...(deviation !== undefined ? { normalizedDeviation: deviation } : {}),
+  });
+  const hasHullGeometry = (snapshot: SceneSnapshot): boolean =>
+    Object.values(snapshot.components).some((component) => isHullId(component.id) && component.triangleIndices.length > 0);
+  if (!hasHullGeometry(oracle) || !hasHullGeometry(candidate)) return row(false, "hull semantics carry no geometry");
+  const oracleSignificant = significantIslands(hullGeometricIslands(oracle));
+  const candidateSignificant = significantIslands(hullGeometricIslands(candidate));
+  if (!candidateSignificant.length) return row(false, "candidate hull has no significant geometry");
+  if (!oracleSignificant.length) return row(false, "oracle hull has no measurable significant geometry to compare against");
+  if (candidateSignificant.length > oracleSignificant.length) {
+    return row(false, `candidate hull splits into ${candidateSignificant.length} significant pieces but the oracle has only ${oracleSignificant.length}; the dominant hull must not be broken into large unexplained pieces`, candidateSignificant.length / oracleSignificant.length);
+  }
+  // Anchor dominant ↔ dominant explicitly before any greedy choice. The island
+  // centroid is now area-weighted (physical), and the match itself is scale-aware
+  // (area/diagonal ratio + tight distance), so a hull/fender swap cannot hide.
+  if (!islandsMatch(candidateSignificant[0]!, oracleSignificant[0]!)) {
+    return row(false, "the dominant oracle hull piece is not represented by the dominant candidate piece", 1);
+  }
+  const unmatchedOracle = new Set(oracleSignificant.map((_, index) => index));
+  unmatchedOracle.delete(0);
+  const assignments: Array<{ candidateIndex: number; oracleIndex: number }> = [{ candidateIndex: 0, oracleIndex: 0 }];
+  // Greedy nearest-counterpart for the remaining pieces.
+  for (const [candidateIndex, candidateIsland] of candidateSignificant.entries()) {
+    if (candidateIndex === 0) continue;
+    let bestOracleIndex = -1;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const oracleIndex of unmatchedOracle) {
+      const distance = Math.hypot(
+        candidateIsland.centroid[0]! - oracleSignificant[oracleIndex]!.centroid[0]!,
+        candidateIsland.centroid[1]! - oracleSignificant[oracleIndex]!.centroid[1]!,
+        candidateIsland.centroid[2]! - oracleSignificant[oracleIndex]!.centroid[2]!,
+      );
+      if (distance < bestDistance) { bestDistance = distance; bestOracleIndex = oracleIndex; }
+    }
+    if (bestOracleIndex < 0 || !islandsMatch(candidateIsland, oracleSignificant[bestOracleIndex]!)) {
+      return row(false, `candidate hull piece ${candidateIndex} (area ${(candidateIsland.area / candidateSignificant.reduce((sum, island) => sum + island.area, 0) * 100).toFixed(1)}%) has no significant oracle counterpart`, 1);
+    }
+    unmatchedOracle.delete(bestOracleIndex);
+    assignments.push({ candidateIndex, oracleIndex: bestOracleIndex });
+  }
+  // Oracle significant pieces that were not directly assigned must be legitimately MERGED:
+  // their bounds must lie inside some assigned candidate piece.
+  for (const oracleIndex of unmatchedOracle) {
+    const lost = candidateSignificant.some((candidateIsland, candidateIndex) =>
+      assignments.some((assignment) => assignment.candidateIndex === candidateIndex)
+      && islandCovers(candidateIsland, oracleSignificant[oracleIndex]!));
+    if (!lost) {
+      return row(false, "a legitimate disconnected oracle hull piece is missing from the candidate without being merged into a simpler shell", 1);
+    }
+  }
+  const merged = unmatchedOracle.size;
+  return row(true, merged
+    ? `hull component structure matches the oracle (${oracleSignificant.length - merged} significant pieces preserved, ${merged} legitimately merged)`
+    : `hull component structure matches the oracle (${oracleSignificant.length} significant pieces preserved)`);
 }
 
 function turretSectionsRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
@@ -682,7 +837,7 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
     rows.push(
       options.performance?.measure("fourteen-hull-stations", () => hullSectionsRow(oracle, candidate)) ?? hullSectionsRow(oracle, candidate),
       options.performance?.measure("hull-planes", () => hullPlanesRow(oracle, candidate)) ?? hullPlanesRow(oracle, candidate),
-      hullContiguityRow(candidate),
+      hullContiguityRow(oracle, candidate),
       { ...comparisonRow("dimensions.hull-length", "hull", requiredHullLength, measuredHullBounds.size[2], 0.01), phase: "hull", physicalUnit: "object-unit" },
     );
   }
