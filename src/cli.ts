@@ -642,9 +642,17 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         }
         if (workspace) {
           const outcome = workspaceGateOutcome(evaluation, workspace.state.activePhase);
-          io.stdout(json({ ...evaluation, ...outcome }));
+          const isGlobal = parsed.flags.has("global");
+          if (!isGlobal) {
+            const active = workspace.state.activePhase;
+            const activeReport = evaluation.phaseGates[active];
+            const filtered = activeReport ? { ...evaluation, deterministic: { ...activeReport, profile: evaluation.deterministic.profile, workorders: activeReport.workorders }, phaseGates: { [active]: activeReport } } : evaluation;
+            io.stdout(json({ ...filtered, ...outcome, activePhase: active, note: "active-phase only; use --global for whole-object diagnostics" }));
+          } else {
+            io.stdout(json({ ...evaluation, ...outcome }));
+          }
           const { activePhasePassed, globalPassed } = outcome;
-          return (parsed.flags.has("global") ? globalPassed : activePhasePassed) ? 0 : 4;
+          return (isGlobal ? globalPassed : activePhasePassed) ? 0 : 4;
         }
         io.stdout(rendered.trimEnd());
         return evaluation.passed ? 0 : 4;

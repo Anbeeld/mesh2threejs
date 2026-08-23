@@ -66,7 +66,7 @@ describe("executable profile contracts", () => {
     expect(evaluation.passed).toBe(false);
     expect(evaluation.phaseGates.hull).toMatchObject({ passed: true });
     expect(evaluation.phaseGates.turret).toMatchObject({ passed: false });
-    expect(evaluation.phaseGates.hull?.rows.map((row) => row.phase)).toEqual(["hull", "hull", "hull", "hull"]);
+    expect(evaluation.phaseGates.hull?.rows.map((row) => row.phase)).toEqual(["hull", "hull", "hull", "hull", "hull", "hull"]);
   });
 });
 
@@ -81,7 +81,7 @@ describe("phase locks and artifact authority", () => {
       candidateHash: "candidate",
       profileContractHash: state.profileContractHash,
       configHash: "fixture",
-      gateResults: ["curves.hull", "hull.stations", "dimensions.hull-length", "orientation.physical"].map((code) => ({ code, passed: true, score: 100 })),
+      gateResults: ["curves.hull", "hull.stations", "hull.sections", "hull.planes", "hull.contiguity", "dimensions.hull-length", "orientation.physical"].map((code) => ({ code, passed: true, score: 100 })),
       result: { passed: true, summary: "claimed pass" },
     });
     state = recordEvidenceArtifact(state, "claimed-hull.json", artifact);
@@ -93,7 +93,7 @@ describe("phase locks and artifact authority", () => {
     for (const [id, kind, phase] of [["registration", "registration", "oracle-registration"], ["hull-gate", "deterministic-gate", "hull"]] as const) {
       const gateResults = phase === "oracle-registration"
         ? [{ code: "registration.complete", passed: true, score: 100 }]
-        : ["curves.hull", "hull.stations", "dimensions.hull-length", "orientation.physical"].map((code) => ({ code, passed: true, score: 100 }));
+        : ["curves.hull", "hull.stations", "hull.sections", "hull.planes", "hull.contiguity", "dimensions.hull-length", "orientation.physical"].map((code) => ({ code, passed: true, score: 100 }));
       const artifact = phase === "oracle-registration"
         ? createWorkflowGateEvidenceArtifact({ id, kind, phase, oracleHash: "oracle", candidateHash: "candidate-a", profileContractHash: state.profileContractHash, configHash: "fixture", gateCode: "registration.complete", passed: true, summary: "fixture" })
         : createRuntimeGateEvidenceArtifact({ id, phase, oracleHash: "oracle", candidateHash: "candidate-a", profileContractHash: state.profileContractHash, configHash: "fixture", report: { profile: "tank", passed: true, score: 100, rows: gateResults.map((gate) => ({ ...gate, phase, component: "fixture", severity: "critical", message: "fixture" })), workorders: [] } });

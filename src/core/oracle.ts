@@ -377,6 +377,8 @@ export interface OracleManifest {
   semanticMap: Record<string, string>;
   articulationMap: Record<string, string>;
   normalization: { translation: Point3; rotationEuler: Point3; scale: number };
+  sourceFrame?: { up: string; forward: string; right: string };
+  logicalOwnership?: Record<string, string>;
   authoritativeDimensions: Record<string, number> | null;
   dimensionSources: string[];
   repairHistory: Array<{ reason: string; recipeHash: string }>;
@@ -387,6 +389,8 @@ export interface OnboardOracleInput extends Omit<OracleManifest, "schemaVersion"
   workspaceRoot?: string;
   sourceOriginalPath?: string;
   referenceMode?: "copy" | "external";
+  sourceFrame?: { up: string; forward: string; right: string };
+  logicalOwnership?: Record<string, string>;
 }
 
 interface PreparedRecipe {
@@ -397,6 +401,8 @@ interface PreparedRecipe {
   semanticMap: Record<string, string>;
   articulationMap: Record<string, string>;
   normalization: { translation: Point3; rotationEuler: Point3; scale: number };
+  sourceFrame?: { up: string; forward: string; right: string };
+  logicalOwnership?: Record<string, string>;
   repair?: { parentPreparedHash: string; reason: string };
   preparedHash?: string;
 }
@@ -431,6 +437,21 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
   const bytes = await readFile(sourceFile);
   const probe = probeGlb(bytes);
   const sourceHash = sha256(bytes);
+  if (input.logicalOwnership) {
+    for (const [child, parent] of Object.entries(input.logicalOwnership)) {
+      if (child === parent) throw new Error(`ownership cycle: ${child} owns itself`);
+      if (child === "hull" && parent === "turret-pivot") throw new Error("hull cannot be owned by turret-pivot");
+      if (child.startsWith("track-") && parent === "gun-pivot") throw new Error("track cannot be owned by gun-pivot");
+    }
+    const seen = new Set<string>();
+    for (const parent of Object.values(input.logicalOwnership)) {
+      if (seen.has(parent) && input.logicalOwnership[parent]) { /* allow */ }
+      const chain = new Set<string>();
+      let cur: string | undefined = parent;
+      while (cur && input.logicalOwnership[cur]) { if (chain.has(cur)) throw new Error(`ownership cycle includes ${cur}`); chain.add(cur); cur = input.logicalOwnership[cur]; }
+    }
+    for (const p of Object.values(input.logicalOwnership)) if (!input.semanticMap[p] && !Object.values(input.semanticMap).includes(p) && p !== "root" && p !== "turret-pivot" && p !== "gun-pivot") throw new Error(`missing pivot ${p}`);
+  }
   const baseRecipe: PreparedRecipe = {
     schemaVersion: 1,
     kind: "prepared-oracle-recipe",
@@ -439,6 +460,8 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     semanticMap: input.semanticMap,
     articulationMap: input.articulationMap,
     normalization: input.normalization,
+    ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : {}),
+    ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : {}),
   };
   const preparedHash = sha256(canonicalJson(baseRecipe));
   await mkdir(dirname(preparedFile), { recursive: true });
@@ -467,6 +490,8 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     semanticMap: input.semanticMap,
     articulationMap: input.articulationMap,
     normalization: input.normalization,
+    ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : {}),
+    ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : {}),
     authoritativeDimensions: input.authoritativeDimensions,
     dimensionSources: input.dimensionSources,
     repairHistory: [],
@@ -519,6 +544,7 @@ export async function loadPreparedOracle(manifest: OracleManifest, workspaceRoot
     if (semantic) object.userData.semanticId = semantic;
     const articulationPivot = recipe.articulationMap[object.name] ?? (semantic ? recipe.articulationMap[semantic] : undefined);
     if (articulationPivot) object.userData.articulationPivot = articulationPivot;
+    if (semantic && recipe.logicalOwnership?.[semantic]) object.userData.logicalOwner = recipe.logicalOwnership[semantic];
   });
   const frame = new THREE.Group();
   frame.name = "prepared-oracle-normalization-frame";
@@ -595,9 +621,10 @@ export function verifyOracleRegistration(root: THREE.Object3D, expected: Registr
   const semantics = new Set<string>();
   const names = new Set<string>();
   const pivots = new Set<string>();
+  const semanticObjects: THREE.Object3D[] = [];
   root.traverse((object) => {
     names.add(object.name);
-    if (typeof object.userData.semanticId === "string") semantics.add(object.userData.semanticId);
+    if (typeof object.userData.semanticId === "string") { semantics.add(object.userData.semanticId); semanticObjects.push(object); }
     if (typeof object.userData.articulationPivot === "string") pivots.add(object.userData.articulationPivot);
   });
   const uniformScale = root.scale.x;
@@ -609,5 +636,23 @@ export function verifyOracleRegistration(root: THREE.Object3D, expected: Registr
     ...expected.requiredSemantics.map((semantic) => ({ code: `registration.semantic.${semantic}`, passed: semantics.has(semantic), expected: "present", actual: semantics.has(semantic) ? "present" : "missing" })),
     ...expected.requiredPivots.map((pivot) => ({ code: `registration.pivot.${pivot}`, passed: names.has(pivot) || pivots.has(pivot), expected: "present", actual: names.has(pivot) || pivots.has(pivot) ? "present" : "missing" })),
   ];
+  try {
+    const roadWheels = semanticObjects.filter((o) => o.userData.semanticId?.startsWith("road-wheel"));
+    if (roadWheels.length >= 4) {
+      const zs = roadWheels.map((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.z; });
+      const xs = roadWheels.map((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.x; });
+      const zVar = Math.max(...zs) - Math.min(...zs);
+      const xVar = Math.max(...xs) - Math.min(...xs);
+      const longitudinalOk = zVar > xVar * 1.5;
+      rows.push({ code: "registration.frame.longitudinal", passed: longitudinalOk, expected: "Z variance >> X variance", actual: `zVar ${zVar.toFixed(2)} xVar ${xVar.toFixed(2)}` });
+      const left = roadWheels.filter((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.x < 0; }).length;
+      const right = roadWheels.filter((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.x > 0; }).length;
+      rows.push({ code: "registration.frame.lateral", passed: left > 0 && right > 0, expected: "left+right wheels separated on X", actual: `L${left} R${right}` });
+      const groundY = bounds.min.y;
+      const wheelYs = roadWheels.map((o) => { const p = new THREE.Vector3(); o.getWorldPosition(p); return p.y; });
+      const nearGround = wheelYs.every((y) => Math.abs(y - groundY) < 1.5);
+      rows.push({ code: "registration.frame.ground-contact", passed: nearGround, expected: "wheels near ground", actual: nearGround ? "near ground" : "elevated" });
+    }
+  } catch {}
   return { schemaVersion: 1, kind: "oracle-registration", passed: rows.every((row) => row.passed), rows };
 }

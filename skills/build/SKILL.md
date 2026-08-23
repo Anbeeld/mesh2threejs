@@ -7,7 +7,7 @@ description: Author or repair native procedural Three.js from actionable oracle-
 
 Read the selected profile standard and StyleContract. Execute one coherent repair group: one component/relationship and its necessary dependent fixes.
 
-Use native Three.js primitives, lofts, transforms, materials, semantic IDs, and explicit pivots. Tank candidates expose `setPose({turretYaw, gunElevation})`; fittings must live under the pivot that owns them. Never load oracle files or paste dense topology/vertex dumps. Preserve macro truth before detail. Run the transitive candidate audit and profile/style gates; execute only the active phase's first coherent repair group.
+Use native Three.js primitives, lofts, transforms, materials, semantic IDs, and explicit pivots. Tank canonical frame is +X right, +Y up, +Z forward, ground at min Y, neutral gun +Z. Tank candidates expose `setPose({turretYaw, gunElevation})`; fittings must live under the pivot that owns them. Never load oracle files or paste dense topology/vertex dumps. Small explicit low-poly control cages (10-30 hull points, ~300-500 numeric values) are preferred over stacks of generic primitives when oracle has clear planar/contour structure. Preserve macro truth before detail. Run the transitive candidate audit and profile/style gates; work only on the active phase — do not optimize pending phases even if global diagnostics exist. If an active macro gate is below structural threshold (<80), change representation rather than sweeping dimensions on a primitive that visibly cannot match.
 
 For a first build in an active phase, finish the smallest complete candidate for that phase before running its audit-and-repair cycle. Do not interleave evaluator verdicts into construction of one incomplete component.
 

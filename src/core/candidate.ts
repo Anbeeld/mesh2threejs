@@ -42,12 +42,12 @@ export function auditCandidateSource(source: string): CandidateAudit {
   if (/data:(?:model\/gltf-binary|application\/octet-stream);base64/iu.test(source)) {
     findings.push({ code: "embedded-oracle", message: "candidate source embeds binary model data" });
   }
-  if (/(?:Buffer\.from|atob)\s*\([^,)]{256,}(?:base64|["'])/isu.test(source) || /new\s+(?:Float32|Uint16|Uint32)Array\s*\(\s*\[[\s\S]{4000,}?\]/u.test(source)) {
-    findings.push({ code: "dense-binary-payload", message: "candidate contains a dense binary/topology payload" });
-  }
+  const typedArrayElements = [...source.matchAll(/new\s+(?:Float32|Uint16|Uint32)Array\s*\(\s*\[([\s\S]*?)\]/gu)].reduce((sum, m) => sum + (m[1]?.split(",").filter((s) => s.trim()).length ?? 0), 0);
+  const hasDensePayload = /(?:Buffer\.from|atob)\s*\([^,)]{256,}(?:base64|["'])/isu.test(source) || typedArrayElements > 5000 || /new\s+(?:Float32|Uint16|Uint32)Array\s*\(\s*\[[\s\S]{4000,}?\]/u.test(source);
+  if (hasDensePayload) findings.push({ code: "dense-binary-payload", message: "candidate contains a dense binary/topology payload" });
   const numericLiteralCount = (source.match(/(?:^|[,[\s])-?\d+(?:\.\d+)?(?=\s*[,\]])/gu) ?? []).length;
-  if (numericLiteralCount > 2_000) {
-    findings.push({ code: "topology-dump", message: `candidate contains ${numericLiteralCount} numeric array literals, consistent with a topology dump` });
+  if (numericLiteralCount > 2000 || typedArrayElements > 20000) {
+    findings.push({ code: "topology-dump", message: `candidate contains ${numericLiteralCount} numeric literals / ${typedArrayElements} typed elements, consistent with a topology dump` });
   }
   return { passed: findings.length === 0, findings };
 }
