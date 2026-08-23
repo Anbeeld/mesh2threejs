@@ -4,16 +4,26 @@ import { join } from "node:path";
 import * as THREE from "three";
 import { MeshoptSimplifier } from "meshoptimizer";
 import type { ResumedWorkspace } from "./workspace.js";
-import { MODEL_SCAFFOLD, verifyWorkspaceCandidateIdentity, verifyWorkspaceOraclePreparation } from "./workspace.js";
+import { MODEL_DERIVED_SCAFFOLD, MODEL_SCAFFOLD, verifyWorkspaceCandidateIdentity, verifyWorkspaceOraclePreparation } from "./workspace.js";
 import { loadPreparedOracle } from "./oracle.js";
 import { loadTaskState, saveTaskState } from "./state.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { snapshotScene } from "./geometry.js";
 import { measureBounds, measureWheelRadialProfile } from "./measurement.js";
 import { evaluateCandidateWithPoses } from "./orchestration.js";
-import { derivedDirectory, derivationManifestHash, loadTrustedGeneratedModules, type DerivationManifest } from "./derivation.js";
+import { getProfileContract } from "./contracts.js";
+import {
+  GENERATED_DIRECTORY,
+  GENERATED_REGISTRY_PATH,
+  derivedDirectory,
+  derivationManifestHash,
+  generateRegistrySource,
+  loadTrustedGeneratedModules,
+  type DerivationManifest,
+} from "./derivation.js";
+import { composeCandidateForPhase, type ComposedCandidateRuntime } from "./phase-compose.js";
 import type { GenericSubjectContract } from "../profiles/generic.js";
-import type { Bounds3, CandidateRuntime, Point3, SceneSnapshot, Workorder } from "../types.js";
+import type { Bounds3, CandidateRuntime, Point3, ProfileId, SceneSnapshot, Workorder } from "../types.js";
 
 export type DeriveQuality = "aggressive" | "balanced" | "conservative";
 
@@ -28,13 +38,25 @@ export interface DeriveTierResult {
   score: number;
   /** Active-phase gates that failed for this tier, with their runtime evidence. */
   failingGates?: Array<{ code: string; score: number; message: string }>;
+  /** False when the tier cleared active gates but already violates the style complexity ceiling. */
+  withinComplexityBudget?: boolean;
   simplifierError?: number;
 }
 
 export type DeriveTierResultTier = "aggressive" | "balanced" | "conservative" | "source-cleaned";
 
+export type DeriveStatus = "seed-passing" | "seed-retained-failing" | "seed-diagnostic-overbudget" | "not-supported";
+
+/** Workflow diagnostics for structured diagnosis; not profile gates. */
+export type DeriveReasonCode =
+  | "derive.no-passing-tier"
+  | "derive.over-budget-fallback"
+  | "derive.missing-prerequisite-semantic"
+  | "derive.generated-hierarchy-invalid";
+
 export interface DeriveResult {
-  status: "seed-passing" | "seed-retained-failing" | "not-supported";
+  status: DeriveStatus;
+  reasonCode?: DeriveReasonCode;
   phase: string;
   operator: string;
   generatedModule?: string;
@@ -42,7 +64,7 @@ export interface DeriveResult {
   tiers: DeriveTierResult[];
   selected?: DeriveTierResult;
   workorders?: Workorder[];
-  wiring?: "wrote-model-scaffold" | "manual-wiring-required";
+  wiring?: "initialized-scaffold" | "updated-registry" | "manual-wiring-required";
   note?: string;
 }
 
@@ -273,43 +295,98 @@ function roundList(values: ArrayLike<number>, decimals = 5): number[] {
   return Array.from(values, (value) => Number(value.toFixed(decimals)));
 }
 
-interface SeedMesh {
+/**
+ * Hierarchy-aware generated seed representation. Groups carry semantic pivots at their world
+ * origins; meshes attach to their declared semantic owner with OWNER-LOCAL geometry, so the
+ * emitted module reproduces physically correct articulation ownership (gun under gun-pivot,
+ * turret assembly under turret-pivot) instead of flat siblings that can never clear gates
+ * like gun.pose or turretYaw articulation.
+ */
+export interface SeedNode {
   semanticId: string;
+  kind: "group" | "mesh";
+  parentSemanticId?: string;
+  /** Local position for group nodes. */
+  position?: Point3;
+  /** Owner-local coordinates for mesh nodes. */
+  positions?: Float32Array;
+  indices?: Uint32Array;
   role?: string;
-  positions: Float32Array;
-  indices: Uint32Array;
 }
 
-interface SeedPivot {
-  semanticId: string;
-  origin: Point3;
+/** Builds the in-memory evaluation graph for one seed tier. */
+export function buildSeedGroup(name: string, nodes: SeedNode[]): THREE.Group {
+  const group = new THREE.Group();
+  group.name = `derived-${name}`;
+  const bySemantic = new Map<string, THREE.Object3D>();
+  // Groups first so parents exist before children attach.
+  for (const node of nodes.filter((entry) => entry.kind === "group")) {
+    const object = new THREE.Group();
+    object.name = node.semanticId;
+    object.userData.semanticId = node.semanticId;
+    object.position.set(...(node.position ?? [0, 0, 0]));
+    bySemantic.set(node.semanticId, object);
+  }
+  const attach = (object: THREE.Object3D, parentSemanticId: string | undefined): void => {
+    const parent = parentSemanticId ? bySemantic.get(parentSemanticId) : undefined;
+    (parent ?? group).add(object);
+  };
+  for (const node of bySemantic.values() as IterableIterator<THREE.Object3D>) attach(node, nodes.find((entry) => entry.kind === "group" && entry.semanticId === node.name)?.parentSemanticId);
+  for (const node of nodes.filter((entry) => entry.kind === "mesh")) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(node.positions!, 3));
+    geometry.setIndex(new THREE.BufferAttribute(node.indices!, 1));
+    geometry.computeVertexNormals();
+    const material = new THREE.MeshStandardMaterial({ color: 0x6b7358, roughness: 0.7 });
+    material.flatShading = true;
+    const object = new THREE.Mesh(geometry, material);
+    object.name = node.semanticId;
+    object.userData.semanticId = node.semanticId;
+    if (node.role) object.userData.semanticRole = node.role;
+    attach(object, node.parentSemanticId);
+  }
+  return group;
 }
 
 /** Emits the pipeline-owned generated module bytes for one derived phase seed. */
-function emitGeneratedModule(name: string, meshes: SeedMesh[], pivots: SeedPivot[]): string {
+function emitGeneratedModule(name: string, nodes: SeedNode[]): string {
   const lines: string[] = [];
   lines.push(`import * as THREE from "three";`);
   lines.push(``);
   lines.push(`// Generated by mesh2threejs derive — trusted pipeline tool output.`);
   lines.push(`// Provenance: .mesh2threejs/derived/${name}.json (do not edit by hand).`);
-  for (const [index, mesh] of meshes.entries()) {
+  const meshes = nodes.filter((node): node is SeedNode & { kind: "mesh"; positions: Float32Array; indices: Uint32Array } => node.kind === "mesh");
+  for (const mesh of meshes) {
+    // Fail fast: an out-of-range index silently becomes a NaN triangle downstream, which
+    // finishBounds() masks as an all-zero component bounds box and produces misleading
+    // detached-geometry gate failures far from the actual defect.
+    const vertexCount = mesh.positions.length / 3;
+    if (Array.from(mesh.indices).some((index) => index >= vertexCount)) {
+      throw new Error(`derived ${mesh.semanticId} contains index outside vertex range`);
+    }
+  }
+  meshes.forEach((mesh, index) => {
     lines.push(`const P${index} = new Float32Array([${roundList(mesh.positions).join(",")}]);`);
     lines.push(`const I${index} = new Uint32Array([${Array.from(mesh.indices).join(",")}]);`);
-  }
+  });
   lines.push(``);
   lines.push(`export function createSeed() {`);
   lines.push(`  const group = new THREE.Group();`);
   lines.push(`  group.name = ${JSON.stringify(`derived-${name}`)};`);
-  for (const pivot of pivots) {
+  // Groups first (fully constructed and ATTACHED), then meshes reference their owner.
+  for (const node of nodes.filter((entry) => entry.kind === "group")) {
     lines.push(`  {`);
-    lines.push(`    const marker = new THREE.Group();`);
-    lines.push(`    marker.name = ${JSON.stringify(pivot.semanticId)};`);
-    lines.push(`    marker.userData.semanticId = ${JSON.stringify(pivot.semanticId)};`);
-    lines.push(`    marker.position.set(${pivot.origin.map((value) => Number(value.toFixed(6))).join(", ")});`);
-    lines.push(`    group.add(marker);`);
+    lines.push(`    const pivotGroup = new THREE.Group();`);
+    lines.push(`    pivotGroup.name = ${JSON.stringify(node.semanticId)};`);
+    lines.push(`    pivotGroup.userData.semanticId = ${JSON.stringify(node.semanticId)};`);
+    lines.push(`    pivotGroup.position.set(${(node.position ?? [0, 0, 0]).map((value) => Number(value.toFixed(6))).join(", ")});`);
+    lines.push(`    group.add(pivotGroup);`);
     lines.push(`  }`);
   }
-  for (const [index, mesh] of meshes.entries()) {
+  const meshIndexByNode = new Map<SeedNode, number>();
+  meshes.forEach((mesh, index) => meshIndexByNode.set(mesh, index));
+  for (const node of meshes) {
+    const index = meshIndexByNode.get(node)!;
     lines.push(`  {`);
     lines.push(`    const geometry = new THREE.BufferGeometry();`);
     lines.push(`    geometry.setAttribute("position", new THREE.BufferAttribute(P${index}, 3));`);
@@ -318,10 +395,14 @@ function emitGeneratedModule(name: string, meshes: SeedMesh[], pivots: SeedPivot
     lines.push(`    const material = new THREE.MeshStandardMaterial({ color: 0x6b7358, roughness: 0.7 });`);
     lines.push(`    material.flatShading = true;`);
     lines.push(`    const mesh = new THREE.Mesh(geometry, material);`);
-    lines.push(`    mesh.name = ${JSON.stringify(mesh.semanticId)};`);
-    lines.push(`    mesh.userData.semanticId = ${JSON.stringify(mesh.semanticId)};`);
-    if (mesh.role) lines.push(`    mesh.userData.semanticRole = ${JSON.stringify(mesh.role)};`);
-    lines.push(`    group.add(mesh);`);
+    lines.push(`    mesh.name = ${JSON.stringify(node.semanticId)};`);
+    lines.push(`    mesh.userData.semanticId = ${JSON.stringify(node.semanticId)};`);
+    if (node.role) lines.push(`    mesh.userData.semanticRole = ${JSON.stringify(node.role)};`);
+    if (node.parentSemanticId) {
+      lines.push(`    (group.getObjectByName(${JSON.stringify(node.parentSemanticId)}) ?? group).add(mesh);`);
+    } else {
+      lines.push(`    group.add(mesh);`);
+    }
     lines.push(`  }`);
   }
   lines.push(`  return group;`);
@@ -335,17 +416,29 @@ function wheelRole(id: string, declared?: unknown): string | undefined {
   return ["road-wheel", "sprocket", "idler", "return-roller"].find((role) => id === role || id.startsWith(`${role}-`));
 }
 
+function localPositions(worldPositions: ArrayLike<number>, origin: Point3): Float32Array {
+  const local = Float32Array.from(worldPositions);
+  for (let index = 0; index < local.length; index += 3) {
+    local[index] = Number((local[index]! - origin[0]).toFixed(5));
+    local[index + 1] = Number((local[index + 1]! - origin[1]).toFixed(5));
+    local[index + 2] = Number((local[index + 2]! - origin[2]).toFixed(5));
+  }
+  return local;
+}
+
 /** Builds the analytic radial-fit seed: one low-segment closed radial wheel per measured instance. */
-function buildRadialSeed(snapshot: SceneSnapshot): { moduleMeshes: SeedMesh[]; inputTriangles: number } {
-  const moduleMeshes: SeedMesh[] = [];
+function buildRadialSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTriangles: number } {
+  const nodes: SeedNode[] = [];
   let inputTriangles = 0;
   for (const component of Object.values(snapshot.components)) {
     const role = wheelRole(component.id, component.role);
     if (!role || !component.triangleIndices.length) continue;
     inputTriangles += component.triangleIndices.length;
-    const profile = measureWheelRadialProfile(snapshot, component.id);
-    const radius = profile ? Math.max(profile.meanRadius, 1e-3) : Math.max(Math.hypot(component.bounds.size[1], component.bounds.size[2]) / 2, 1e-3);
-    const width = Math.max(component.bounds.size[0], component.bounds.size[1] * 0.25, 1e-3);
+    // Size the seed from the same bounds-envelope measurements the evaluator uses
+    // (radius = max Y/Z extent half, width = X extent): profile.meanRadius averages every
+    // projected edge sample including end-cap fans, underestimating the outer radius.
+    const radius = Math.max(Math.max(component.bounds.size[1], component.bounds.size[2]) / 2, 1e-3);
+    const width = Math.max(component.bounds.size[0], 1e-3);
     const segments = 12;
     const centerX = component.bounds.center[0];
     const centerY = component.bounds.center[1];
@@ -370,17 +463,17 @@ function buildRadialSeed(snapshot: SceneSnapshot): { moduleMeshes: SeedMesh[]; i
         indices.push(centerIndex, ringIndex * segments + segment + (ringIndex ? 1 : 0), ringIndex * segments + segment + (ringIndex ? 0 : 1));
       }
     }
-    moduleMeshes.push({ semanticId: component.id, role, positions: Float32Array.from(positions), indices: Uint32Array.from(indices) });
+    nodes.push({ semanticId: component.id, kind: "mesh", role, positions: Float32Array.from(positions), indices: Uint32Array.from(indices) });
   }
-  return { moduleMeshes, inputTriangles };
+  return { nodes, inputTriangles };
 }
 
 /**
  * Builds the course-regenerate seed: one continuous low-poly course per measured track,
  * matching the measured envelope (length along Z, height along Y, width along X).
  */
-function buildTrackSeed(snapshot: SceneSnapshot): { moduleMeshes: SeedMesh[]; inputTriangles: number } {
-  const moduleMeshes: SeedMesh[] = [];
+function buildTrackSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTriangles: number } {
+  const nodes: SeedNode[] = [];
   let inputTriangles = 0;
   for (const component of Object.values(snapshot.components)) {
     if (!component.id.startsWith("track") && component.role !== "track-course") continue;
@@ -405,15 +498,19 @@ function buildTrackSeed(snapshot: SceneSnapshot): { moduleMeshes: SeedMesh[]; in
         }
       };
       const points: Array<[number, number]> = [];
+      // Twelve steps per quarter-arc: the wrap-normal diagnostic bins face normals at
+      // 7.5° granularity and demands near-source diversity, so the arc must place at
+      // least one facet in every angular bin the source's curved wrap covers.
+      const arcSteps = 12;
       points.push([left + radius, bottom]);
       points.push([right - radius, bottom]);
-      arc(right - radius, bottom + radius, -Math.PI / 2, 4);
+      arc(right - radius, bottom + radius, -Math.PI / 2, arcSteps);
       points.push([right, top - radius]);
-      arc(right - radius, top - radius, 0, 4);
+      arc(right - radius, top - radius, 0, arcSteps);
       points.push([left + radius, top]);
-      arc(left + radius, top - radius, Math.PI / 2, 4);
+      arc(left + radius, top - radius, Math.PI / 2, arcSteps);
       points.push([left, bottom + radius]);
-      arc(left + radius, bottom + radius, Math.PI, 4);
+      arc(left + radius, bottom + radius, Math.PI, arcSteps);
       return points;
     };
     const outerPoints = roundedProfile(wrapRadius, 0);
@@ -453,16 +550,17 @@ function buildTrackSeed(snapshot: SceneSnapshot): { moduleMeshes: SeedMesh[]; in
       indices.push(b0, j0, j1);
       indices.push(b0, j1, b1);
     }
-    moduleMeshes.push({ semanticId: component.id, role: component.role ?? "track-course", positions: Float32Array.from(positions), indices: Uint32Array.from(indices) });
+    nodes.push({ semanticId: component.id, kind: "mesh", role: component.role ?? "track-course", positions: Float32Array.from(positions), indices: Uint32Array.from(indices) });
   }
-  return { moduleMeshes, inputTriangles };
+  return { nodes, inputTriangles };
 }
 
 /**
- * Builds the axis-fit gun seed: the measured pivot anchor, neutral barrel direction, barrel
- * length, and an 80th-percentile perpendicular radius drive one low-segment capped tube.
+ * Builds the axis-fit gun seed with CORRECT semantic hierarchy: gun-pivot group at the
+ * measured pivot anchor, gun mesh child in PIVOT-LOCAL coordinates, so gun.parent resolves
+ * to gun-pivot and pose/articulation gates are structurally satisfiable.
  */
-function buildGunSeed(snapshot: SceneSnapshot): { pivots: SeedPivot[]; moduleMeshes: SeedMesh[]; inputTriangles: number } {
+function buildGunSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTriangles: number } {
   const pivotComponent = snapshot.components["gun-pivot"];
   const gun = snapshot.components.gun;
   if (!gun || !gun.triangleIndices.length) throw new Error("prepared oracle carries no gun geometry to fit");
@@ -481,8 +579,11 @@ function buildGunSeed(snapshot: SceneSnapshot): { pivots: SeedPivot[]; moduleMes
   const distanceFromPivot = (point: Point3): number => Math.hypot(point[0] - pivotOrigin[0], point[1] - pivotOrigin[1], point[2] - pivotOrigin[2]);
   const muzzle = points.reduce((best, point) => distanceFromPivot(point) > distanceFromPivot(best) ? point : best, points[0]!);
   const vector = muzzle.map((value, axis) => value - pivotOrigin[axis]!) as Point3;
-  const length = Math.hypot(...vector);
-  const direction = vector.map((value) => value / Math.max(length, 1e-9)) as Point3;
+  // Length/axis via center projection: avoids rim-corner bias (farthest rim point is sqrt(L^2+r^2) off).
+  const centerVector = gun.bounds.center.map((value, axis) => value - pivotOrigin[axis]!) as Point3;
+  const centerDistance = Math.hypot(...centerVector);
+  const direction = centerDistance > 1e-9 ? centerVector.map((value) => value / centerDistance) as Point3 : vector.map((value) => value / Math.max(Math.hypot(...vector), 1e-9)) as Point3;
+  const length = centerDistance > 1e-9 ? centerDistance * 2 : Math.hypot(...vector);
   const radii = points.filter((_, index) => index % 16 === 0).map((point) => {
     const dx = point[0] - pivotOrigin[0]; const dy = point[1] - pivotOrigin[1]; const dz = point[2] - pivotOrigin[2];
     const along = dx * direction[0]! + dy * direction[1]! + dz * direction[2]!;
@@ -505,15 +606,16 @@ function buildGunSeed(snapshot: SceneSnapshot): { pivots: SeedPivot[]; moduleMes
   ];
   const secondLength = Math.hypot(...secondRaw) || 1;
   const second = secondRaw.map((value) => value / secondLength) as Point3;
-  const positions: number[] = [];
+  const world: number[] = [];
   const indices: number[] = [];
+  // Tube spans exactly [0, L] from the pivot: the measured muzzle length must survive.
   for (let ring = 0; ring < 2; ring += 1) {
-    const along = (ring - 0.3) * length;
+    const along = ring * length;
     for (let segment = 0; segment < segments; segment += 1) {
       const angle = (segment / segments) * Math.PI * 2;
       const cos = Math.cos(angle) * radius;
       const sin = Math.sin(angle) * radius;
-      positions.push(
+      world.push(
         pivotOrigin[0]! + direction[0]! * along + side[0]! * cos + second[0]! * sin,
         pivotOrigin[1]! + direction[1]! * along + side[1]! * cos + second[1]! * sin,
         pivotOrigin[2]! + direction[2]! * along + side[2]! * cos + second[2]! * sin,
@@ -525,22 +627,23 @@ function buildGunSeed(snapshot: SceneSnapshot): { pivots: SeedPivot[]; moduleMes
     indices.push(segment, segments + next, segments + segment);
     indices.push(segment, next, segments + next);
   }
-  for (let segment = 1; segment < segments - 1; segment += 1) indices.push(0, segment + 1, segment + 2);
+  for (let segment = 1; segment < segments - 1; segment += 1) indices.push(0, segment, segment + 1);
   const capBase = segments;
-  for (let segment = 1; segment < segments - 1; segment += 1) indices.push(capBase, capBase + segment + 1, capBase + segment + 2);
+  for (let segment = 1; segment < segments - 1; segment += 1) indices.push(capBase, capBase + segment + 1, capBase + segment);
   return {
-    pivots: [{ semanticId: "gun-pivot", origin: pivotOrigin }],
-    moduleMeshes: [{ semanticId: "gun", positions: Float32Array.from(positions), indices: Uint32Array.from(indices) }],
+    nodes: [
+      { semanticId: "gun-pivot", kind: "group", position: pivotOrigin },
+      { semanticId: "gun", kind: "mesh", parentSemanticId: "gun-pivot", positions: localPositions(Float32Array.from(world), pivotOrigin), indices: Uint32Array.from(indices) },
+    ],
     inputTriangles: gun.triangleIndices.length,
   };
 }
 
 interface PhaseSeed {
   name: string;
-  pivots: SeedPivot[];
   inputGeometryHash: string;
   inputTriangles: number;
-  simplify: (ratio: number | undefined, error: number | undefined) => Promise<{ meshes: SeedMesh[]; error?: number }>;
+  simplify: (ratio: number | undefined, error: number | undefined) => Promise<{ nodes: SeedNode[]; error?: number }>;
 }
 
 async function buildMeshSimplifySeed(snapshot: SceneSnapshot, phase: string): Promise<PhaseSeed> {
@@ -557,64 +660,56 @@ async function buildMeshSimplifySeed(snapshot: SceneSnapshot, phase: string): Pr
     triangles: soup.triangleCount,
     geometryHash: geometryBytesHash(Float32Array.from(soup.positions), Uint32Array.from(soup.indices)),
   }))));
-  const pivots: SeedPivot[] = [];
+
+  // Turret assembly nests under its admitted pivot when the oracle declares one.
+  let pivotOrigin: Point3 | undefined;
   if (phase === "turret") {
     const marker = snapshot.components["turret-pivot"];
-    if (marker?.origin) pivots.push({ semanticId: "turret-pivot", origin: marker.origin });
+    if (marker?.origin) pivotOrigin = [...marker.origin] as Point3;
   }
+
   return {
     name: phase.replace(/[^a-z0-9]+/giu, "-").toLowerCase(),
-    pivots,
     inputGeometryHash,
     inputTriangles,
     simplify: async (ratio, error) => {
-      const meshes: SeedMesh[] = [];
+      const nodes: SeedNode[] = [];
       let simplifierError: number | undefined;
-      for (const [id, cleaned] of [...cleanedPerSemantic].sort(([a], [b]) => a.localeCompare(b))) {
+      const orderedIds = [...cleanedPerSemantic.keys()].sort((a, b) => a.localeCompare(b));
+      if (pivotOrigin) nodes.push({ semanticId: "turret-pivot", kind: "group", position: pivotOrigin });
+      for (const id of orderedIds) {
+        const cleaned = cleanedPerSemantic.get(id)!;
         const result = await simplifyMesh(cleaned.positions, cleaned.indices, ratio, error);
         if (result.error !== undefined) simplifierError = Math.max(simplifierError ?? 0, result.error);
-        meshes.push({ semanticId: id, positions: result.positions, indices: result.indices });
+        const parentSemanticId = pivotOrigin && id !== "turret-pivot" ? "turret-pivot" : undefined;
+        const positions = parentSemanticId ? localPositions(result.positions, pivotOrigin!) : result.positions;
+        nodes.push({ semanticId: id, kind: "mesh", ...(parentSemanticId ? { parentSemanticId } : {}), positions, indices: result.indices });
       }
-      return { meshes, ...(simplifierError !== undefined ? { error: simplifierError } : {}) };
+      return { nodes, ...(simplifierError !== undefined ? { error: simplifierError } : {}) };
     },
   };
 }
 
-function buildSeedGroup(name: string, pivots: SeedPivot[], meshes: SeedMesh[]): THREE.Group {
-  const group = new THREE.Group();
-  group.name = `derived-${name}`;
-  for (const pivot of pivots) {
-    const marker = new THREE.Group();
-    marker.name = pivot.semanticId;
-    marker.userData.semanticId = pivot.semanticId;
-    marker.position.set(...pivot.origin);
-    group.add(marker);
-  }
-  for (const mesh of meshes) {
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(mesh.positions, 3));
-    geometry.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
-    geometry.computeVertexNormals();
-    const material = new THREE.MeshStandardMaterial({ color: 0x6b7358, roughness: 0.7 });
-    material.flatShading = true;
-    const object = new THREE.Mesh(geometry, material);
-    object.name = mesh.semanticId;
-    object.userData.semanticId = mesh.semanticId;
-    if (mesh.role) object.userData.semanticRole = mesh.role;
-    group.add(object);
-  }
-  return group;
-}
-
-/** Evaluates one seed tier through the real active-phase deterministic gate path. */
-async function evaluateSeed(workspace: ResumedWorkspace, phase: string, oracle: THREE.Object3D, authoritativeDimensions: Record<string, number> | undefined, seedRoot: THREE.Object3D): Promise<{ passed: boolean; score: number; failingGates: Array<{ code: string; score: number; message: string }> }> {
+/** Evaluates one composed candidate through the real active-phase deterministic gate path. */
+async function evaluateComposedCandidate(
+  workspace: ResumedWorkspace,
+  phase: string,
+  oracle: THREE.Object3D,
+  authoritativeDimensions: Record<string, number> | undefined,
+  composed: CandidateRuntime,
+): Promise<{
+  passed: boolean;
+  score: number;
+  triangles: number;
+  meshes: number;
+  failingGates: Array<{ code: string; score: number; message: string }>;
+}> {
   const subjectContract = workspace.resolved.subjectContract
     ? JSON.parse(await readFile(workspace.resolved.subjectContract, "utf8")) as GenericSubjectContract
     : undefined;
-  const candidateRuntime: CandidateRuntime = { root: seedRoot, setPose: () => {} };
   const evaluation = await evaluateCandidateWithPoses({
     oracle,
-    candidate: candidateRuntime,
+    candidate: composed,
     profile: workspace.project.profile,
     style: workspace.styleContract,
     certification: workspace.state.certification,
@@ -623,9 +718,14 @@ async function evaluateSeed(workspace: ResumedWorkspace, phase: string, oracle: 
     phase,
   });
   const phaseReport = evaluation.phaseGates[phase];
+  // Early complexity admissibility over the COMPOSED totals: geometrically acceptable is not
+  // yet lockable when the workspace hard style ceiling is already exceeded.
+  const composedSnapshot = snapshotScene(composed.root);
   return {
     passed: evaluation.passed && Boolean(phaseReport?.passed),
     score: phaseReport?.score ?? evaluation.contractGates.score,
+    triangles: composedSnapshot.triangleCount,
+    meshes: composedSnapshot.meshCount,
     failingGates: [
       ...evaluation.deterministic.rows.filter((row) => !row.passed).map((row) => ({ code: row.code, score: row.score, message: row.message })),
       ...Object.values(evaluation.phaseGates).flatMap((report) => report.rows.filter((row) => !row.passed).map((row) => ({ code: row.code, score: row.score, message: row.message }))),
@@ -635,7 +735,7 @@ async function evaluateSeed(workspace: ResumedWorkspace, phase: string, oracle: 
 
 async function writeDerivedArtifacts(workspace: ResumedWorkspace, manifest: DerivationManifest, moduleSource: string): Promise<{ modulePath: string; manifestPath: string }> {
   const modulePath = resolve(workspace.root, manifest.generatedModulePath);
-  await mkdir(resolve(workspace.root, "model/.generated"), { recursive: true });
+  await mkdir(resolve(workspace.root, GENERATED_DIRECTORY), { recursive: true });
   await writeFile(modulePath, moduleSource);
   const manifestDirectory = derivedDirectory(workspace.layout.internal.root);
   await mkdir(manifestDirectory, { recursive: true });
@@ -644,30 +744,32 @@ async function writeDerivedArtifacts(workspace: ResumedWorkspace, manifest: Deri
   return { modulePath, manifestPath };
 }
 
-/** Rewrites an untouched model scaffold to compose every recorded generated seed module. */
-async function wireModelScaffold(workspace: ResumedWorkspace, manifests: DerivationManifest[]): Promise<"wrote-model-scaffold" | "manual-wiring-required"> {
+const REGISTRY_IMPORT_PATTERN = /\.generated\/registry\.mjs/u;
+
+/**
+ * Regenerates the pipeline-owned composition layer from current manifests. The authored
+ * entry stays stable: pristine scaffolds (legacy plain or registry-aware) are migrated to
+ * the registry scaffold once, after which only registry.mjs changes per derivation.
+ */
+async function wireGeneratedComposition(workspace: ResumedWorkspace, orderedPhases: ReadonlyArray<string>): Promise<DeriveResult["wiring"]> {
   const modelEntryPath = resolve(workspace.root, workspace.project.model);
-  const current = await readFile(modelEntryPath, "utf8");
-  if (current.trim() !== MODEL_SCAFFOLD.trim()) return "manual-wiring-required";
-  const ordered = [...manifests].sort((a, b) => a.generatedModulePath.localeCompare(b.generatedModulePath));
-  const identifier = (phase: string): string => `createSeed${phase.replace(/[^a-z0-9]+/giu, "")}`;
-  const lines: string[] = [`import * as THREE from "three";`];
-  for (const manifest of ordered) {
-    lines.push(`import { createSeed as ${identifier(manifest.phase)} } from "./.generated/${manifest.phase}.mjs";`);
+  let current: string;
+  try {
+    current = await readFile(modelEntryPath, "utf8");
+  } catch {
+    return "manual-wiring-required";
   }
-  lines.push(``);
-  lines.push(`export function createCandidate() {`);
-  lines.push(`  const root = new THREE.Group();`);
-  lines.push(`  root.name = "candidate";`);
-  for (const manifest of ordered) lines.push(`  root.add(${identifier(manifest.phase)}());`);
-  lines.push(`  return {`);
-  lines.push(`    root,`);
-  lines.push(`    setPose() {},`);
-  lines.push(`  };`);
-  lines.push(`}`);
-  lines.push(``);
-  await writeFile(modelEntryPath, lines.join("\n"));
-  return "wrote-model-scaffold";
+  const trimmed = current.trim();
+  const pristine = trimmed === MODEL_SCAFFOLD.trim() || trimmed === MODEL_DERIVED_SCAFFOLD.trim() || REGISTRY_IMPORT_PATTERN.test(current);
+  await mkdir(resolve(workspace.root, GENERATED_DIRECTORY), { recursive: true });
+  await writeFile(resolve(workspace.root, GENERATED_REGISTRY_PATH), generateRegistrySource(workspace.project.profile, orderedPhases));
+  if (!pristine) return "manual-wiring-required";
+  const scaffold = MODEL_DERIVED_SCAFFOLD;
+  if (trimmed !== scaffold.trim()) {
+    await writeFile(modelEntryPath, scaffold);
+    return "initialized-scaffold";
+  }
+  return "updated-registry";
 }
 
 async function readAllManifests(workspace: ResumedWorkspace): Promise<DerivationManifest[]> {
@@ -686,17 +788,51 @@ async function readAllManifests(workspace: ResumedWorkspace): Promise<Derivation
   return manifests;
 }
 
-/** Trusted-audit options bound to the CURRENT preparation for workspace commands. */
+/** Trusted-audit options bound to preparation + state bindings + canonical paths. */
 export async function trustedGeneratedAuditOptions(workspace: ResumedWorkspace, identity?: string): Promise<{ trustedGeneratedModules: Map<string, unknown> }> {
   const preparationIdentity = identity ?? (await verifyWorkspaceOraclePreparation(workspace)).binding.identity;
-  const trusted = await loadTrustedGeneratedModules(derivedDirectory(workspace.layout.internal.root), workspace.root, preparationIdentity);
+  const state = await loadTaskState(workspace.layout.internal.state);
+  const contract = getProfileContract(workspace.project.profile);
+  const allowedPhases = new Set(contract.phases.filter((phase) => phase.owner === "builder").map((phase) => phase.id));
+  const trusted = await loadTrustedGeneratedModules({
+    directory: derivedDirectory(workspace.layout.internal.root),
+    workspaceRoot: workspace.root,
+    preparationIdentity,
+    bindings: state.derivedBindings ?? {},
+    allowedPhases,
+  });
   return { trustedGeneratedModules: trusted };
 }
 
+/** Ordered derived phases known to the workspace, in profile contract dependency order. */
+function orderedDerivedPhases(profile: ProfileId, manifests: DerivationManifest[]): string[] {
+  const present = new Set(manifests.map((manifest) => manifest.phase));
+  const contractOrder = getProfileContract(profile).phases.map((phase) => phase.id).filter((id) => present.has(id));
+  for (const phase of [...present].sort()) if (!contractOrder.includes(phase)) contractOrder.push(phase);
+  return contractOrder;
+}
+
 /**
- * Creates the best cheap source-derived seed for the active builder phase, selects the
- * simplest tier that clears the active deterministic gates, writes the trusted generated
- * module plus its provenance manifest, and binds both into durable state.
+ * Pure tier-selection policy: geometrically acceptable is distinct from LOCKABLE. A tier that
+ * cleared active gates but violates the hard style ceiling is diagnostic repair input only.
+ */
+export function resolveSeedOutcome(tierResults: ReadonlyArray<DeriveTierResult>): { status: DeriveStatus; reasonCode?: DeriveReasonCode; chosen?: DeriveTierResult } {
+  const eligiblePassing = tierResults.find((tier) => tier.passed && tier.withinComplexityBudget !== false);
+  const overBudgetPassing = tierResults.filter((tier) => tier.passed && tier.withinComplexityBudget === false);
+  if (eligiblePassing) return { status: "seed-passing", chosen: eligiblePassing };
+  if (overBudgetPassing.length) {
+    return { status: "seed-diagnostic-overbudget", reasonCode: "derive.over-budget-fallback", chosen: overBudgetPassing.reduce((best, tier) => (tier.score > best.score ? tier : best)) };
+  }
+  const best = tierResults.reduce<DeriveTierResult | undefined>((acc, tier) => (!acc || tier.score > acc.score ? tier : acc), undefined);
+  return { status: "seed-retained-failing", reasonCode: "derive.no-passing-tier", ...(best ? { chosen: best } : {}) };
+}
+
+/**
+ * Creates the best cheap source-derived seed for the active builder phase and evaluates it
+ * IN CONTEXT: locked prerequisite geometry stays in place, previous active-phase geometry is
+ * temporarily replaced, future-phase geometry is rejected. The simplest tier that clears the
+ * active deterministic gates WITHIN the style complexity ceiling wins; an over-budget pass is
+ * retained only as diagnostic repair input and never reported as a lockable seed.
  */
 export async function derivePhaseSeed(workspaceInput: string, options: DeriveOptions = {}): Promise<DeriveResult> {
   const { resumeWorkspace } = await import("./workspace.js");
@@ -713,62 +849,83 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   const snapshot = snapshotScene(oracle);
   const authoritativeDimensions = preparation.manifest.authoritativeDimensions ?? undefined;
 
+  // Live candidate context for composition: audited under CURRENT trust authority.
+  const liveCandidateIdentity = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace, preparation.binding.identity));
+
   let seed: PhaseSeed;
   const analytic = route.operator !== "mesh-simplify";
   if (route.operator === "mesh-simplify") {
     seed = await buildMeshSimplifySeed(snapshot, phase);
   } else if (route.operator === "radial-fit") {
     const built = buildRadialSeed(snapshot);
-    if (!built.moduleMeshes.length) throw new Error("prepared oracle carries no running-gear instances to derive from");
+    if (!built.nodes.length) throw new Error("prepared oracle carries no running-gear instances to derive from");
     seed = {
       name: "running-gear",
-      pivots: [],
-      inputGeometryHash: sha256(canonicalJson(built.moduleMeshes.map((mesh) => ({ id: mesh.semanticId, radiusBounds: measureWheelRadialProfile(snapshot, mesh.semanticId)?.meanRadius ?? null })))),
+      inputGeometryHash: sha256(canonicalJson(built.nodes.map((node) => ({ id: node.semanticId, radiusBounds: measureWheelRadialProfile(snapshot, node.semanticId)?.meanRadius ?? null })))),
       inputTriangles: built.inputTriangles,
-      simplify: async () => ({ meshes: built.moduleMeshes }),
+      simplify: async () => ({ nodes: built.nodes }),
     };
   } else if (route.operator === "course-regenerate") {
     const built = buildTrackSeed(snapshot);
-    if (!built.moduleMeshes.length) throw new Error("prepared oracle carries no track courses to derive from");
+    if (!built.nodes.length) throw new Error("prepared oracle carries no track courses to derive from");
     seed = {
       name: "tracks",
-      pivots: [],
-      inputGeometryHash: sha256(canonicalJson(built.moduleMeshes.map((mesh) => ({ id: mesh.semanticId, bounds: mesh.indices.length })))),
+      inputGeometryHash: sha256(canonicalJson(built.nodes.map((node) => ({ id: node.semanticId, indices: node.indices!.length })))),
       inputTriangles: built.inputTriangles,
-      simplify: async () => ({ meshes: built.moduleMeshes }),
+      simplify: async () => ({ nodes: built.nodes }),
     };
   } else {
     const built = buildGunSeed(snapshot);
     seed = {
       name: "gun",
-      pivots: built.pivots,
-      inputGeometryHash: geometryBytesHash(built.moduleMeshes[0]!.positions, built.moduleMeshes[0]!.indices),
+      inputGeometryHash: geometryBytesHash(built.nodes[1]!.positions!, built.nodes[1]!.indices!),
       inputTriangles: built.inputTriangles,
-      simplify: async () => ({ meshes: built.moduleMeshes }),
+      simplify: async () => ({ nodes: built.nodes }),
     };
   }
 
+  const triangleMax = workspace.styleContract.complexity.triangleMax;
+  const meshMax = workspace.styleContract.complexity.meshMax;
+
   const tierResults: DeriveTierResult[] = [];
-  const evaluated = new Map<DeriveTierResultTier, { meshes: SeedMesh[]; error?: number }>();
+  const evaluatedNodes = new Map<DeriveTierResultTier, SeedNode[]>();
   for (const tier of tiersForQuality(options.quality, analytic)) {
     const built = await seed.simplify(tier.ratio, tier.error);
-    const outputTriangles = built.meshes.reduce((sum, mesh) => sum + mesh.indices.length / 3, 0);
+    const outputTriangles = built.nodes.reduce((sum, node) => sum + (node.indices?.length ?? 0) / 3, 0);
     if (!outputTriangles) continue;
-    evaluated.set(tier.tier, built);
-    const verdict = await evaluateSeed(workspace, phase, oracle, authoritativeDimensions, buildSeedGroup(seed.name, seed.pivots, built.meshes));
-    tierResults.push({ tier: tier.tier, triangles: outputTriangles, passed: verdict.passed, score: verdict.score, failingGates: verdict.failingGates, ...(built.error !== undefined ? { simplifierError: built.error } : {}) });
-    if (verdict.passed) break;
+    const replacement = buildSeedGroup(seed.name, built.nodes);
+    const composed: ComposedCandidateRuntime = composeCandidateForPhase({
+      profile: workspace.project.profile,
+      phase,
+      liveCandidate: liveCandidateIdentity.runtime,
+      replacement,
+    });
+    let verdict: Awaited<ReturnType<typeof evaluateComposedCandidate>>;
+    try {
+      verdict = await evaluateComposedCandidate(workspace, phase, oracle, authoritativeDimensions, composed);
+    } finally {
+      composed.dispose();
+    }
+    evaluatedNodes.set(tier.tier, built.nodes);
+    const withinBudget = verdict.triangles <= triangleMax && verdict.meshes <= meshMax;
+    tierResults.push({
+      tier: tier.tier,
+      triangles: outputTriangles,
+      passed: verdict.passed,
+      score: verdict.score,
+      failingGates: verdict.failingGates,
+      withinComplexityBudget: withinBudget,
+      ...(built.error !== undefined ? { simplifierError: built.error } : {}),
+    });
+    if (verdict.passed && withinBudget) break;
   }
 
-  const passing = tierResults.find((tier) => tier.passed);
-  const retained = tierResults.reduce((best, tier) => (!best || tier.score > best.score ? tier : best), tierResults[0]);
-  const chosen = passing ?? retained;
+  const { status, reasonCode, chosen } = resolveSeedOutcome(tierResults);
   if (!chosen) throw new Error("no derive tier produced usable geometry for the active phase");
-  const status: DeriveResult["status"] = passing ? "seed-passing" : "seed-retained-failing";
-  const built = evaluated.get(chosen.tier)!;
+  const builtNodes = evaluatedNodes.get(chosen.tier)!;
 
-  const outputHash = sha256(canonicalJson(built.meshes.map((mesh) => ({ id: mesh.semanticId, geometryHash: geometryBytesHash(mesh.positions, mesh.indices) }))));
-  const moduleSource = emitGeneratedModule(seed.name, built.meshes, seed.pivots);
+  const outputHash = sha256(canonicalJson(builtNodes.filter((node) => node.kind === "mesh").map((node) => ({ id: node.semanticId, geometryHash: geometryBytesHash(node.positions!, node.indices!) }))));
+  const moduleSource = emitGeneratedModule(seed.name, builtNodes);
   const manifest: DerivationManifest = {
     schemaVersion: 1,
     kind: "mesh2threejs-derived-seed",
@@ -783,7 +940,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     },
     inputGeometryHash: seed.inputGeometryHash,
     outputGeometryHash: outputHash,
-    generatedModulePath: `model/.generated/${seed.name}.mjs`,
+    generatedModulePath: `${GENERATED_DIRECTORY}/${seed.name}.mjs`,
     generatedModuleHash: sha256(Buffer.from(moduleSource, "utf8")),
     inputTriangles: seed.inputTriangles,
     outputTriangles: chosen.triangles,
@@ -791,27 +948,43 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   };
 
   let workorders: Workorder[] | undefined;
-  if (!passing) {
+  if (status !== "seed-passing") {
     try {
       const subjectContract = workspace.resolved.subjectContract
         ? JSON.parse(await readFile(workspace.resolved.subjectContract, "utf8")) as GenericSubjectContract
         : undefined;
-      const evaluation = await evaluateCandidateWithPoses({
-        oracle,
-        candidate: { root: buildSeedGroup(seed.name, seed.pivots, built.meshes), setPose: () => {} } satisfies CandidateRuntime,
-        profile: workspace.project.profile,
-        style: workspace.styleContract,
-        certification: workspace.state.certification,
-        ...(authoritativeDimensions ? { authoritativeDimensions: authoritativeDimensions as { hullLength: number; overallLength: number; width: number; height: number } } : {}),
-        ...(subjectContract ? { subjectContract } : {}),
-        phase,
-      });
+      const replacement = buildSeedGroup(seed.name, builtNodes);
+      const composed = composeCandidateForPhase({ profile: workspace.project.profile, phase, liveCandidate: liveCandidateIdentity.runtime, replacement });
+      let evaluation;
+      try {
+        evaluation = await evaluateCandidateWithPoses({
+          oracle,
+          candidate: composed,
+          profile: workspace.project.profile,
+          style: workspace.styleContract,
+          certification: workspace.state.certification,
+          ...(authoritativeDimensions ? { authoritativeDimensions: authoritativeDimensions as { hullLength: number; overallLength: number; width: number; height: number } } : {}),
+          ...(subjectContract ? { subjectContract } : {}),
+          phase,
+        });
+      } finally {
+        composed.dispose();
+      }
       workorders = evaluation.phaseGates[phase]?.workorders ?? [];
+      if (status === "seed-diagnostic-overbudget") {
+        workorders = [{
+          component: "style-complexity",
+          errorKind: "derive.over-budget-fallback",
+          priority: "critical",
+          correction: `derived ${chosen.tier} geometry clears the active gates but the composed candidate exceeds the style ceiling (${triangleMax} triangles / ${meshMax} meshes); simplify the representation further or lower derive quality`,
+          phase,
+        }, ...workorders];
+      }
     } catch { /* retain without workorder detail */ }
   }
 
   const written = await writeDerivedArtifacts(workspace, manifest, moduleSource);
-  const wiring = await wireModelScaffold(workspace, await readAllManifests(workspace));
+  const wiring = await wireGeneratedComposition(workspace, orderedDerivedPhases(workspace.project.profile, await readAllManifests(workspace)));
 
   const nextState = await loadTaskState(workspace.layout.internal.state);
   nextState.derivedBindings[manifest.generatedModulePath] = {
@@ -822,23 +995,29 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   nextState.systemDecisions.push({
     id: `derived-seed-${nextState.systemDecisions.length + 1}`,
     value: manifest.generatedModulePath,
-    reason: `derive produced a ${chosen.tier} ${route.operator} seed for phase ${phase} (${seed.inputTriangles} -> ${chosen.triangles} triangles)`,
+    reason: `derive produced a ${chosen.tier} ${route.operator} seed for phase ${phase} (${seed.inputTriangles} -> ${chosen.triangles} triangles, status ${status})`,
   });
   await saveTaskState(workspace.layout.internal.state, nextState);
-  // The live candidate changed (new generated module bytes plus possibly rewritten scaffold);
-  // prove it audits and loads cleanly under the CURRENT preparation binding before reporting.
+  // The live candidate changed (new generated module bytes plus regenerated registry);
+  // prove it audits and loads cleanly under the CURRENT trust authority before reporting.
   await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace, preparation.binding.identity));
 
+  const note = status === "seed-passing"
+    ? undefined
+    : status === "seed-diagnostic-overbudget"
+      ? "the retained seed passes active gates but exceeds the style complexity ceiling; it is diagnostic repair input only and must be simplified before locking"
+      : "no tier cleared the active gates; the highest-scoring tier was retained with its failing workorders";
   return {
     status,
+    ...(reasonCode ? { reasonCode } : {}),
     phase,
     operator: route.operator,
     generatedModule: relative(workspace.root, written.modulePath).replaceAll("\\", "/"),
     manifest: relative(workspace.root, written.manifestPath).replaceAll("\\", "/"),
     tiers: tierResults,
-    ...(passing ? { selected: passing } : {}),
+    ...(status === "seed-passing" ? { selected: chosen } : {}),
     ...(workorders ? { workorders } : {}),
-    wiring,
-    ...(status === "seed-retained-failing" ? { note: "no tier cleared the active gates; the highest-scoring tier was retained with its failing workorders" } : {}),
+    ...(wiring ? { wiring } : {}),
+    ...(note ? { note } : {}),
   };
 }

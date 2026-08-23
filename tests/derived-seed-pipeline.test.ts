@@ -7,6 +7,7 @@ import {
   auditCandidateModule,
   createTaskState,
   createWorkspaceResolver,
+  derivationManifestHash,
   derivePhaseSeed,
   evaluateTankProfile,
   initializeWorkspace,
@@ -26,10 +27,11 @@ async function exists(path: string): Promise<boolean> {
   try { await stat(path); return true; } catch { return false; }
 }
 
-function semanticMesh(id: string, geometry: THREE.BufferGeometry, position: [number, number, number]): THREE.Mesh {
+function semanticMesh(id: string, geometry: THREE.BufferGeometry, position: [number, number, number], role?: string): THREE.Mesh {
   const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0x6b7358, roughness: 0.7 }));
   mesh.name = id;
   mesh.userData.semanticId = id;
+  if (role) mesh.userData.semanticRole = role;
   mesh.position.set(...position);
   return mesh;
 }
@@ -158,12 +160,12 @@ describe("authorship mode defaults and compatibility", () => {
   });
 });
 
-describe("run B opaque topology regression", () => {
-  test("hand-authored opaque hex payloads fail the audit; verified generated modules pass; tampered and stale fail closed", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-opaque-"));
-    const modulePath = join(directory, "model.mjs");
-    const hexPayload = Array.from({ length: 1200 }, (_, index) => ((index * 37) % 255).toString(16).padStart(2, "0")).join("");
-    await writeFile(modulePath, `import * as THREE from "three";
+describe("run B opaque topology and derivation trust regression", () => {
+  const sha256File = async (path: string): Promise<string> => (await import("node:crypto")).createHash("sha256").update(await readFile(path)).digest("hex");
+  const canonicalModule = (directory: string): string => join(directory, "model", ".generated", "hull.mjs");
+
+  function writeOpaqueModule(path: string, hexPayload: string): string {
+    return `import * as THREE from "three";
 const HULL_HEX = "${hexPayload}";
 export function createCandidate() {
   const bytes = new Uint8Array(HULL_HEX.length / 2);
@@ -173,43 +175,84 @@ export function createCandidate() {
   geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(bytes.buffer), 3));
   return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial());
 }
-`);
+`;
+  }
+
+  function trustedInput(options: { directory: string; workspaceRoot: string; identity: string; bindings: Record<string, { manifestHash: string; generatedModuleHash: string; oraclePreparationIdentity: string }> }): Parameters<typeof loadTrustedGeneratedModules>[0] {
+    return {
+      directory: options.directory,
+      workspaceRoot: options.workspaceRoot,
+      preparationIdentity: options.identity,
+      bindings: options.bindings as never,
+      allowedPhases: new Set(["hull"]),
+    };
+  }
+
+  test("sidecars alone are not authority; full state-bound trust is required end to end", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-opaque-"));
+    const modulePath = canonicalModule(directory);
+    const hexPayload = Array.from({ length: 1200 }, (_, index) => ((index * 37) % 255).toString(16).padStart(2, "0")).join("");
+    await mkdir(join(directory, "model", ".generated"), { recursive: true });
+    await writeFile(modulePath, writeOpaqueModule(modulePath, hexPayload));
     const untrusted = await auditCandidateModule(modulePath);
     expect(untrusted.passed).toBe(false);
     expect(untrusted.findings.map((finding) => finding.code)).toContain("opaque-topology-payload");
 
+    // Fake sidecar + fake module + NO state binding: fail.
     const internal = join(directory, ".mesh2threejs", "derived");
     await mkdir(internal, { recursive: true });
     const manifest = {
-      schemaVersion: 1,
-      kind: "mesh2threejs-derived-seed",
+      schemaVersion: 1 as const,
+      kind: "mesh2threejs-derived-seed" as const,
       phase: "hull",
       oraclePreparationIdentity: "identity-a",
       preparedOracleHash: "a".repeat(64),
-      operator: "mesh-simplify",
+      operator: "mesh-simplify" as const,
       recipe: { tier: "balanced" },
       inputGeometryHash: "b".repeat(64),
       outputGeometryHash: "c".repeat(64),
-      generatedModulePath: modulePath.replaceAll("\\", "/"),
-      generatedModuleHash: (await import("node:crypto")).createHash("sha256").update(await readFile(modulePath)).digest("hex"),
+      generatedModulePath: "model/.generated/hull.mjs",
+      generatedModuleHash: await sha256File(modulePath),
       inputTriangles: 100,
       outputTriangles: 10,
     };
     await writeFile(join(internal, "hull.json"), `${JSON.stringify(manifest)}\n`);
+    const noBinding = await loadTrustedGeneratedModules(trustedInput({ directory: internal, workspaceRoot: directory, identity: "identity-a", bindings: {} }));
+    expect(noBinding.size).toBe(0);
+    expect((await auditCandidateModule(modulePath, { trustedGeneratedModules: noBinding })).passed).toBe(false);
 
-    const trusted = await loadTrustedGeneratedModules(internal, directory, "identity-a");
+    // Full authority (manifest + matching state binding): the only passing path.
+    const binding = { manifestHash: derivationManifestHash(manifest), generatedModuleHash: manifest.generatedModuleHash, oraclePreparationIdentity: "identity-a" };
+    const trusted = await loadTrustedGeneratedModules(trustedInput({ directory: internal, workspaceRoot: directory, identity: "identity-a", bindings: { "model/.generated/hull.mjs": binding } }));
     expect(trusted.size).toBe(1);
     const trustedAudit = await auditCandidateModule(modulePath, { trustedGeneratedModules: trusted });
     expect(trustedAudit.passed).toBe(true);
     expect(trustedAudit.trustedGeneratedModules).toHaveLength(1);
 
-    // Tampered bytes no longer match the manifest hash: the loader drops it, the audit fails.
+    // Tampered module bytes break both hash authorities.
     await writeFile(modulePath, `${await readFile(modulePath, "utf8")}\n// tampered\n`);
-    expect((await loadTrustedGeneratedModules(internal, directory, "identity-a")).size).toBe(0);
-    expect((await auditCandidateModule(modulePath, { trustedGeneratedModules: await loadTrustedGeneratedModules(internal, directory, "identity-a") })).passed).toBe(false);
+    expect((await loadTrustedGeneratedModules(trustedInput({ directory: internal, workspaceRoot: directory, identity: "identity-a", bindings: { "model/.generated/hull.mjs": binding } }))).size).toBe(0);
 
-    // A manifest bound to a previous preparation identity never authorizes anything.
-    expect((await loadTrustedGeneratedModules(internal, directory, "identity-b")).size).toBe(0);
+    // Stale binding (old generation hash) fails even though the manifest still matches bytes? No:
+    // restore bytes; stale BINDING hashes must fail closed.
+    await writeFile(modulePath, writeOpaqueModule(modulePath, hexPayload));
+    const staleBinding = { ...binding, generatedModuleHash: "d".repeat(64) };
+    expect((await loadTrustedGeneratedModules(trustedInput({ directory: internal, workspaceRoot: directory, identity: "identity-a", bindings: { "model/.generated/hull.mjs": staleBinding } }))).size).toBe(0);
+
+    // A manifest/binding bound to a previous preparation identity never authorizes anything.
+    expect((await loadTrustedGeneratedModules(trustedInput({ directory: internal, workspaceRoot: directory, identity: "identity-b", bindings: { "model/.generated/hull.mjs": binding } }))).size).toBe(0);
+
+    // Path escape: a canonical-looking name outside model/.generated/ is never trusted.
+    const escapedManifest = { ...manifest, generatedModulePath: "model/../../escaped.mjs" };
+    await writeFile(join(internal, "escape.json"), `${JSON.stringify(escapedManifest)}\n`);
+    expect((await loadTrustedGeneratedModules(trustedInput({ directory: internal, workspaceRoot: directory, identity: "identity-a", bindings: {} }))).size).toBe(0);
+    await rm(join(internal, "escape.json"));
+
+    // Absolute generated paths are rejected outright.
+    const absoluteManifest = { ...manifest, generatedModulePath: resolve(modulePath) };
+    await writeFile(join(internal, "absolute.json"), `${JSON.stringify(absoluteManifest)}\n`);
+    expect((await loadTrustedGeneratedModules(trustedInput({ directory: internal, workspaceRoot: directory, identity: "identity-a", bindings: {} }))).size).toBe(0);
+    await rm(join(internal, "absolute.json"));
   });
 });
 
@@ -267,10 +310,11 @@ describe("hull contiguity anti-stitch regression", () => {
 });
 
 describe("phase semantic scope regression", () => {
-  function marker(id: string, position: [number, number, number]): THREE.Group {
+  function marker(id: string, position: [number, number, number], role?: string): THREE.Group {
     const group = new THREE.Group();
     group.name = id;
     group.userData.semanticId = id;
+    if (role) group.userData.semanticRole = role;
     group.position.set(...position);
     return group;
   }
@@ -291,6 +335,40 @@ describe("phase semantic scope regression", () => {
     turretPhase.add(marker("turret-pivot", [0, 1.6, 0]));
     turretPhase.add(semanticMesh("turret", new THREE.BoxGeometry(1, 0.5, 1), [0, 1.8, 0]));
     expect(() => assertPhaseSemanticScope("tank", "turret", turretPhase)).not.toThrow();
+
+    // Turret derivation may produce a cupola; scope must admit it during turret and keep
+    // it admitted for every later phase.
+    turretPhase.add(semanticMesh("cupola", new THREE.CylinderGeometry(0.2, 0.25, 0.2, 8), [0.3, 2.1, 0]));
+    expect(() => assertPhaseSemanticScope("tank", "turret", turretPhase)).not.toThrow();
+    expect(() => assertPhaseSemanticScope("tank", "gun", turretPhase)).not.toThrow();
+    expect(() => assertPhaseSemanticScope("tank", "tracks", turretPhase)).not.toThrow();
+
+    // Future-phase geometry stays out of the turret phase.
+    turretPhase.add(semanticMesh("gun", new THREE.CylinderGeometry(0.1, 0.1, 2, 8), [0, 1.8, 1.5]));
+    expect(() => assertPhaseSemanticScope("tank", "turret", turretPhase)).toThrow(/phase-scope violation/iu);
+  });
+
+  test("running-gear rejects tracks; tracks phase admits the full cumulative prerequisite set", () => {
+    const runningGear = new THREE.Group();
+    runningGear.add(semanticMesh("hull", new THREE.BoxGeometry(3, 1, 6), [0, 1, 0]));
+    runningGear.add(marker("turret-pivot", [0, 1.6, 0]));
+    runningGear.add(semanticMesh("turret", new THREE.BoxGeometry(1, 0.5, 1), [0, 1.8, 0]));
+    runningGear.add(semanticMesh("cupola", new THREE.CylinderGeometry(0.2, 0.25, 0.2, 8), [0.3, 2.1, 0]));
+    runningGear.add(marker("gun-pivot", [0, 1.8, 0.5]));
+    runningGear.add(semanticMesh("gun", new THREE.CylinderGeometry(0.1, 0.1, 2, 8), [0, 1.8, 1.5]));
+    expect(() => assertPhaseSemanticScope("tank", "gun", runningGear)).not.toThrow();
+
+    // Running gear is still future geometry during the gun phase…
+    runningGear.add(semanticMesh("road-wheel-l1", new THREE.CylinderGeometry(0.35, 0.35, 0.2, 10), [1.5, 0.35, 2], "road-wheel"));
+    expect(() => assertPhaseSemanticScope("tank", "gun", runningGear)).toThrow(/phase-scope violation/iu);
+    // …but inside scope once the running-gear phase is active.
+    expect(() => assertPhaseSemanticScope("tank", "running-gear", runningGear)).not.toThrow();
+
+    // Tracks are still future geometry during running-gear…
+    runningGear.add(semanticMesh("track-l", new THREE.BoxGeometry(0.3, 1.1, 6), [1.5, 0.58, 0], "track-course"));
+    expect(() => assertPhaseSemanticScope("tank", "running-gear", runningGear)).toThrow(/phase-scope violation/iu);
+    // …but inside scope once the tracks phase is active.
+    expect(() => assertPhaseSemanticScope("tank", "tracks", runningGear)).not.toThrow();
   });
 });
 
@@ -346,7 +424,10 @@ describe("derived seed end-to-end", () => {
     const manifest = JSON.parse(await readFile(resolve(root, ".mesh2threejs", "derived", "hull.json"), "utf8")) as { inputTriangles: number; outputTriangles: number; generatedModuleHash: string };
     expect(manifest.outputTriangles).toBeLessThan(manifest.inputTriangles * 0.1);
     expect(await exists(resolve(root, "model", ".generated", "hull.mjs"))).toBe(true);
-    expect(await readFile(resolve(root, "model", "model.mjs"), "utf8")).toMatch(/\.generated\/hull\.mjs/u);
+    // The stable authored entry imports only the pipeline-owned registry; the phase module
+    // is wired through registry.mjs regeneration.
+    expect(await readFile(resolve(root, "model", "model.mjs"), "utf8")).toMatch(/\.generated\/registry\.mjs/u);
+    expect(await readFile(resolve(root, "model", ".generated", "registry.mjs"), "utf8")).toMatch(/\.\/hull\.mjs/u);
 
     const state = await loadTaskState(createWorkspaceResolver(root).layout.internal.state);
     expect(Object.keys(state.derivedBindings)).toContain("model/.generated/hull.mjs");

@@ -22,6 +22,7 @@ import { selectRepairGroup } from "./core/compare.js";
 import { createEvaluationIdentity, EVALUATOR_VERSION, evaluationIdentityHash, MEASUREMENT_VERSION, optionalContractHash } from "./core/identity.js";
 import { loadStyleContract } from "./styles/low-poly.js";
 import { derivePhaseSeed, trustedGeneratedAuditOptions } from "./core/derive.js";
+import { phaseSemanticScope } from "./core/phase-compose.js";
 import { snapshotScene } from "./core/geometry.js";
 import type { TaskState } from "./core/state.js";
 
@@ -88,25 +89,20 @@ function storedArtifactPath(path: string, root?: string): string {
 }
 
 /**
- * Cumulative active-phase semantic scope for the tank profile: a phase may carry its own
- * semantics plus everything earlier phases legitimately contributed. Future-phase geometry
- * (a box turret parked in a hull-phase candidate) is refused with a phase-scope error before
- * any gate runs, so placeholders cannot survive merely by being ignored by active gates.
+ * Cumulative active-phase semantic scope from the single authoritative ownership model:
+ * a phase may carry its own semantics plus everything prerequisite phases legitimately
+ * contributed. Future-phase geometry (a box turret parked in a hull-phase candidate) is
+ * refused with a phase-scope error before any gate runs, so placeholders cannot survive
+ * merely by being ignored by active gates.
  */
-const TANK_PHASE_SEMANTIC_SCOPE: Record<string, (id: string) => boolean> = {
-  hull: (id) => /^hull/u.test(id),
-  turret: (id) => /^hull/u.test(id) || id === "turret" || id === "turret-pivot",
-  gun: (id) => (/^hull/u.test(id) || id === "turret" || id === "turret-pivot" || id === "gun" || id === "gun-pivot"),
-  "running-gear": (id) => (/^hull/u.test(id) || id === "turret" || id === "turret-pivot" || id === "gun" || id === "gun-pivot" || /^(road-wheel|sprocket|idler|return-roller)/u.test(id)),
-  tracks: (id) => (/^hull/u.test(id) || id === "turret" || id === "turret-pivot" || id === "gun" || id === "gun-pivot" || /^(road-wheel|sprocket|idler|return-roller|track)/u.test(id)),
-};
-
 export function assertPhaseSemanticScope(profile: ProfileId, activePhase: string | undefined, root: import("three").Object3D): void {
-  if (profile !== "tank" || !activePhase) return;
-  const allows = TANK_PHASE_SEMANTIC_SCOPE[activePhase];
-  if (!allows) return; // fittings-articulation and later phases admit remaining semantics.
+  if (!activePhase) return;
+  const allows = phaseSemanticScope(profile, activePhase);
+  if (!allows) return; // profile without an ownership model imposes no mechanical restriction.
   const snapshot = snapshotScene(root);
-  const violations = Object.keys(snapshot.components).filter((id) => !allows(id));
+  const violations = Object.entries(snapshot.components)
+    .filter(([id, component]) => !allows(id, component.role))
+    .map(([id]) => id);
   if (violations.length) throw new Error(`phase-scope violation: active phase ${activePhase} does not permit future-phase semantics ${violations.join(", ")}; remove the placeholder or advance to that phase first`);
 }
 

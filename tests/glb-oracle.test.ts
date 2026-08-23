@@ -5,15 +5,16 @@ import { describe, expect, test } from "vitest";
 import * as THREE from "three";
 import { loadPreparedOracle, onboardOracle, probeGlb, repairPreparedOracle, runCli, validateOracleManifest, verifyOracleRegistration } from "../src/index.js";
 
-function minimalGlb(options: { multipart?: boolean; translated?: boolean } = {}): Buffer {
+function minimalGlb(options: { multipart?: boolean; translated?: boolean; sceneOffset?: [number, number, number] } = {}): Buffer {
   const positions = new Float32Array([
     -1, -1, -1, 1, -1, -1, 1, 1, -1,
     -1, -1, -1, 1, 1, -1, -1, 1, -1,
   ]);
   const bin = Buffer.from(positions.buffer);
   const mesh = { primitives: [{ attributes: { POSITION: 0 } }], name: "body" };
+  const offset = options.sceneOffset ?? [0, 0, 0];
   const nodes = options.multipart
-    ? [{ mesh: 0, name: "hull" }, { mesh: 0, name: "turret", translation: [0, 2, 0] }]
+    ? [{ mesh: 0, name: "hull", translation: offset }, { mesh: 0, name: "turret", translation: [offset[0], offset[1] + 2, offset[2]] }]
     : [{ mesh: 0, name: "Object_0", ...(options.translated ? { translation: [3, 0, 0] } : {}) }];
   const json = {
     asset: { version: "2.0", generator: "mesh2threejs-test" },
@@ -94,6 +95,25 @@ describe("source and prepared oracle lifecycle", () => {
     expect(fused.semanticReadiness).toBe("insufficient");
     expect(multipart.semanticReadiness).toBe("partial");
     expect(fused.sha256).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  test("probe suggestions are invariant under whole-scene translation", () => {
+    const centered = probeGlb(minimalGlb({ multipart: true, sceneOffset: [0, 0, 0] }));
+    const positive = probeGlb(minimalGlb({ multipart: true, sceneOffset: [50, 0, 0] }));
+    const negative = probeGlb(minimalGlb({ multipart: true, sceneOffset: [-50, 0, 0] }));
+    for (const probe of [centered, positive, negative]) {
+      expect(probe.scene.nodeCount).toBe(2);
+      expect(probe.scene.meshCount).toBe(1);
+      expect(probe.semanticReadiness).toBe("partial");
+    }
+    // Ranking/confidence/kind must not depend on where the model sits in world space.
+    expect(positive.suggestions).toEqual(centered.suggestions);
+    expect(negative.suggestions).toEqual(centered.suggestions);
+    expect(centered.bounds?.center[0]).toBe(0);
+    expect(positive.bounds?.center[0]).toBe(50);
+    expect(negative.bounds?.center[0]).toBe(-50);
+    expect(positive.bounds?.size).toEqual(centered.bounds?.size);
+    expect(negative.bounds?.size).toEqual(centered.bounds?.size);
   });
 
   test("rejects malformed GLB rather than guessing", () => {

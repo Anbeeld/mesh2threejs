@@ -1,7 +1,7 @@
 import type { CertificationLevel, ProfileId } from "../types.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 
-export const EVALUATOR_VERSION = "7";
+export const EVALUATOR_VERSION = "8";
 export const MEASUREMENT_VERSION = "4";
 
 export interface EvaluationIdentity {

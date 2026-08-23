@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { dirname, extname, join, parse, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as THREE from "three";
@@ -146,11 +147,37 @@ function commonAncestor(files: string[]): string {
 const STAGE_PREFIX = ".mesh2threejs-candidate-";
 
 /**
+ * Staged graphs are imported from a temporary sibling directory. Node resolves bare
+ * specifiers by walking up from the importer, so a workspace anywhere without a
+ * `node_modules` ancestor (any location outside an installed project tree) would lose
+ * access to `three` that the pipeline itself already provides. Expose the pipeline's own
+ * resolved `three` package inside the stage root; a directory junction needs no elevated
+ * rights on Windows, and `rm recursive` unlinks it without touching the target.
+ * Best-effort: when `three` cannot be resolved here the staged import surfaces the real
+ * resolution error itself.
+ */
+async function exposePipelineThree(stageRoot: string): Promise<void> {
+  try {
+    // three's exports map does not expose ./package.json, so resolve the entry and
+    // ascend to the directory that owns a package.json.
+    let directory = dirname(createRequire(import.meta.url).resolve("three"));
+    while (!(await readFile(join(directory, "package.json"), "utf8").then(() => true, () => false))) {
+      const parent = dirname(directory);
+      if (parent === directory) throw new Error("cannot locate three package root");
+      directory = parent;
+    }
+    await mkdir(join(stageRoot, "node_modules"), { recursive: true });
+    await symlink(directory, join(stageRoot, "node_modules", "three"), process.platform === "win32" ? "junction" : "dir");
+  } catch { /* best-effort staging aid; import failures surface from the real import below */ }
+}
+
+/**
  * Stages the exact audited transitive source graph in a fresh location and imports it from there.
  * A bare entry-module cache-buster is insufficient because Node's ESM cache keys transitive local
  * imports by URL; a long-lived process could report source B while executing cached helper A.
- * Staging under the graph's common ancestor keeps bare-specifier resolution (e.g. "three") and
- * package.json module-type semantics identical to the original location, while every load sees the
+ * Staging under the graph's common ancestor keeps package.json module-type semantics identical to
+ * the original location — bare "three" resolution is provided by the stage-root junction in
+ * exposePipelineThree() — while every load sees the
  * bytes that produced the source hash. Execution from the staged copy is short-lived: the directory
  * is removed as soon as the module graph has been instantiated, which is why the audit requires
  * candidate-local imports to be static.
@@ -170,6 +197,7 @@ async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudi
       await mkdir(dirname(staged), { recursive: true });
       await writeFile(staged, bytes, { flag: "wx" });
     }
+    await exposePipelineThree(root);
     return { root, entry: resolve(root, relative(ancestor, entry)) };
   } catch (error) {
     await rm(root, { recursive: true, force: true });

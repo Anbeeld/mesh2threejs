@@ -14,6 +14,7 @@ export * from "./core/measurement.js";
 export * from "./core/oracle.js";
 export * from "./core/orchestration.js";
 export * from "./core/performance.js";
+export * from "./core/phase-compose.js";
 export * from "./core/render.js";
 export * from "./core/review.js";
 export * from "./core/routing.js";

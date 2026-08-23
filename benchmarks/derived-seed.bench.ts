@@ -21,19 +21,21 @@ const stations = [
   { z: 1.6, halfWidth: 1.5, bottom: 0.5, top: 1.5 },
   { z: 2.9, halfWidth: 1.25, bottom: 0.5, top: 1.05 },
 ];
+// Source fixture lives OUTSIDE the workspace and is passed to init explicitly — the same
+// supported entry path as a real user; post-init placement would not enter the reference index.
+const fixturePath = join(parent, "dense-hull.glb");
 const fixture = new THREE.Group();
 fixture.add(semanticMesh("hull", tessellateFiner(createLoftGeometry(stations), 6), [0, 0, 0]));
 fixture.add(semanticMesh("hull-fender", new THREE.BoxGeometry(0.35, 0.08, 2.2).toNonIndexed(), [1.45, 0.95, 0.2]));
 const identity = new Map<string, string>();
 for (const [k, name] of Object.entries(stableSemanticIdentityMap(fixture))) if (!identity.has(name)) identity.set(name, k);
 const semanticMap = Object.fromEntries([...identity].map(([name, key]) => [key, name]));
-const glb = sceneToGlb(fixture);
+await writeFile(fixturePath, sceneToGlb(fixture));
 const beforeRss = process.memoryUsage().rss;
 const start = performance.now();
-await initializeWorkspace(root, { id: "bench-derive", goal: "bench", profile: "tank" });
-await writeFile(join(root, "refs", "oracle", "dense.glb"), glb);
+await initializeWorkspace(root, { id: "bench-derive", goal: "bench", profile: "tank", oracle: fixturePath });
 const resolver = createWorkspaceResolver(root);
-const onboardConfig = { id: "bench", sourcePath: "refs/oracle/dense.glb", preparedPath: ".mesh2threejs/oracle/prepared.json", source: "bench", author: "bench", license: "MIT", redistribution: "p", coordinateFrame: "rh", upAxis: "+y", forwardAxis: "+z", grounding: "min-y", scale: 1, semanticMap, articulationMap: {}, normalization: { translation: [0,0,0], rotationEuler: [0,0,0], scale: 1 }, authoritativeDimensions: null, dimensionSources: [] };
+const onboardConfig = { id: "bench", sourcePath: "refs/oracle/dense-hull.glb", preparedPath: ".mesh2threejs/oracle/prepared.json", source: "bench", author: "bench", license: "MIT", redistribution: "p", coordinateFrame: "rh", upAxis: "+y", forwardAxis: "+z", grounding: "min-y", scale: 1, semanticMap, articulationMap: {}, normalization: { translation: [0,0,0], rotationEuler: [0,0,0], scale: 1 }, authoritativeDimensions: null, dimensionSources: [] };
 await writeFile(join(root, "onboard.json"), JSON.stringify(onboardConfig));
 await runCli(["onboard", root, "--config", join(root, "onboard.json")], { stdout(){}, stderr(){} });
 await writeFile(join(root, "reg.json"), JSON.stringify({ forwardAxis:"+z", upAxis:"+y", expectedScale:1, groundY:0.5, requiredSemantics:["hull"], requiredPivots:[], tolerance:0.02 }));

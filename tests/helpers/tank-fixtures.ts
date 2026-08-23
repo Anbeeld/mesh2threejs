@@ -153,6 +153,17 @@ export function stableSemanticIdentityMap(root: THREE.Object3D, options: { inclu
   return map;
 }
 
+interface GlbPbr {
+  baseColorFactor: [number, number, number, number];
+  roughnessFactor: number;
+  metallicFactor: number;
+}
+
+interface GlbMesh {
+  positions: Float32Array;
+  pbr?: GlbPbr;
+}
+
 interface GlbNode {
   name: string;
   children: number[];
@@ -172,7 +183,7 @@ interface GlbNode {
 export function sceneToGlb(root: THREE.Object3D, options: { includeRoot?: boolean } = {}): Buffer {
   const dedupeNames = new Map<string, string>();
   const nodes: GlbNode[] = [];
-  const meshes: Array<{ positions: Float32Array }> = [];
+  const meshes: GlbMesh[] = [];
   let counter = 0;
   const visit = (object: THREE.Object3D, nameForNode: string): number => {
     let name = nameForNode || object.name || `node-${counter}`;
@@ -190,7 +201,21 @@ export function sceneToGlb(root: THREE.Object3D, options: { includeRoot?: boolea
     if ((mesh as unknown as { isMesh?: boolean }).isMesh && mesh.geometry?.getAttribute("position")) {
       const geometry = mesh.geometry.index ? mesh.geometry.toNonIndexed() : mesh.geometry;
       const attribute = geometry.getAttribute("position");
-      meshes.push({ positions: new Float32Array(attribute.array as ArrayLike<number>) });
+      // Preserve simple PBR so oracle palette/style gates measure the authored material.
+      // THREE.Color components are already LINEAR working-space values, matching the
+      // glTF baseColorFactor definition; never serialize normalized sRGB bytes here.
+      const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+      const standard = material && (material as THREE.MeshStandardMaterial).isMeshStandardMaterial ? material as THREE.MeshStandardMaterial : undefined;
+      meshes.push({
+        positions: new Float32Array(attribute.array as ArrayLike<number>),
+        ...(standard ? {
+          pbr: {
+            baseColorFactor: [standard.color.r, standard.color.g, standard.color.b, standard.opacity],
+            roughnessFactor: standard.roughness,
+            metallicFactor: standard.metalness,
+          },
+        } : {}),
+      });
       node.mesh = meshes.length - 1;
     }
     const index = nodes.push(node) - 1;
@@ -200,7 +225,20 @@ export function sceneToGlb(root: THREE.Object3D, options: { includeRoot?: boolea
   const sceneRoots = options.includeRoot || !root.children.length
     ? [visit(root, root.name || "root")]
     : [...root.children].map((child) => visit(child, child.name || "root"));
-  const gltfMeshes = meshes.map((_mesh, meshIndex) => ({ primitives: [{ attributes: { POSITION: meshIndex } }] }));
+  const materials: Array<Record<string, unknown>> = [];
+  const gltfMeshes = meshes.map((mesh, meshIndex) => {
+    let materialIndex: number | undefined;
+    if (mesh.pbr) {
+      materialIndex = materials.length;
+      materials.push({ pbrMetallicRoughness: mesh.pbr });
+    }
+    return {
+      primitives: [{
+        attributes: { POSITION: meshIndex },
+        ...(materialIndex !== undefined ? { material: materialIndex } : {}),
+      }],
+    };
+  });
   const bufferViews: Array<Record<string, unknown>> = [];
   const accessors: Array<Record<string, unknown>> = [];
   const binChunks: Buffer[] = [];
@@ -229,6 +267,7 @@ export function sceneToGlb(root: THREE.Object3D, options: { includeRoot?: boolea
     bufferViews,
     accessors,
     meshes: gltfMeshes,
+    ...(materials.length ? { materials } : {}),
     nodes,
     scenes: [{ nodes: sceneRoots }],
     scene: 0,

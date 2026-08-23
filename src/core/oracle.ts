@@ -419,7 +419,14 @@ export function probeGlb(input: Uint8Array): GlbProbe {
   // Non-authoritative onboarding suggestions derived only from the facts above.
   const suggestions: GlbProbeSuggestion[] = [];
   if (nodeFacts.length >= 2) {
-    const volumes = nodeFacts.map((fact) => fact.worldBounds.max[0] * fact.worldBounds.max[1] * fact.worldBounds.max[2]);
+    // Volume comes from box DIMENSIONS, never absolute coordinates, so ranking is
+    // translation invariant regardless of where the model sits in world space.
+    const volumes = nodeFacts.map((fact) => {
+      const sizeX = fact.worldBounds.max[0] - fact.worldBounds.min[0];
+      const sizeY = fact.worldBounds.max[1] - fact.worldBounds.min[1];
+      const sizeZ = fact.worldBounds.max[2] - fact.worldBounds.min[2];
+      return sizeX * sizeY * sizeZ;
+    });
     const groundY = Math.min(...nodeFacts.map((fact) => fact.worldBounds.min[1]));
     const hullIndex = volumes.indexOf(Math.max(...volumes));
     const hull = nodeFacts[hullIndex];

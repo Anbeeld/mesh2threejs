@@ -5,6 +5,7 @@ import type { AuthorshipMode, CertificationLevel, ProfileId } from "../types.js"
 import { determineNextAction, loadTaskState, saveTaskState, createTaskState, type TaskState } from "./state.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { validateOracleManifest, validateProjectManifest, validateReferenceIndex } from "./schema.js";
+import { emptyGeneratedRegistry } from "./derivation.js";
 import { verifyOraclePreparation, type OracleManifest, type OraclePreparationBinding } from "./oracle.js";
 import { loadStyleContract, type StyleContract } from "../styles/low-poly.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
@@ -261,6 +262,18 @@ export function createCandidate() {
 }
 `;
 
+/**
+ * Stable authored entry for DERIVED-mode projects: it never changes after initialization.
+ * The pipeline composes phases by regenerating `.generated/registry.mjs`, which this entry
+ * imports exactly once, so later derivations stay automatic without touching agent files.
+ */
+export const MODEL_DERIVED_SCAFFOLD = `import { createGeneratedCandidate } from "./.generated/registry.mjs";
+
+export function createCandidate() {
+  return createGeneratedCandidate();
+}
+`;
+
 export async function initializeWorkspace(directory: string, input: InitializeWorkspaceInput): Promise<{ root: string; layout: WorkspaceLayout; project: ProjectManifest; references: ReferenceIndex; directories: string[] }> {
   const resolver = createWorkspaceResolver(directory);
   const { layout } = resolver;
@@ -355,7 +368,19 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
       await rename(temporary, record.destination);
       created.push(record.destination);
     }
-    if (!await pathExists(modelPath)) { await mkdir(dirname(modelPath), { recursive: true }); await writeFile(modelPath, MODEL_SCAFFOLD, { flag: "wx" }); created.push(modelPath); }
+    if (!await pathExists(modelPath)) {
+      await mkdir(dirname(modelPath), { recursive: true });
+      // Derived projects get the stable registry-composed entry immediately so every later
+      // derivation stays pipeline-wired; independent/legacy projects keep the plain scaffold.
+      await writeFile(modelPath, project.authorshipMode === "derived" ? MODEL_DERIVED_SCAFFOLD : MODEL_SCAFFOLD, { flag: "wx" });
+      created.push(modelPath);
+    }
+    if (project.authorshipMode === "derived") {
+      const generatedDirectory = resolver.resolveProjectPath("model/.generated");
+      await mkdir(generatedDirectory, { recursive: true });
+      const registryPath = join(generatedDirectory, "registry.mjs");
+      if (!await pathExists(registryPath)) { await writeFile(registryPath, emptyGeneratedRegistry(project.profile)); created.push(registryPath); }
+    }
     await writeFile(layout.internal.references, `${JSON.stringify(referenceIndex, null, 2)}\n`, { flag: "wx" }); created.push(layout.internal.references);
     await saveTaskState(layout.internal.state, createTaskState({ taskId: project.id, profile: project.profile, style: project.style, certification: project.certification, styleContractHash: style.hash, projectConfigurationHash: configurationHash, subjectContractHash, articulationRequired, ...(project.authorshipMode ? { authorshipMode: project.authorshipMode } : {}) })); created.push(layout.internal.state);
     await writeFile(layout.project, `${JSON.stringify(project, null, 2)}\n`, { flag: "wx" }); created.push(layout.project);

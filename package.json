@@ -48,6 +48,7 @@
     "ci": "npm run validate:development && npm run test:e2e && npm pack --dry-run",
     "validate:artifacts": "node dist/validation/artifacts.js",
     "test:e2e": "node dist/validation/e2e.js",
+    "validate:release": "npm run ci && npm run benchmark:derive && npm run benchmark:heavy",
     "prepack": "npm run validate:development"
   },
   "engines": {
