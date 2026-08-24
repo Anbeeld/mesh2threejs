@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -18,16 +19,13 @@ describe("host packaging and progressive disclosure", () => {
     expect(metadata).toContain(`$${role}`);
   });
 
-  test("marks unexecuted hosts and visual review as unverified", async () => {
+  test("documents host compatibility without inert adapter manifests", async () => {
     const root = process.cwd();
-    const codex = JSON.parse(await readFile(join(root, "adapters", "codex", "adapter.json"), "utf8"));
-    const claude = JSON.parse(await readFile(join(root, "adapters", "claude-code", "adapter.json"), "utf8"));
-    const opencode = JSON.parse(await readFile(join(root, "adapters", "opencode", "adapter.json"), "utf8"));
-    expect(codex.status).toContain("unverified");
-    expect(codex.capabilities.actualVisualReview).toBe(false);
-    expect(claude.status).toContain("not-installed");
-    expect(opencode.status).toContain("configuration");
-    expect(claude.capabilities.projectInstructionDiscovery).toBe(false);
+    const hostCompat = await readFile(join(root, "docs", "host-compatibility.md"), "utf8");
+    for (const host of ["Codex Desktop", "Claude Code", "OpenCode"]) {
+      expect(hostCompat).toContain(host);
+    }
+    expect(existsSync(join(root, "adapters"))).toBe(false);
   });
 
   test("root router does not activate tank instructions for generic tasks", async () => {

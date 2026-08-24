@@ -100,8 +100,19 @@ describe("per-run serialization and store lease (final closure §12.2)", () => {
         (e) => e.kind === "deterministic-gate" && e.phase === "oracle-registration" && e.valid,
       );
       if (registrationLocked && hasCurrentGateEvidence) {
-        // This is only valid if gate won AFTER reopen (re-locked with fresh evidence).
-        expect(record.record.mirrorSequence).toBeGreaterThan(0);
+        // A surviving valid lock+evidence pair is ONLY legitimate when the gate ran
+        // AFTER the reopen and re-established fresh evidence. Prove the ordering
+        // exactly: a reopen of this phase must be recorded, and the newest valid gate
+        // evidence must postdate it.
+        const phaseReopens = state.reopens.filter((r) => r.phase === "oracle-registration");
+        expect(phaseReopens.length).toBeGreaterThan(0);
+        const lastReopenAt = phaseReopens[phaseReopens.length - 1]!.reopenedAt;
+        const newestGateEvidenceAt = Object.values(state.evidence)
+          .filter((e) => e.kind === "deterministic-gate" && e.phase === "oracle-registration" && e.valid)
+          .map((e) => e.createdAt)
+          .sort()
+          .at(-1)!;
+        expect(newestGateEvidenceAt > lastReopenAt).toBe(true);
       }
       expect(record.record.status).toMatch(/active|awaiting-human-review/);
     } finally {

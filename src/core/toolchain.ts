@@ -68,7 +68,7 @@ export interface VerifiedToolchain {
   toolchainId: string;
 }
 
-const RUNTIME_ROOTS = ["dist", "profiles", "styles", "schemas", "viewer", "adapters"];
+const RUNTIME_ROOTS = ["dist", "profiles", "styles", "schemas", "viewer"];
 const CONTROL_ROOTS = ["skills", "agents"];
 const CONTROL_FILES = ["SKILL.md", "AGENTS.md", "CLAUDE.md", "README.md"];
 

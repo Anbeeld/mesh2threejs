@@ -73,29 +73,18 @@ export async function validateRepositoryArtifacts(root: string): Promise<Artifac
       validated += 1;
     } catch (error) { errors.push(`${profile}/contract.json: ${String(error)}`); }
   }
-  for (const host of ["codex", "claude-code", "opencode"]) {
-    try {
-      const adapter = await jsonFile(join(base, "adapters", host, "adapter.json")) as {
-        host?: unknown;
-        status?: unknown;
-        cli?: unknown;
-        trustedReconstruction?: unknown;
-        builderToolIsolation?: unknown;
-        toolchainWriteIsolation?: unknown;
-        humanApprovalSeparation?: unknown;
-        candidateSandboxBackend?: unknown;
-        capabilities?: { actualVisualReview?: unknown };
-      };
-      if (typeof adapter.host !== "string" || typeof adapter.status !== "string" || typeof adapter.capabilities?.actualVisualReview !== "boolean") {
-        errors.push(`${host} adapter has an invalid capability contract`);
-      }
-      // Verified-facts truth fields: hosts that have not proven every trusted
-      // boundary must declare trustedReconstruction=false.
-      if (adapter.trustedReconstruction !== false) errors.push(`${host} adapter must declare trustedReconstruction=false until integration is verified`);
-      validated += 1;
-    } catch (error) {
-      errors.push(`${host} adapter: ${String(error)}`);
+  // Host compatibility lives in docs/host-compatibility.md as plain documentation.
+  // There are no adapter manifests to validate: harness behavior comes from instruction
+  // surfaces (AGENTS.md/SKILL.md/skills) that the harness genuinely consumes, and host
+  // capability claims would only go stale as inert metadata.
+  try {
+    const hostCompat = await readFile(join(base, "docs", "host-compatibility.md"), "utf8");
+    for (const host of ["Codex Desktop", "Claude Code", "OpenCode"]) {
+      if (!hostCompat.includes(host)) errors.push(`docs/host-compatibility.md is missing the ${host} section`);
     }
+    validated += 1;
+  } catch (error) {
+    errors.push(`docs/host-compatibility.md: ${String(error)}`);
   }
   const skillRoots = [base, ...["reconstruct", "onboard-oracle", "repair-oracle", "build", "visual-review", "diagnose", "finalize"].map((name) => join(base, "skills", name))];
   for (const skillRoot of skillRoots) {

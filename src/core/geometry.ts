@@ -1,23 +1,6 @@
 import * as THREE from "three";
 import type { Bounds3, Point3, SceneComponent, SceneSnapshot, SceneTriangle } from "../types.js";
-
-/**
- * Inline non-subject check. Walks the ancestor chain to determine if a mesh
- * is marked as non-subject or presentation-fixture. Inlined here to avoid a circular import
- * with assembly.ts. The canonical classifier is `oracleGeometryDisposition` in assembly.ts;
- * this mirrors its non-subject detection for the snapshot hot path.
- */
-function isNonSubjectMesh(mesh: THREE.Object3D): boolean {
-  let current: THREE.Object3D | null = mesh;
-  while (current) {
-    if (current.userData.insignificant === true) {
-      const kind = current.userData.exclusionKind as string | undefined;
-      if (kind === "non-subject" || kind === "presentation-fixture" || kind === undefined) return true;
-    }
-    current = current.parent;
-  }
-  return false;
-}
+import { isNonSubject as isNonSubjectMesh } from "./disposition.js";
 
 const emptyBounds = (): Bounds3 => ({
   min: [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY],

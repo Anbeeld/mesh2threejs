@@ -42,6 +42,6 @@ Run fresh Codex, Claude Code, and OpenCode sessions. Capture skill discovery and
 
 ## Upstream and claim audit
 
-Run `mesh2threejs upstream-drift`, inspect relevant changed files without auto-merging, and update the dated source map only when an adaptation changes. Audit README, root/role skills, profile docs, adapters, package scripts, and handoff language against captured behavior.
+Run `mesh2threejs upstream-drift`, inspect relevant changed files without auto-merging, and update the dated source map only when an adaptation changes. Audit README, root/role skills, profile docs, host compatibility notes, package scripts, and handoff language against captured behavior.
 
 Production-readiness claims require every protected fixture, the real-reference corpus, real-reference and non-tank flows, actual WebGL evidence, calibrated visual review, all three host trials, upstream review, and the final claim audit to pass with retained hashes.

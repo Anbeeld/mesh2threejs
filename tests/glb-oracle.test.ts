@@ -181,6 +181,55 @@ describe("source and prepared oracle lifecycle", () => {
     expect(repairedRegistration.rows.filter((row) => !row.passed)).toEqual([]);
   });
 
+  test("assembly exclusions are fail-closed without a profile-derived protection policy", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-policy-"));
+    const source = join(directory, "source.glb");
+    await writeFile(source, minimalGlb({ multipart: true }));
+    await expect(onboardOracle({
+      id: "policy-guard",
+      sourcePath: source,
+      preparedPath: join(directory, "prepared.json"),
+      source: "fixture", author: "fixture", license: "MIT", redistribution: "allowed",
+      coordinateFrame: "right-handed", upAxis: "+y", forwardAxis: "+z", grounding: "min-y=0", scale: 1,
+      semanticMap: {}, articulationMap: {},
+      normalization: { translation: [0, 0, 0], rotationEuler: [0, 0, 0], scale: 1 },
+      authoritativeDimensions: null, dimensionSources: [],
+      assemblyExclusions: [{ nodeId: "node:1", kind: "non-subject", reason: "no policy supplied" }],
+    })).rejects.toThrow(/exclusion protection policy/);
+  });
+
+  test("preserved exclusions are revalidated when a repair changes only the semantic map", async () => {
+    const { protectedSourceSemantics } = await import("../src/core/phase-compose.js");
+    const genericPolicy = protectedSourceSemantics("generic");
+    const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-repair-reval-"));
+    const source = join(directory, "source.glb");
+    const prepared = join(directory, "prepared.json");
+    await writeFile(source, minimalGlb({ multipart: true }));
+    // node:1 is unmapped at onboard time; excluding it as presentation fixture is valid.
+    const manifest = await onboardOracle({
+      id: "revalidation",
+      sourcePath: source,
+      preparedPath: prepared,
+      source: "fixture", author: "fixture", license: "MIT", redistribution: "allowed",
+      coordinateFrame: "right-handed", upAxis: "+y", forwardAxis: "+z", grounding: "min-y=0", scale: 1,
+      semanticMap: { "node:0": "primary" }, articulationMap: {},
+      normalization: { translation: [0, 0, 0], rotationEuler: [0, 0, 0], scale: 1 },
+      authoritativeDimensions: null, dimensionSources: [],
+      assemblyExclusions: [{ nodeId: "node:1", kind: "presentation-fixture", reason: "presentation plate" }],
+      exclusionPolicy: genericPolicy,
+    });
+    expect(manifest.assemblyExclusions).toHaveLength(1);
+    // Repair maps the excluded node to the PROTECTED primary semantic while preserving the
+    // old exclusion — the preserved exclusion must be revalidated against the NEW map and
+    // rejected instead of silently bypassing protected-subtree rules.
+    await expect(repairPreparedOracle(manifest, {
+      reason: "remap second node after inspection",
+      preparedPath: join(directory, "prepared-repaired.json"),
+      semanticMap: { "node:0": "primary", "node:1": "primary" },
+      exclusionPolicy: genericPolicy,
+    })).rejects.toThrow(/cannot exclude a subtree containing required semantic "primary"/);
+  });
+
   test("persists workspace-relative oracle lineage that survives relocation", async () => {
     const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-oracle-portable-"));
     const root = join(parent, "original");

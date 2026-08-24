@@ -6,7 +6,7 @@ Mode resolution comes FIRST: if `state.mirrorOfRun` is present, the workspace is
 
 ## Reconstruction work vs pipeline development
 
-RECONSTRUCTION WORK: modify workspace reconstruction artifacts only (candidate modules, declarative repairs, workspace state). You must not modify repository source code, evaluator code, profile contracts, style contracts, schemas to weaken validation, broker/authority implementation, generated trust/integrity metadata by hand, package/runtime code, or gate thresholds/pass logic. You must not change authorship/policy to escape a failing gate. You must not use development-only commands on a managed run. You must not manually fabricate evidence, review approval, replay results, locks, or certification state.
+RECONSTRUCTION WORK: modify workspace candidate/repair inputs only (candidate modules, declarative repair data). You may READ `.mesh2threejs/state.json` for orientation, but you must never edit it, nor evidence, locks, review records, generated authority metadata, or any other pipeline-written state by hand. You must not modify repository source code, evaluator code, profile contracts, style contracts, schemas to weaken validation, broker/authority implementation, package/runtime code, or gate thresholds/pass logic. You must not change authorship/policy to escape a failing gate. You must not use development-only commands on a managed run. You must not manually fabricate evidence, review approval, replay results, locks, or certification state.
 
 PIPELINE DEVELOPMENT: modify repository/toolchain code. This is a separate task from reconstruction. A reconstruction agent must never silently switch from reconstruction work to pipeline development.
 

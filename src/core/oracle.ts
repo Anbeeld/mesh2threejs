@@ -256,8 +256,14 @@ export function validateLogicalOwnership(ownership: Record<string, string>, sema
   }
 }
 
-/** Required semantics that cannot be excluded (tank profile). */
-const NON_EXCLUDABLE_SEMANTICS = new Set(["hull", "turret", "gun", "turret-pivot", "gun-pivot"]);
+/**
+ * Protection authority for assembly exclusions: returns true when a mapped semantic
+ * participates in profile-required geometry and may never be hidden by an exclusion.
+ * The policy is derived by the caller from the selected profile contract (see
+ * protectedSourceSemantics in phase-compose.ts) — source-node validation stays a
+ * generic oracle concern and never hardcodes per-subject vocabularies.
+ */
+export type ExclusionProtectionPolicy = (semanticId: string) => boolean;
 
 /** Validated source node identity from the immutable GLB node array. */
 export interface SourceNodeIdentity {
@@ -274,7 +280,7 @@ export interface SourceNodeIdentity {
  * - Invalid kinds are rejected (runtime JSON safety).
  * - Empty reasons are rejected.
  * - An exclusion is rejected if the node OR any descendant subtree contains a mapped
- *   protected semantic/pivot (hull, turret, gun, turret-pivot, gun-pivot).
+ *   semantic that the supplied protection policy marks as required.
  *
  * Returns a canonicalized (sorted by nodeId) copy for deterministic preparation identity.
  */
@@ -282,6 +288,7 @@ export function validateAssemblyExclusions(
   exclusions: AssemblyExclusion[],
   sourceNodes: SourceNodeIdentity[],
   semanticMap: Record<string, string>,
+  exclusionPolicy: ExclusionProtectionPolicy,
 ): AssemblyExclusion[] {
   const validNodeIds = new Set(sourceNodes.map((n) => n.id));
   const nodeChildren = new Map<string, string[]>();
@@ -304,8 +311,8 @@ export function validateAssemblyExclusions(
     if (!validKinds.has(entry.kind)) throw new Error(`assembly exclusion kind must be non-subject, presentation-fixture, or microdetail: got ${entry.kind}`);
     if (!entry.reason.trim()) throw new Error(`assembly exclusion for ${entry.nodeId} requires a reason`);
     // Protected-subtree check: reject if the excluded node or any descendant carries a
-    // mapped protected semantic/pivot.
-    const protectedInSubtree = checkProtectedSemanticInSubtree(entry.nodeId, nodeChildren, semanticMap);
+    // mapped semantic the profile's protection policy marks as required.
+    const protectedInSubtree = checkProtectedSemanticInSubtree(entry.nodeId, nodeChildren, semanticMap, exclusionPolicy);
     if (protectedInSubtree) {
       throw new Error(`assembly exclusion for ${entry.nodeId} cannot exclude a subtree containing required semantic "${protectedInSubtree}"`);
     }
@@ -319,12 +326,12 @@ export function validateAssemblyExclusions(
 }
 
 /** Walks the subtree of `nodeId` and returns the first protected semantic found, or null. */
-function checkProtectedSemanticInSubtree(nodeId: string, nodeChildren: Map<string, string[]>, semanticMap: Record<string, string>): string | null {
+function checkProtectedSemanticInSubtree(nodeId: string, nodeChildren: Map<string, string[]>, semanticMap: Record<string, string>, exclusionPolicy: ExclusionProtectionPolicy): string | null {
   const queue = [nodeId];
   while (queue.length) {
     const current = queue.shift()!;
     const semantic = semanticMap[current];
-    if (semantic && NON_EXCLUDABLE_SEMANTICS.has(semantic)) return semantic;
+    if (semantic && exclusionPolicy(semantic)) return semantic;
     queue.push(...(nodeChildren.get(current) ?? []));
   }
   return null;
@@ -765,6 +772,8 @@ export interface OnboardOracleInput extends Omit<OracleManifest, "schemaVersion"
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
   assemblyExclusions?: AssemblyExclusion[];
+  /** Required whenever assemblyExclusions are declared: profile-derived protection authority. */
+  exclusionPolicy?: ExclusionProtectionPolicy;
 }
 
 interface PreparedRecipe {
@@ -819,8 +828,9 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     validateLogicalOwnership(input.logicalOwnership, input.semanticMap, input.articulationMap);
   }
   if (input.assemblyExclusions) {
+    if (!input.exclusionPolicy) throw new Error("assembly exclusions require an exclusion protection policy derived from the selected profile");
     const sourceNodes: SourceNodeIdentity[] = probe.semanticIdentities.map((s) => ({ id: s.id, parentId: s.parentId }));
-    const canonical = validateAssemblyExclusions(input.assemblyExclusions, sourceNodes, input.semanticMap);
+    const canonical = validateAssemblyExclusions(input.assemblyExclusions, sourceNodes, input.semanticMap, input.exclusionPolicy);
     input = { ...input, assemblyExclusions: canonical };
   }
   validateScaleAuthority(input.scaleAuthority);
@@ -992,6 +1002,8 @@ export interface RepairPreparedOracleInput {
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
   assemblyExclusions?: AssemblyExclusion[];
+  /** Required whenever effective (new or preserved) exclusions exist: profile-derived protection authority. */
+  exclusionPolicy?: ExclusionProtectionPolicy;
   scaleAuthority?: ScaleAuthority;
 }
 
@@ -999,12 +1011,19 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
   if (!input.reason.trim()) throw new Error("oracle repair requires a reason");
   if (input.sourceFrame) sourceFrameTransform(input.sourceFrame);
   if (input.logicalOwnership) validateLogicalOwnership(input.logicalOwnership, input.semanticMap ?? manifest.semanticMap, input.articulationMap ?? manifest.articulationMap);
+  // Exclusions are ALWAYS revalidated against the EFFECTIVE semantic map — including
+  // exclusions merely preserved from the existing preparation. A repair that changes only
+  // semanticMap could otherwise move a protected semantic beneath a previously valid
+  // exclusion and silently bypass the protected-subtree rule.
   let canonicalExclusions: AssemblyExclusion[] | undefined;
-  if (input.assemblyExclusions) {
+  const effectiveSemanticMap = input.semanticMap ?? manifest.semanticMap;
+  const effectiveExclusions = input.assemblyExclusions ?? manifest.assemblyExclusions ?? [];
+  if (effectiveExclusions.length) {
+    if (!input.exclusionPolicy) throw new Error("assembly exclusion revalidation requires an exclusion protection policy derived from the selected profile");
     const sourceBytes = await readVerifiedSourceBytes(manifest, workspaceRoot);
     const probe = probeGlb(sourceBytes);
     const sourceNodes: SourceNodeIdentity[] = probe.semanticIdentities.map((s) => ({ id: s.id, parentId: s.parentId }));
-    canonicalExclusions = validateAssemblyExclusions(input.assemblyExclusions, sourceNodes, input.semanticMap ?? manifest.semanticMap);
+    canonicalExclusions = validateAssemblyExclusions(effectiveExclusions, sourceNodes, effectiveSemanticMap, input.exclusionPolicy);
   }
   validateScaleAuthority(input.scaleAuthority ?? manifest.scaleAuthority);
   await verifyOraclePreparation(manifest, workspaceRoot);
@@ -1018,11 +1037,12 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     semanticMap: input.semanticMap ?? manifest.semanticMap,
     articulationMap: input.articulationMap ?? manifest.articulationMap,
     normalization: input.normalization ?? manifest.normalization,
-    // Frame, ownership, exclusions, and scale authority survive repair unless the caller
-    // explicitly changes them: a repaired recipe must never silently change authoritative decisions.
+    // Frame, ownership, and scale authority survive repair unless the caller explicitly
+    // changes them: a repaired recipe must never silently change authoritative decisions.
+    // Exclusions carry the revalidated canonical form computed above.
     ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : manifest.sourceFrame ? { sourceFrame: manifest.sourceFrame } : {}),
     ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : manifest.logicalOwnership ? { logicalOwnership: manifest.logicalOwnership } : {}),
-    ...(canonicalExclusions ? { assemblyExclusions: canonicalExclusions } : input.assemblyExclusions ? { assemblyExclusions: input.assemblyExclusions } : manifest.assemblyExclusions ? { assemblyExclusions: manifest.assemblyExclusions } : {}),
+    ...(canonicalExclusions ? { assemblyExclusions: canonicalExclusions } : {}),
     ...(input.scaleAuthority ? { scaleAuthority: input.scaleAuthority } : manifest.scaleAuthority ? { scaleAuthority: manifest.scaleAuthority } : {}),
     repair: { parentPreparedHash: manifest.preparedHash, reason: input.reason.trim() },
   };

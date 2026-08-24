@@ -23,6 +23,7 @@ import {
   type RepairPreparedOracleInput,
 } from "../core/oracle.js";
 import { evaluateAssemblyCoverage } from "../core/assembly.js";
+import { protectedSourceSemantics } from "../core/phase-compose.js";
 import { derivePhaseSeed } from "../core/derive.js";
 import { verifyDerivedLineage, derivedDirectory, loadTrustedGeneratedModules } from "../core/derivation.js";
 import { performRenderRun, performOracleSanityRun, performQuickDiagnosticRun, verifyLatestOracleSanity } from "../core/workspace-render.js";import { createVisualReviewPacket, verifyVisualReviewPacketFiles, type ReviewFileReference } from "../core/review.js";
@@ -307,6 +308,7 @@ export class TrustedPipeline {
       sourceOriginalPath: oracleRecord.originalPath,
       referenceMode: oracleRecord.mode,
       preparedPath: resolver.toProjectPath(workspace.layout.internal.preparedOracle),
+      exclusionPolicy: protectedSourceSemantics(record.policy.profile),
     });
     await mkdir(dirname(workspace.layout.internal.oracleManifest), { recursive: true });
     await writeFile(workspace.layout.internal.oracleManifest, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -331,6 +333,7 @@ export class TrustedPipeline {
     const repaired = await repairPreparedOracle(preparation.manifest, {
       ...config,
       preparedPath: `.mesh2threejs/oracle/prepared-repair-${preparation.manifest.repairHistory.length + 1}.json`,
+      exclusionPolicy: protectedSourceSemantics(record.policy.profile),
     }, workspace.root);
     await writeFile(workspace.layout.internal.oracleManifest, `${JSON.stringify(repaired, null, 2)}\n`);
     const next = await this.authority.recordComputedPreparation(runId, {

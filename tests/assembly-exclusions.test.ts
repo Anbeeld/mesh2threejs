@@ -1,7 +1,8 @@
 import * as THREE from "three";
 import { describe, expect, test } from "vitest";
 import { validateAssemblyExclusions, type AssemblyExclusion, type SourceNodeIdentity } from "../src/core/oracle.js";
-import { oracleGeometryDisposition, isNonSubject } from "../src/core/assembly.js";
+import { oracleGeometryDisposition, isNonSubject, evaluateAssemblyCoverage } from "../src/core/assembly.js";
+import { protectedSourceSemantics } from "../src/core/phase-compose.js";
 import { snapshotScene } from "../src/core/geometry.js";
 
 /** Tank-like source node tree for testing: 7 nodes with parent-child relationships. */
@@ -24,26 +25,30 @@ const SEMANTIC_MAP = {
   // node:20 deliberately unmapped
 };
 
+// Profile-derived protection policies under test.
+const TANK_POLICY = protectedSourceSemantics("tank");
+const GENERIC_POLICY = protectedSourceSemantics("generic");
+
 describe("strict assembly exclusion authority", () => {
   test("valid exclusion for an unmapped non-subject node passes", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "node:20", kind: "non-subject", reason: "display stand" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).not.toThrow();
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).not.toThrow();
   });
 
   test("semantic alias rejected — nodeId must be exact node:N", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "display-stand", kind: "non-subject", reason: "fixture" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).toThrow(/exact source node:N identity/);
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).toThrow(/exact source node:N identity/);
   });
 
   test("unknown node rejected", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "node:999", kind: "non-subject", reason: "unknown" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).toThrow(/does not exist in the source GLB/);
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).toThrow(/does not exist in the source GLB/);
   });
 
   test("duplicate node rejected", () => {
@@ -51,28 +56,28 @@ describe("strict assembly exclusion authority", () => {
       { nodeId: "node:20", kind: "non-subject", reason: "first" },
       { nodeId: "node:20", kind: "microdetail", reason: "second" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).toThrow(/duplicate nodeId/);
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).toThrow(/duplicate nodeId/);
   });
 
   test("invalid runtime kind rejected", () => {
     const exclusions = [
       { nodeId: "node:20", kind: "whatever", reason: "bad kind" },
     ] as unknown as AssemblyExclusion[];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).toThrow(/kind must be/);
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).toThrow(/kind must be/);
   });
 
   test("empty reason rejected", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "node:20", kind: "non-subject", reason: "" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).toThrow(/requires a reason/);
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).toThrow(/requires a reason/);
   });
 
   test("protected semantic on the node itself rejected", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "node:1", kind: "non-subject", reason: "try to exclude hull" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).toThrow(/cannot exclude a subtree containing required semantic "hull"/);
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).toThrow(/cannot exclude a subtree containing required semantic "hull"/);
   });
 
   test("protected descendant in subtree rejected (parent exclusion)", () => {
@@ -80,7 +85,7 @@ describe("strict assembly exclusion authority", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "node:2", kind: "non-subject", reason: "try to exclude turret-pivot subtree" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).toThrow(/cannot exclude a subtree containing required semantic/);
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).toThrow(/cannot exclude a subtree containing required semantic/);
   });
 
   test("protected descendant deep in subtree rejected", () => {
@@ -88,14 +93,14 @@ describe("strict assembly exclusion authority", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "node:0", kind: "non-subject", reason: "try to exclude root" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).toThrow(/cannot exclude a subtree containing required semantic/);
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).toThrow(/cannot exclude a subtree containing required semantic/);
   });
 
   test("canonical ordering: exclusions sorted by nodeId", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "node:20", kind: "non-subject", reason: "stand" },
     ];
-    const result = validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP);
+    const result = validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY);
     expect(result).toHaveLength(1);
     expect(result[0]!.nodeId).toBe("node:20");
   });
@@ -107,7 +112,7 @@ describe("strict assembly exclusion authority", () => {
     ];
     // node:6 doesn't exist in SOURCE_NODES, add it
     const nodes = [...SOURCE_NODES, { id: "node:6", parentId: "node:0" }];
-    const result = validateAssemblyExclusions(exclusions, nodes, SEMANTIC_MAP);
+    const result = validateAssemblyExclusions(exclusions, nodes, SEMANTIC_MAP, TANK_POLICY);
     expect(result[0]!.nodeId).toBe("node:6");
     expect(result[1]!.nodeId).toBe("node:20");
   });
@@ -116,7 +121,88 @@ describe("strict assembly exclusion authority", () => {
     const exclusions: AssemblyExclusion[] = [
       { nodeId: "node:20", kind: "presentation-fixture", reason: "presentation floor" },
     ];
-    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP)).not.toThrow();
+    expect(() => validateAssemblyExclusions(exclusions, SOURCE_NODES, SEMANTIC_MAP, TANK_POLICY)).not.toThrow();
+  });
+});
+
+describe("profile-aware exclusion protection", () => {
+  // Running gear and track semantics are tank contract OPTIONAL but phase-owned by
+  // required executable phases; the profile-derived policy must protect them.
+  const RUNNING_NODES: SourceNodeIdentity[] = [
+    { id: "node:0", parentId: null },
+    { id: "node:6", parentId: "node:0" },   // road-wheel
+    { id: "node:7", parentId: "node:0" },   // track-course
+  ];
+  const RUNNING_MAP = { "node:6": "road-wheel", "node:7": "track-course" };
+
+  test("tank policy protects phase-owned running gear and track roles", () => {
+    for (const nodeId of ["node:6", "node:7"]) {
+      const exclusions: AssemblyExclusion[] = [{ nodeId, kind: "non-subject", reason: "try to hide running gear" }];
+      expect(() => validateAssemblyExclusions(exclusions, RUNNING_NODES, RUNNING_MAP, TANK_POLICY))
+        .toThrow(/cannot exclude a subtree containing required semantic/);
+    }
+  });
+
+  test("generic policy protects the required primary semantic", () => {
+    const nodes: SourceNodeIdentity[] = [
+      { id: "node:0", parentId: null },
+      { id: "node:1", parentId: "node:0" },
+    ];
+    const semanticMap = { "node:1": "primary" };
+    const exclusions: AssemblyExclusion[] = [{ nodeId: "node:1", kind: "non-subject", reason: "try to hide primary mass" }];
+    expect(() => validateAssemblyExclusions(exclusions, nodes, semanticMap, GENERIC_POLICY))
+      .toThrow(/cannot exclude a subtree containing required semantic "primary"/);
+  });
+
+  test("generic policy does not import tank vocabularies; unmapped nodes stay excludable", () => {
+    const exclusions: AssemblyExclusion[] = [{ nodeId: "node:6", kind: "non-subject", reason: "generic profile has no running-gear phases" }];
+    expect(() => validateAssemblyExclusions(exclusions, RUNNING_NODES, RUNNING_MAP, GENERIC_POLICY)).not.toThrow();
+  });
+});
+
+describe("exclusion baseline neutrality", () => {
+  function box(name: string, w: number, h: number, d: number): THREE.Mesh {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshStandardMaterial());
+    mesh.name = name;
+    return mesh;
+  }
+
+  test("non-subject geometry does not inflate significance baselines", () => {
+    // Tiny mesh (area 6) vs hull (area 216). With a huge non-subject stand counted into
+    // totalArea (~3582), the tiny mesh would clear the 0.5% global area share; with the
+    // stand excluded from the baseline (~222), it must stay UNRESOLVED.
+    const withStand = () => {
+      const root = new THREE.Group();
+      const hull = box("hull", 6, 6, 6);
+      hull.userData.semanticId = "hull";
+      const tiny = box("tiny-detail", 1, 1, 1);
+      const stand = box("display-stand", 40, 40, 1);
+      stand.userData.insignificant = true;
+      stand.userData.exclusionKind = "non-subject";
+      root.add(hull, tiny, stand);
+      root.updateMatrixWorld(true);
+      return evaluateAssemblyCoverage(root, "generic");
+    };
+    const withoutStand = () => {
+      const root = new THREE.Group();
+      const hull = box("hull", 6, 6, 6);
+      hull.userData.semanticId = "hull";
+      const tiny = box("tiny-detail", 1, 1, 1);
+      root.add(hull, tiny);
+      root.updateMatrixWorld(true);
+      return evaluateAssemblyCoverage(root, "generic");
+    };
+    const reportWith = withStand();
+    const reportWithout = withoutStand();
+    // Baseline parity: an excluded stand must not change how other geometry is judged.
+    expect(reportWith.passed).toBe(reportWithout.passed);
+    expect(reportWith.passed).toBe(false);
+    const unresolvedNames = (report: ReturnType<typeof evaluateAssemblyCoverage>) =>
+      report.unresolved.map((entry) => entry.meshName).sort();
+    expect(unresolvedNames(reportWith)).toEqual(unresolvedNames(reportWithout));
+    expect(unresolvedNames(reportWith)).toContain("tiny-detail");
+    // The stand still appears in the report as explicitly excluded.
+    expect(reportWith.explicitExclusions.map((entry) => entry.objectId)).toContain("display-stand");
   });
 });
 

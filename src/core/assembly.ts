@@ -1,6 +1,10 @@
 import * as THREE from "three";
 import type { ProfileId } from "../types.js";
 import { phaseOwnedSemantics } from "./phase-compose.js";
+import { isNonSubject, oracleGeometryDisposition, type OracleGeometryDisposition } from "./disposition.js";
+
+// Re-exported for existing consumers; the canonical classifier lives in disposition.ts.
+export { oracleGeometryDisposition, isNonSubject, type OracleGeometryDisposition };
 
 /**
  * Source assembly coverage (§11). A significant source mesh beneath a mapped critical
@@ -72,47 +76,9 @@ function hasExplicitExclusion(mesh: THREE.Object3D): boolean {
 }
 
 /**
- * Subject-geometry disposition. A central classifier that determines whether a
- * mesh participates in subject fidelity measurement and derivation, or is excluded from it.
- *
- * - `subject`: normal subject geometry, participates in all measurements and derivation.
- * - `subject-microdetail`: excluded from assembly ownership but RETAINED in fidelity/derivation
- *   (low-poly reconstruction may omit it, but it must not silently redefine macro geometry).
- * - `non-subject`: excluded from ALL subject measurements and derivation (display stand, floor,
- *   pedestal, etc.). Assembly coverage passes, but fidelity/derivation/snapshot must filter it.
+ * Subject-geometry disposition summary retained for API compatibility; the authoritative
+ * classifier lives in `disposition.ts` and is shared with fidelity snapshot filtering.
  */
-export type OracleGeometryDisposition = "subject" | "subject-microdetail" | "non-subject";
-
-/**
- * Returns the disposition of a mesh based on ancestor-chain exclusion markers.
- * `non-subject` and `presentation-fixture` kinds → `non-subject`.
- * `microdetail` kind → `subject-microdetail`.
- * No exclusion marker → `subject`.
- */
-export function oracleGeometryDisposition(mesh: THREE.Object3D): OracleGeometryDisposition {
-  let current: THREE.Object3D | null = mesh;
-  let disposition: OracleGeometryDisposition = "subject";
-  while (current) {
-    if (current.userData.insignificant === true) {
-      const kind = current.userData.exclusionKind as string | undefined;
-      if (kind === "non-subject" || kind === "presentation-fixture") {
-        disposition = "non-subject";
-      } else if (kind === "microdetail") {
-        if (disposition === "subject") disposition = "subject-microdetail";
-      } else {
-        // insignificant without a known kind — treat as non-subject for safety.
-        if (disposition === "subject") disposition = "non-subject";
-      }
-    }
-    current = current.parent;
-  }
-  return disposition;
-}
-
-/** True if the mesh is non-subject and should be filtered from fidelity/derivation. */
-export function isNonSubject(mesh: THREE.Object3D): boolean {
-  return oracleGeometryDisposition(mesh) === "non-subject";
-}
 
 function triangleArea(ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number): number {
   return Math.hypot(
@@ -206,15 +172,22 @@ export function evaluateAssemblyCoverage(root: THREE.Object3D, profile: ProfileI
       for (let axis = 0; axis < 3; axis += 1) projected[axis] = projected[axis]! + Math.abs(cross.getComponent(axis));
     }
     const diagonal = min.distanceTo(max);
-    totalArea += area;
-    maxDiagonal = Math.max(maxDiagonal, diagonal);
+    // Non-subject geometry (display stands, presentation fixtures) must not alter the
+    // significance baseline other geometry is judged against: it contributes nothing to
+    // totalArea, maxDiagonal, or assembly aggregates. Microdetail stays subject geometry
+    // and still contributes.
+    const nonSubject = isNonSubject(object);
+    if (!nonSubject) {
+      totalArea += area;
+      maxDiagonal = Math.max(maxDiagonal, diagonal);
+    }
     // The nearest critical source assembly is the nearest SEMANTIC ancestor; meshes without
     // any semantic ancestry form no meaningful aggregate (their own measures are compared
     // against the whole object only).
     const semanticAncestor = nearestSemanticAncestor(object);
     const assemblyKey = semanticAncestor ?? `mesh:${object.uuid}`;
     raws.push({ mesh: object, objectId: nearestSemanticObjectId(root, object), meshName: mesh.name || object.name || mesh.uuid, triangles, surfaceArea: area, diagonal, projected, phase: resolveOwningPhase(object, profile), assemblyKey });
-    if (!semanticAncestor) return;
+    if (nonSubject || !semanticAncestor) return;
     phaseArea.set(assemblyKey, (phaseArea.get(assemblyKey) ?? 0) + area);
     phaseMaxDiagonal.set(assemblyKey, Math.max(phaseMaxDiagonal.get(assemblyKey) ?? 0, diagonal));
     const totals = assemblyProjected.get(assemblyKey) ?? ([0, 0, 0] as [number, number, number]);

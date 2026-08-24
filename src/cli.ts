@@ -22,7 +22,7 @@ import { selectRepairGroup } from "./core/compare.js";
 import { createEvaluationIdentity, EVALUATOR_VERSION, evaluationIdentityHash, MEASUREMENT_VERSION, optionalContractHash } from "./core/identity.js";
 import { loadStyleContract } from "./styles/low-poly.js";
 import { derivePhaseSeed, trustedGeneratedAuditOptions } from "./core/derive.js";
-import { phaseSemanticScope } from "./core/phase-compose.js";
+import { phaseSemanticScope, protectedSourceSemantics } from "./core/phase-compose.js";
 import { snapshotScene } from "./core/geometry.js";
 import { assertAssemblyCoverage, evaluateAssemblyCoverage } from "./core/assembly.js";
 import { serializeScene, serializedSceneHash } from "./core/scene-serialization.js";
@@ -532,6 +532,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const oracleRecord = workspace?.references.records.find((record) => record.kind === "oracle" && record.operationalPath === workspace.project.oracle);
         if (workspace && !oracleRecord) throw new Error("workspace oracle is absent from the reference index");
         const outputPath = workspace?.layout.internal.oracleManifest ?? resolve(required(parsed.options, "out"));
+        const stateProfile = workspace ? (await loadTaskState(workspace.layout.internal.state)).profile : undefined;
         const manifest = await onboardOracle(workspace && oracleRecord ? {
           ...config,
           workspaceRoot: workspace.root,
@@ -539,6 +540,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           sourceOriginalPath: oracleRecord.originalPath,
           referenceMode: oracleRecord.mode,
           preparedPath: createWorkspaceResolver(workspace.root).toProjectPath(workspace.layout.internal.preparedOracle),
+          ...(stateProfile ? { exclusionPolicy: protectedSourceSemantics(stateProfile) } : {}),
         } : config);
         await mkdir(dirname(outputPath), { recursive: true });
         await writeFile(outputPath, `${json(manifest)}\n`, { flag: "wx" });
@@ -568,9 +570,11 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
         }
         const config = JSON.parse(await readFile(resolve(required(parsed.options, "config")), "utf8")) as RepairPreparedOracleInput;
+        const stateProfile = workspace ? (await loadTaskState(workspace.layout.internal.state)).profile : undefined;
         const repaired = await repairPreparedOracle(manifest, workspace ? {
           ...config,
           preparedPath: `.mesh2threejs/oracle/prepared-repair-${manifest.repairHistory.length + 1}.json`,
+          ...(stateProfile ? { exclusionPolicy: protectedSourceSemantics(stateProfile) } : {}),
         } : config, workspace?.root);
         const outputPath = workspace?.layout.internal.oracleManifest ?? resolve(required(parsed.options, "out"));
         await writeFile(outputPath, `${json(repaired)}\n`, workspace ? undefined : { flag: "wx" });

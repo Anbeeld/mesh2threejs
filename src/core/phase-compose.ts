@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import type { CandidateRuntime, ProfileId } from "../types.js";
 import { getProfileContract } from "./contracts.js";
+import type { ExclusionProtectionPolicy } from "./oracle.js";
 
 /**
  * Single authoritative phase-semantic ownership model. Every consumer — phase scope checks,
@@ -64,6 +65,33 @@ export function phaseSemanticScope(profile: ProfileId, phase: string): SemanticO
 /** Semantics owned exactly by ONE phase (not cumulative); used to select replacement targets. */
 export function phaseOwnedSemantics(profile: ProfileId, phase: string): SemanticOwnershipPredicate | null {
   return profilePhaseOwnership(profile)?.[phase] ?? null;
+}
+
+/**
+ * Source phases whose owned semantics are REQUIRED executable geometry: derivation,
+ * fidelity, and required gates depend on their source subtrees, so those subtrees may
+ * never be silently assembly-excluded. Generic profiles protect contract-required
+ * semantics through the contract path instead; a future profile either declares its
+ * required semantics in its contract or lists its executable phases here.
+ */
+const PROTECTED_SOURCE_PHASES: Partial<Record<ProfileId, readonly string[]>> = {
+  tank: ["hull", "turret", "gun", "running-gear", "tracks"],
+};
+
+/**
+ * Derives the assembly-exclusion protection policy for a profile from the executable
+ * contract (required/critical semantics) plus this module's protected source-phase
+ * ownership. This is profile-owned authority: oracle validation stays generic and never
+ * hardcodes per-subject semantic vocabularies.
+ */
+export function protectedSourceSemantics(profile: ProfileId): ExclusionProtectionPolicy {
+  const contract = getProfileContract(profile);
+  const declared = new Set([...contract.semantics.required, ...contract.semantics.critical]);
+  const ownership = profilePhaseOwnership(profile);
+  const predicates = (PROTECTED_SOURCE_PHASES[profile] ?? [])
+    .map((phase) => ownership?.[phase])
+    .filter((predicate): predicate is SemanticOwnershipPredicate => Boolean(predicate));
+  return (semanticId) => declared.has(semanticId) || predicates.some((owns) => owns(semanticId));
 }
 
 export class PhaseCompositionError extends Error {}
