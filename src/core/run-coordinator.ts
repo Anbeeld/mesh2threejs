@@ -25,14 +25,20 @@ export class RunOperationCoordinator {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.queues.set(runId, previous.then(() => gate, () => gate));
+    const tail = previous.then(() => gate, () => gate);
+    this.queues.set(runId, tail);
     await previous.catch(() => {});
     try {
       return await fn();
     } finally {
       release!();
       // Clean up the queue entry only if no newer operation is waiting behind it.
-      if (this.queues.get(runId) === gate) this.queues.delete(runId);
+      if (this.queues.get(runId) === tail) this.queues.delete(runId);
     }
+  }
+
+  /** Test-only introspection: returns the number of queued run entries (should be 0 when idle). */
+  _queueSize(): number {
+    return this.queues.size;
   }
 }

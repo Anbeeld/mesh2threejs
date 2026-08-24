@@ -142,6 +142,19 @@ export const oracleManifestSchema = {
       additionalProperties: false,
     },
     logicalOwnership: { type: "object", additionalProperties: { type: "string", minLength: 1 } },
+    assemblyExclusions: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["nodeId", "kind", "reason"],
+        properties: {
+          nodeId: { type: "string", minLength: 1 },
+          kind: { enum: ["non-subject", "presentation-fixture", "microdetail"] },
+          reason: { type: "string", minLength: 1 },
+        },
+        additionalProperties: false,
+      },
+    },
     scaleAuthority: {
       anyOf: [
         {

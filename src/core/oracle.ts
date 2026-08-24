@@ -256,6 +256,22 @@ export function validateLogicalOwnership(ownership: Record<string, string>, sema
   }
 }
 
+/** Required semantics that cannot be excluded (tank profile). */
+const NON_EXCLUDABLE_SEMANTICS = new Set(["hull", "turret", "gun", "turret-pivot", "gun-pivot"]);
+
+export function validateAssemblyExclusions(exclusions: AssemblyExclusion[], semanticMap: Record<string, string>): void {
+  const knownIds = new Set([...Object.keys(semanticMap), ...Object.values(semanticMap)]);
+  for (const entry of exclusions) {
+    if (!entry.nodeId.trim()) throw new Error("assembly exclusion nodeId must be non-empty");
+    if (!knownIds.has(entry.nodeId)) throw new Error(`assembly exclusion nodeId does not resolve to a known semantic or node: ${entry.nodeId}`);
+    if (!entry.reason.trim()) throw new Error(`assembly exclusion for ${entry.nodeId} requires a reason`);
+    const semanticValue = Object.values(semanticMap).find((v) => v === entry.nodeId) ?? semanticMap[entry.nodeId];
+    if (semanticValue && NON_EXCLUDABLE_SEMANTICS.has(semanticValue)) {
+      throw new Error(`required semantic "${semanticValue}" cannot be excluded (${entry.nodeId})`);
+    }
+  }
+}
+
 export interface GlbProbeNodeFact {
   nodeId: string;
   name: string;
@@ -644,6 +660,12 @@ export function validateScaleAuthority(value: ScaleAuthority | undefined): void 
   if (value.unit !== "m") throw new Error("dimension-anchor scaleAuthority.unit must be \"m\"");
 }
 
+export interface AssemblyExclusion {
+  nodeId: string;
+  kind: "non-subject" | "presentation-fixture" | "microdetail";
+  reason: string;
+}
+
 export interface OracleManifest {
   schemaVersion: 1;
   id: string;
@@ -670,6 +692,7 @@ export interface OracleManifest {
   normalization: { translation: Point3; rotationEuler: Point3; scale: number };
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
+  assemblyExclusions?: AssemblyExclusion[];
   scaleAuthority?: ScaleAuthority;
   authoritativeDimensions: Record<string, number> | null;
   dimensionSources: string[];
@@ -683,6 +706,7 @@ export interface OnboardOracleInput extends Omit<OracleManifest, "schemaVersion"
   referenceMode?: "copy" | "external";
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
+  assemblyExclusions?: AssemblyExclusion[];
 }
 
 interface PreparedRecipe {
@@ -695,6 +719,7 @@ interface PreparedRecipe {
   normalization: { translation: Point3; rotationEuler: Point3; scale: number };
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
+  assemblyExclusions?: AssemblyExclusion[];
   scaleAuthority?: ScaleAuthority;
   repair?: { parentPreparedHash: string; reason: string };
   preparedHash?: string;
@@ -735,6 +760,9 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
   if (input.logicalOwnership) {
     validateLogicalOwnership(input.logicalOwnership, input.semanticMap, input.articulationMap);
   }
+  if (input.assemblyExclusions) {
+    validateAssemblyExclusions(input.assemblyExclusions, input.semanticMap);
+  }
   validateScaleAuthority(input.scaleAuthority);
   const baseRecipe: PreparedRecipe = {
     schemaVersion: 1,
@@ -746,6 +774,7 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     normalization: input.normalization,
     ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : {}),
     ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : {}),
+    ...(input.assemblyExclusions ? { assemblyExclusions: input.assemblyExclusions } : {}),
     ...(input.scaleAuthority ? { scaleAuthority: input.scaleAuthority } : {}),
   };
   const preparedHash = sha256(canonicalJson(baseRecipe));
@@ -777,6 +806,7 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     normalization: input.normalization,
     ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : {}),
     ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : {}),
+    ...(input.assemblyExclusions ? { assemblyExclusions: input.assemblyExclusions } : {}),
     ...(input.scaleAuthority ? { scaleAuthority: input.scaleAuthority } : {}),
     authoritativeDimensions: input.authoritativeDimensions,
     dimensionSources: input.dimensionSources,
@@ -852,6 +882,26 @@ export async function loadPreparedOracle(manifest: OracleManifest, workspaceRoot
     if (articulationPivot) object.userData.articulationPivot = articulationPivot;
     if (semantic && recipe.logicalOwnership?.[semantic]) object.userData.logicalOwner = recipe.logicalOwnership[semantic];
   });
+  // Apply durable assembly exclusions: match each exclusion entry against objects by stable
+  // node identity or semantic id, then mark them (and their descendants) as insignificant so
+  // evaluateAssemblyCoverage's hasExplicitExclusion path recognizes them.
+  if (recipe.assemblyExclusions?.length) {
+    const excludedNodeIds = new Set(recipe.assemblyExclusions.map((e) => e.nodeId));
+    const excludedSemantics = new Set(
+      recipe.assemblyExclusions
+        .map((e) => recipe.semanticMap[e.nodeId] ?? e.nodeId)
+        .filter((s) => s),
+    );
+    source.traverse((object) => {
+      const stableId = typeof object.userData.oracleNodeId === "string" ? object.userData.oracleNodeId : undefined;
+      const semantic = object.userData.semanticId as string | undefined;
+      if ((stableId && excludedNodeIds.has(stableId)) || (semantic && excludedSemantics.has(semantic))) {
+        object.userData.insignificant = true;
+        object.userData.exclusionReason = recipe.assemblyExclusions!.find((e) => e.nodeId === stableId || recipe.semanticMap[e.nodeId] === semantic)?.reason;
+        object.userData.exclusionKind = recipe.assemblyExclusions!.find((e) => e.nodeId === stableId || recipe.semanticMap[e.nodeId] === semantic)?.kind;
+      }
+    });
+  }
   // The declared source frame becomes geometry here: it is applied before user normalization so
   // canonical-frame claims in the manifest are mechanically enforced on every load.
   let normalizedSource: THREE.Object3D = source;
@@ -885,6 +935,7 @@ export interface RepairPreparedOracleInput {
   normalization?: { translation: Point3; rotationEuler: Point3; scale: number };
   sourceFrame?: PhysicalFrame;
   logicalOwnership?: Record<string, string>;
+  assemblyExclusions?: AssemblyExclusion[];
   scaleAuthority?: ScaleAuthority;
 }
 
@@ -892,6 +943,7 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
   if (!input.reason.trim()) throw new Error("oracle repair requires a reason");
   if (input.sourceFrame) sourceFrameTransform(input.sourceFrame);
   if (input.logicalOwnership) validateLogicalOwnership(input.logicalOwnership, input.semanticMap ?? manifest.semanticMap, input.articulationMap ?? manifest.articulationMap);
+  if (input.assemblyExclusions) validateAssemblyExclusions(input.assemblyExclusions, input.semanticMap ?? manifest.semanticMap);
   validateScaleAuthority(input.scaleAuthority ?? manifest.scaleAuthority);
   await verifyOraclePreparation(manifest, workspaceRoot);
   const preparedFile = workspaceFile(input.preparedPath, workspaceRoot, "preparedPath");
@@ -904,10 +956,11 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     semanticMap: input.semanticMap ?? manifest.semanticMap,
     articulationMap: input.articulationMap ?? manifest.articulationMap,
     normalization: input.normalization ?? manifest.normalization,
-    // Frame, ownership, and scale authority survive repair unless the caller explicitly
-    // changes them: a repaired recipe must never silently change authoritative decisions.
+    // Frame, ownership, exclusions, and scale authority survive repair unless the caller
+    // explicitly changes them: a repaired recipe must never silently change authoritative decisions.
     ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : manifest.sourceFrame ? { sourceFrame: manifest.sourceFrame } : {}),
     ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : manifest.logicalOwnership ? { logicalOwnership: manifest.logicalOwnership } : {}),
+    ...(input.assemblyExclusions ? { assemblyExclusions: input.assemblyExclusions } : manifest.assemblyExclusions ? { assemblyExclusions: manifest.assemblyExclusions } : {}),
     ...(input.scaleAuthority ? { scaleAuthority: input.scaleAuthority } : manifest.scaleAuthority ? { scaleAuthority: manifest.scaleAuthority } : {}),
     repair: { parentPreparedHash: manifest.preparedHash, reason: input.reason.trim() },
   };
@@ -923,6 +976,7 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     normalization: baseRecipe.normalization,
     ...(baseRecipe.sourceFrame ? { sourceFrame: baseRecipe.sourceFrame } : {}),
     ...(baseRecipe.logicalOwnership ? { logicalOwnership: baseRecipe.logicalOwnership } : {}),
+    ...(baseRecipe.assemblyExclusions ? { assemblyExclusions: baseRecipe.assemblyExclusions } : {}),
     ...(baseRecipe.scaleAuthority ? { scaleAuthority: baseRecipe.scaleAuthority } : {}),
     repairHistory: [...manifest.repairHistory, { reason: input.reason.trim(), recipeHash: preparedHash }],
   };

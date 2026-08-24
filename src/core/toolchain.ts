@@ -138,10 +138,20 @@ async function resolveDependencyRoot(packageRoot: string, packageName: string): 
 const DEPENDENCY_ASSET_PATTERN = /\.(?:js|mjs|cjs|wasm)$/u;
 
 /**
- * Runtime dependency ledger (remaining closure §4.1/§4.2): resolved version + identity
- * hashes computed from the ACTUAL installed dependency bytes. Every input is available both
- * during prepack and after a clean `npm install <tgz>`, so the manifest generated at pack
- * time matches what an installation recomputes. The parent project's lockfile is never read.
+ * Runtime dependency ledger (remaining closure §4.1/§4.2, release host-trust §8):
+ * resolved version + identity hashes computed from the ACTUAL installed dependency bytes.
+ *
+ * Direct-only rationale (release host-trust §8): the shipped manifest is generated at
+ * `npm pack` time from the source checkout's `node_modules` and shipped inside the tarball.
+ * Direct dependencies are pinned by exact version in `package.json` and always resolve
+ * identically in a clean `npm install <tgz>`. Transitive dependency versions are NOT
+ * pinned by the publisher and may differ between the source checkout's `node_modules` and
+ * a fresh install (e.g. `ajv` -> `fast-uri` resolved to 3.1.5 in source but 3.1.6 in a clean
+ * install). Including transitive versions in the shipped manifest would make it
+ * non-reproducible across install contexts and break the installed-package verification.
+ * Real host write isolation remains the primary security boundary; dependency hashing is
+ * defense-in-depth covering the direct dependency closure (which includes all code the
+ * trusted runtime actually imports at load time).
  */
 export async function computeRuntimeDependencies(packageRoot: string): Promise<Array<RuntimeDependencyIdentity>> {
   const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };

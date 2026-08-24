@@ -133,6 +133,8 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
   const store = options.store ?? (options.storeRoot ? new DirectoryRunAuthorityStore(options.storeRoot) : new InMemoryRunAuthorityStore());
   // Store lease (final closure §3.4): one live broker per directory store.
   const releaseLease = await acquireStoreLease(options.store ? undefined : options.storeRoot);
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
   const coordinator = new RunOperationCoordinator();
   const brokerInstanceId = randomBytes(12).toString("hex");
   const authority = new TrustedRunAuthority(store);
@@ -151,7 +153,7 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
     res.end(payload);
   };
 
-  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
       if (req.method !== "POST") {
         respond(res, 405, { error: "broker accepts POST only" });
@@ -299,10 +301,13 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
     if (!value) throw new Error("runId required");
   };
 
-  const port = await new Promise<number>((resolvePort) => {
-    server.listen(options.port ?? 0, options.host ?? "127.0.0.1", () => {
-      const address = server.address();
+  const port = await new Promise<number>((resolvePort, rejectPort) => {
+    server!.listen(options.port ?? 0, options.host ?? "127.0.0.1", () => {
+      const address = server!.address();
       resolvePort(typeof address === "object" && address ? address.port : options.port ?? 0);
+    });
+    server!.on("error", (error: NodeJS.ErrnoException) => {
+      rejectPort(new Error(`broker listen failed: ${error.message}`));
     });
   });
 
@@ -322,10 +327,16 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
     authority,
     pipeline,
     close: async () => {
-      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      await new Promise<void>((resolveClose) => server!.close(() => resolveClose()));
       await releaseLease();
     },
   };
+  } catch (startupError) {
+    // Startup failure must release the store lease so the next broker can start.
+    if (server) { try { server.close(); } catch { /* best-effort */ } }
+    await releaseLease();
+    throw startupError;
+  }
 }
 
 /** Mirrors an authoritative record into workspace-visible TaskState form. */

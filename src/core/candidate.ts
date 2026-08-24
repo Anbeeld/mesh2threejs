@@ -362,6 +362,12 @@ export interface StageCandidateGraphOptions {
    * re-hashed AFTER writing. Either mismatch throws CANDIDATE_STAGE_DRIFT.
    */
   authorityLedger?: ReadonlyArray<{ absolutePath: string; sha256: string }>;
+  /**
+   * Test-only hook: invoked after each staged file is written but BEFORE the post-write
+   * re-hash. A test can mutate the staged file to verify CANDIDATE_STAGE_DRIFT detection.
+   * Never exposed through broker payloads.
+   */
+  onAfterStageWrite?: (stagedPath: string) => Promise<void>;
 }
 
 export async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudit, options?: StageCandidateGraphOptions): Promise<StagedCandidateGraph> {
@@ -385,6 +391,8 @@ export async function stageCandidateGraph(entryPath: string, audit: CandidateMod
       const staged = resolve(root, relative(ancestor, file));
       await mkdir(dirname(staged), { recursive: true });
       await writeFile(staged, bytes, { flag: "wx" });
+      // Test-only hook: allows mutation of the staged file before post-write re-hash.
+      if (options?.onAfterStageWrite) await options.onAfterStageWrite(staged);
       // Post-write re-verification (final closure §2): the staged copy must hash to the same
       // value as the authority ledger. A mismatch means the staged file was altered between
       // write and re-read, or the filesystem is unreliable.

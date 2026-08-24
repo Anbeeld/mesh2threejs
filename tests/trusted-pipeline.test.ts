@@ -470,21 +470,16 @@ describe("broker-private trusted execution staging (final closure §12.1)", () =
     const source = `export function createCandidate() { return {}; }\n`;
     await writeFile(entry, source);
     const audit = await auditCandidateModule(entry);
-    // Build the authority ledger from the audit, then corrupt the staged file mid-stage by
-    // intercepting: we test the post-write re-hash path by providing a ledger that disagrees
-    // with the actual file bytes. The staged copy must hash to the ledger value, not the file.
     const ledger = audit.candidateFiles.map((file) => ({ absolutePath: join(parent, file.path), sha256: file.sha256 }));
-    // Mutate the source AFTER audit so the READ during staging sees different bytes → the
-    // authority-ledger check (pre-write) catches it as CANDIDATE_CHANGED_DURING_AUTHORIZATION.
-    // For CANDIDATE_STAGE_DRIFT we need the pre-write check to pass but post-write to fail:
-    // that requires an external mutation between write and re-read, which we simulate by
-    // using a stagingRoot on the same filesystem and corrupting after stageCandidateGraph
-    // completes a write but before the re-read. Since stageCandidateGraph is atomic, we test
-    // the ledger path: when the ledger hash matches the original but the file changed, the
-    // pre-write check catches it. The post-write check is verified by the fact that staging
-    // with a correct ledger succeeds and the staged file hashes correctly.
-    await writeFile(entry, `export function createCandidate() { return { tampered: true }; }\n`);
-    await expect(stageCandidateGraph(entry, audit, { stagingRoot, authorityLedger: ledger })).rejects.toThrow(/CANDIDATE_CHANGED_DURING_AUTHORIZATION/);
+    // Use the onAfterStageWrite hook to mutate the staged file AFTER it is written but
+    // BEFORE the post-write re-hash. This triggers CANDIDATE_STAGE_DRIFT for real.
+    await expect(stageCandidateGraph(entry, audit, {
+      stagingRoot,
+      authorityLedger: ledger,
+      onAfterStageWrite: async (stagedPath) => {
+        await writeFile(stagedPath, `// tampered\n`);
+      },
+    })).rejects.toThrow(/CANDIDATE_STAGE_DRIFT/);
   });
 
   test("regression 4: trusted child entry path is never under the workspace root", async () => {

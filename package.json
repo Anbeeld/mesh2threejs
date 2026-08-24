@@ -53,6 +53,7 @@
     "test:e2e": "node dist/validation/e2e.js",
     "test:installed-package": "npm run build && node dist/validation/installed-package.js",
     "test:installed-lifecycle": "node dist/validation/installed-lifecycle.js",
+    "test:installed-lifecycle:regression": "node dist/validation/installed-lifecycle-regression.js",
     "validate:release": "npm run ci && npm run benchmark:derive && npm run benchmark:heavy",
     "prepack": "npm run validate:development && npm run generate:toolchain-manifest"
   },

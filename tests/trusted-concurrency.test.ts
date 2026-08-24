@@ -5,6 +5,7 @@ import { describe, expect, test, afterAll } from "vitest";
 import { runCli } from "../src/cli.js";
 import { startBroker } from "../src/broker/server.js";
 import { BrokerClient } from "../src/broker/client.js";
+import { RunOperationCoordinator } from "../src/core/run-coordinator.js";
 import { createSlopedTank, stableSemanticIdentityMap, sceneToGlb } from "./helpers/tank-fixtures.js";
 
 /**
@@ -144,5 +145,48 @@ describe("per-run serialization and store lease (final closure §12.2)", () => {
     } finally {
       await brokerB.close();
     }
+  }, 60_000);
+
+  test("coordinator queue entries are cleaned up after sequential runs complete", async () => {
+    const coordinator = new RunOperationCoordinator();
+    // Run many sequential operations on different runIds.
+    for (let i = 0; i < 20; i += 1) {
+      await coordinator.runExclusive(`run-${i}`, async () => i);
+    }
+    // After all operations complete, no queue entries should remain.
+    expect(coordinator._queueSize()).toBe(0);
+  }, 30_000);
+
+  test("coordinator queue entries are cleaned up after concurrent same-run operations", async () => {
+    const coordinator = new RunOperationCoordinator();
+    const runId = "run-concurrent";
+    // Launch many concurrent operations on the SAME runId.
+    const ops = Array.from({ length: 10 }, (_, i) => coordinator.runExclusive(runId, async () => i));
+    await Promise.all(ops);
+    // After all operations complete, the queue entry should be cleaned up.
+    expect(coordinator._queueSize()).toBe(0);
+  }, 30_000);
+
+  test("failed broker startup releases the store lease", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-lease-fail-"));
+    roots.push(parent);
+    const storeRoot = join(parent, "store");
+    await mkdir(storeRoot, { recursive: true });
+    // Start brokerA to occupy the port; brokerB will acquire the lease on a DIFFERENT
+    // storeRoot but fail to listen on brokerA's port. The catch must release brokerB's lease.
+    const storeRootA = join(parent, "storeA");
+    const storeRootB = join(parent, "storeB");
+    await mkdir(storeRootA, { recursive: true });
+    await mkdir(storeRootB, { recursive: true });
+    const brokerA = await startBroker({ storeRoot: storeRootA, toolchainOverride });
+    try {
+      // brokerB acquires lease on storeRootB (succeeds) but fails at listen (port in use).
+      await expect(startBroker({ storeRoot: storeRootB, toolchainOverride, port: brokerA.port })).rejects.toThrow();
+    } finally {
+      await brokerA.close();
+    }
+    // After the failed startup released its lease, a new broker can start on storeRootB.
+    const brokerC = await startBroker({ storeRoot: storeRootB, toolchainOverride });
+    await brokerC.close();
   }, 60_000);
 });

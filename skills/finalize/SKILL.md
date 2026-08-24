@@ -7,13 +7,8 @@ description: Fail-closed certification and user handoff. Certification requires 
 
 Certification is a trusted-run operation (fail-closed):
 
-- `mesh2threejs finalize <workspace>` on an unbound (development) workspace refuses with
-  exit 6 (`TRUSTED_CERTIFICATION_UNAVAILABLE`). Development runs produce reports but never
-  claim certification.
-- A workspace bound to a trusted run (`state.mirrorOfRun`) is finalized by the trusted
-  broker only: the broker freshly replays the whole evaluation through the candidate
-  sandbox, requires the current human approval bound to the exact packet/candidate/oracle/
-  toolchain/replay hashes, and refuses when anything drifted.
+- An unbound (development) workspace has no trusted run and refuses certification. Development runs produce reports but never claim certification.
+- A workspace bound to a trusted run (`state.mirrorOfRun`) is finalized by the broker only: the admin channel runs `trusted-finalize`, which freshly replays the whole evaluation through the candidate sandbox, requires the current human approval bound to the exact packet/candidate/oracle/toolchain/replay hashes, and refuses when anything drifted.
 - Historical `passed` evidence fields are provenance; they never override current truth. Finalization re-verifies every bound review artifact byte-for-byte BEFORE the fresh replay; any drift is `REVIEW_ARTIFACT_DRIFT` and requires a new review-ready plus human approval.
 
 Finalization still verifies registration, deterministic gate, style, complexity, sampled

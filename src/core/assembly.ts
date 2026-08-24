@@ -244,7 +244,7 @@ export function assertAssemblyCoverage(root: THREE.Object3D, profile: ProfileId)
   const report = evaluateAssemblyCoverage(root, profile);
   if (!report.passed) {
     const listed = report.unresolved.map((entry) => `${entry.meshName} (${entry.triangles} tris, ${entry.objectId})`).join("; ");
-    throw new Error(`semantic assembly coverage failed: ${report.unresolved.length} significant source mesh(es) are not owned by any phase and not excluded as insignificant: ${listed}. Map them with onboard/repair-oracle, or mark them explicitly insignificant (userData.insignificant = true on the mesh or an ancestor) so the exclusion carries provenance.`);
+    throw new Error(`semantic assembly coverage failed: ${report.unresolved.length} significant source mesh(es) are not owned by any phase and not excluded as insignificant: ${listed}. Map them with onboard/repair-oracle, or exclude them durably via repair-oracle → assemblyExclusions (nodeId, kind, reason) so the exclusion carries provenance.`);
   }
   return report;
 }
