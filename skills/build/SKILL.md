@@ -13,6 +13,8 @@ Authorship strategy first: check `state.authorshipMode`. In **derived** mode, wh
 
 Trusted build loop: broker `derive` → broker `gate` → broker `workorders` if failed → edit `model/repairs/<phase>.json` → broker `derive` → broker `gate` → broker `render-quick` when useful → broker `lock`.
 
+Use declarative repair data and normal reconstruction operations. Do not edit pipeline source, evaluator code, profile contracts, or gate thresholds.
+
 For a first build in an active phase, finish the smallest complete candidate for that phase before running its audit-and-repair cycle. Do not interleave evaluator verdicts into construction of one incomplete component. After the first derived seed or any representation-level repair, inspect a quick phase render (broker `render-quick`) yourself when host image inspection is available; if the macro read is grossly wrong, change representation/derive recipe instead of entering numeric iteration. These captures are builder diagnostics only — they never satisfy visual review.
 
 Candidate changes invalidate dependent evidence. If three equivalent attempts add no evidence and do not move a metric, route to diagnosis; failed gates are recorded automatically, so no manual attempt bookkeeping is needed.

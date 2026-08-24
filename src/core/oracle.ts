@@ -259,17 +259,75 @@ export function validateLogicalOwnership(ownership: Record<string, string>, sema
 /** Required semantics that cannot be excluded (tank profile). */
 const NON_EXCLUDABLE_SEMANTICS = new Set(["hull", "turret", "gun", "turret-pivot", "gun-pivot"]);
 
-export function validateAssemblyExclusions(exclusions: AssemblyExclusion[], semanticMap: Record<string, string>): void {
-  const knownIds = new Set([...Object.keys(semanticMap), ...Object.values(semanticMap)]);
-  for (const entry of exclusions) {
-    if (!entry.nodeId.trim()) throw new Error("assembly exclusion nodeId must be non-empty");
-    if (!knownIds.has(entry.nodeId)) throw new Error(`assembly exclusion nodeId does not resolve to a known semantic or node: ${entry.nodeId}`);
-    if (!entry.reason.trim()) throw new Error(`assembly exclusion for ${entry.nodeId} requires a reason`);
-    const semanticValue = Object.values(semanticMap).find((v) => v === entry.nodeId) ?? semanticMap[entry.nodeId];
-    if (semanticValue && NON_EXCLUDABLE_SEMANTICS.has(semanticValue)) {
-      throw new Error(`required semantic "${semanticValue}" cannot be excluded (${entry.nodeId})`);
+/** Validated source node identity from the immutable GLB node array. */
+export interface SourceNodeIdentity {
+  id: string;
+  parentId: string | null;
+}
+
+/**
+ * Validates assembly exclusions against immutable source GLB node identities.
+ *
+ * - nodeId must be an exact `node:N` identity that exists in the source GLB.
+ * - Semantic aliases (e.g. "hull") are rejected — nodeId is a source node, not a semantic.
+ * - Duplicate nodeIds are rejected.
+ * - Invalid kinds are rejected (runtime JSON safety).
+ * - Empty reasons are rejected.
+ * - An exclusion is rejected if the node OR any descendant subtree contains a mapped
+ *   protected semantic/pivot (hull, turret, gun, turret-pivot, gun-pivot).
+ *
+ * Returns a canonicalized (sorted by nodeId) copy for deterministic preparation identity.
+ */
+export function validateAssemblyExclusions(
+  exclusions: AssemblyExclusion[],
+  sourceNodes: SourceNodeIdentity[],
+  semanticMap: Record<string, string>,
+): AssemblyExclusion[] {
+  const validNodeIds = new Set(sourceNodes.map((n) => n.id));
+  const nodeChildren = new Map<string, string[]>();
+  for (const node of sourceNodes) {
+    if (node.parentId) {
+      const siblings = nodeChildren.get(node.parentId) ?? [];
+      siblings.push(node.id);
+      nodeChildren.set(node.parentId, siblings);
     }
   }
+  const seen = new Set<string>();
+  for (const entry of exclusions) {
+    if (!entry.nodeId.trim()) throw new Error("assembly exclusion nodeId must be non-empty");
+    if (!validNodeIds.has(entry.nodeId)) {
+      throw new Error(`assembly exclusion nodeId must be an exact source node:N identity: ${entry.nodeId} does not exist in the source GLB`);
+    }
+    if (seen.has(entry.nodeId)) throw new Error(`assembly exclusion duplicate nodeId: ${entry.nodeId}`);
+    seen.add(entry.nodeId);
+    const validKinds = new Set(["non-subject", "presentation-fixture", "microdetail"]);
+    if (!validKinds.has(entry.kind)) throw new Error(`assembly exclusion kind must be non-subject, presentation-fixture, or microdetail: got ${entry.kind}`);
+    if (!entry.reason.trim()) throw new Error(`assembly exclusion for ${entry.nodeId} requires a reason`);
+    // Protected-subtree check: reject if the excluded node or any descendant carries a
+    // mapped protected semantic/pivot.
+    const protectedInSubtree = checkProtectedSemanticInSubtree(entry.nodeId, nodeChildren, semanticMap);
+    if (protectedInSubtree) {
+      throw new Error(`assembly exclusion for ${entry.nodeId} cannot exclude a subtree containing required semantic "${protectedInSubtree}"`);
+    }
+  }
+  // Canonicalize: sort by numeric node index for deterministic preparation identity.
+  return [...exclusions].sort((a, b) => {
+    const aIndex = parseInt(a.nodeId.replace(/^node:/u, ""), 10);
+    const bIndex = parseInt(b.nodeId.replace(/^node:/u, ""), 10);
+    return aIndex - bIndex;
+  });
+}
+
+/** Walks the subtree of `nodeId` and returns the first protected semantic found, or null. */
+function checkProtectedSemanticInSubtree(nodeId: string, nodeChildren: Map<string, string[]>, semanticMap: Record<string, string>): string | null {
+  const queue = [nodeId];
+  while (queue.length) {
+    const current = queue.shift()!;
+    const semantic = semanticMap[current];
+    if (semantic && NON_EXCLUDABLE_SEMANTICS.has(semantic)) return semantic;
+    queue.push(...(nodeChildren.get(current) ?? []));
+  }
+  return null;
 }
 
 export interface GlbProbeNodeFact {
@@ -761,7 +819,9 @@ export async function onboardOracle(input: OnboardOracleInput): Promise<OracleMa
     validateLogicalOwnership(input.logicalOwnership, input.semanticMap, input.articulationMap);
   }
   if (input.assemblyExclusions) {
-    validateAssemblyExclusions(input.assemblyExclusions, input.semanticMap);
+    const sourceNodes: SourceNodeIdentity[] = probe.semanticIdentities.map((s) => ({ id: s.id, parentId: s.parentId }));
+    const canonical = validateAssemblyExclusions(input.assemblyExclusions, sourceNodes, input.semanticMap);
+    input = { ...input, assemblyExclusions: canonical };
   }
   validateScaleAuthority(input.scaleAuthority);
   const baseRecipe: PreparedRecipe = {
@@ -882,23 +942,19 @@ export async function loadPreparedOracle(manifest: OracleManifest, workspaceRoot
     if (articulationPivot) object.userData.articulationPivot = articulationPivot;
     if (semantic && recipe.logicalOwnership?.[semantic]) object.userData.logicalOwner = recipe.logicalOwnership[semantic];
   });
-  // Apply durable assembly exclusions: match each exclusion entry against objects by stable
-  // node identity or semantic id, then mark them (and their descendants) as insignificant so
-  // evaluateAssemblyCoverage's hasExplicitExclusion path recognizes them.
+  // Apply durable assembly exclusions: match each exclusion entry against objects by exact
+  // source node identity (node:N), then mark them (and their descendants via the ancestor
+  // chain walk in hasExplicitExclusion) as insignificant so evaluateAssemblyCoverage
+  // recognizes them. Only exact node:N matching — no semantic aliases.
   if (recipe.assemblyExclusions?.length) {
-    const excludedNodeIds = new Set(recipe.assemblyExclusions.map((e) => e.nodeId));
-    const excludedSemantics = new Set(
-      recipe.assemblyExclusions
-        .map((e) => recipe.semanticMap[e.nodeId] ?? e.nodeId)
-        .filter((s) => s),
-    );
+    const exclusionByNodeId = new Map(recipe.assemblyExclusions.map((e) => [e.nodeId, e]));
     source.traverse((object) => {
       const stableId = typeof object.userData.oracleNodeId === "string" ? object.userData.oracleNodeId : undefined;
-      const semantic = object.userData.semanticId as string | undefined;
-      if ((stableId && excludedNodeIds.has(stableId)) || (semantic && excludedSemantics.has(semantic))) {
+      if (stableId && exclusionByNodeId.has(stableId)) {
+        const entry = exclusionByNodeId.get(stableId)!;
         object.userData.insignificant = true;
-        object.userData.exclusionReason = recipe.assemblyExclusions!.find((e) => e.nodeId === stableId || recipe.semanticMap[e.nodeId] === semantic)?.reason;
-        object.userData.exclusionKind = recipe.assemblyExclusions!.find((e) => e.nodeId === stableId || recipe.semanticMap[e.nodeId] === semantic)?.kind;
+        object.userData.exclusionReason = entry.reason;
+        object.userData.exclusionKind = entry.kind;
       }
     });
   }
@@ -943,7 +999,13 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
   if (!input.reason.trim()) throw new Error("oracle repair requires a reason");
   if (input.sourceFrame) sourceFrameTransform(input.sourceFrame);
   if (input.logicalOwnership) validateLogicalOwnership(input.logicalOwnership, input.semanticMap ?? manifest.semanticMap, input.articulationMap ?? manifest.articulationMap);
-  if (input.assemblyExclusions) validateAssemblyExclusions(input.assemblyExclusions, input.semanticMap ?? manifest.semanticMap);
+  let canonicalExclusions: AssemblyExclusion[] | undefined;
+  if (input.assemblyExclusions) {
+    const sourceBytes = await readVerifiedSourceBytes(manifest, workspaceRoot);
+    const probe = probeGlb(sourceBytes);
+    const sourceNodes: SourceNodeIdentity[] = probe.semanticIdentities.map((s) => ({ id: s.id, parentId: s.parentId }));
+    canonicalExclusions = validateAssemblyExclusions(input.assemblyExclusions, sourceNodes, input.semanticMap ?? manifest.semanticMap);
+  }
   validateScaleAuthority(input.scaleAuthority ?? manifest.scaleAuthority);
   await verifyOraclePreparation(manifest, workspaceRoot);
   const preparedFile = workspaceFile(input.preparedPath, workspaceRoot, "preparedPath");
@@ -960,7 +1022,7 @@ export async function repairPreparedOracle(manifest: OracleManifest, input: Repa
     // explicitly changes them: a repaired recipe must never silently change authoritative decisions.
     ...(input.sourceFrame ? { sourceFrame: input.sourceFrame } : manifest.sourceFrame ? { sourceFrame: manifest.sourceFrame } : {}),
     ...(input.logicalOwnership ? { logicalOwnership: input.logicalOwnership } : manifest.logicalOwnership ? { logicalOwnership: manifest.logicalOwnership } : {}),
-    ...(input.assemblyExclusions ? { assemblyExclusions: input.assemblyExclusions } : manifest.assemblyExclusions ? { assemblyExclusions: manifest.assemblyExclusions } : {}),
+    ...(canonicalExclusions ? { assemblyExclusions: canonicalExclusions } : input.assemblyExclusions ? { assemblyExclusions: input.assemblyExclusions } : manifest.assemblyExclusions ? { assemblyExclusions: manifest.assemblyExclusions } : {}),
     ...(input.scaleAuthority ? { scaleAuthority: input.scaleAuthority } : manifest.scaleAuthority ? { scaleAuthority: manifest.scaleAuthority } : {}),
     repair: { parentPreparedHash: manifest.preparedHash, reason: input.reason.trim() },
   };

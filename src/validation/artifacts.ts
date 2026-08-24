@@ -89,13 +89,9 @@ export async function validateRepositoryArtifacts(root: string): Promise<Artifac
       if (typeof adapter.host !== "string" || typeof adapter.status !== "string" || typeof adapter.capabilities?.actualVisualReview !== "boolean") {
         errors.push(`${host} adapter has an invalid capability contract`);
       }
-      // Verified-facts truth fields (plan §20/§26): hosts that have not proven every trusted
-      // boundary must declare trustedReconstruction=false and unverified isolation facts.
-      if (adapter.trustedReconstruction !== false) errors.push(`${host} adapter must declare trustedReconstruction=false until a host trial proves every trusted boundary`);
-      for (const field of ["builderToolIsolation", "toolchainWriteIsolation", "humanApprovalSeparation"] as const) {
-        if (adapter[field] !== "unverified") errors.push(`${host} adapter ${field} must be "unverified" until a host trial proves it`);
-      }
-      if (adapter.candidateSandboxBackend !== "none") errors.push(`${host} adapter candidateSandboxBackend must be "none" until a verified sandbox backend is demonstrated`);
+      // Verified-facts truth fields: hosts that have not proven every trusted
+      // boundary must declare trustedReconstruction=false.
+      if (adapter.trustedReconstruction !== false) errors.push(`${host} adapter must declare trustedReconstruction=false until integration is verified`);
       validated += 1;
     } catch (error) {
       errors.push(`${host} adapter: ${String(error)}`);

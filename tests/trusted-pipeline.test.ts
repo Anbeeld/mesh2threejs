@@ -28,7 +28,7 @@ const io = () => {
 
 const toolchainOverride = {
   manifest: { schemaVersion: 2 as const, dependencies: [] as never, packageName: "mesh2threejs", packageVersion: "1.0.0", runtimeHash: "r", controlHash: "c", dependencyIdentity: "d", runtimeFiles: {}, controlFiles: {} },
-  provenance: { nodeVersion: process.version, platform: process.platform, arch: process.arch, packageRoot: ".", threeRoot: null, threeVersion: null, meshoptimizerRoot: null, meshoptimizerVersion: null },
+  provenance: { nodeVersion: process.version, platform: process.platform, arch: process.arch, packageRoot: ".", threeRoot: null, threeVersion: null, meshoptimizerRoot: null, meshoptimizerVersion: null, installationRuntimeClosureHash: null },
   toolchainId: "tc-pipeline-attacks",
   trustedToolchain: true,
 };

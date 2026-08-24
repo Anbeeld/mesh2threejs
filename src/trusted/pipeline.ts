@@ -70,7 +70,7 @@ export interface TrustedPipelineOptions {
   toolchain?: VerifiedToolchain;
   /**
    * Broker-private execution scratch root (final closure §2). Trusted candidate staging is
-   * created INSIDE this directory — outside the workspace, repo, and builder-writable space
+    * created INSIDE this directory — outside the workspace and repo
    * — so a workspace mutation after authorization cannot affect the private staged copy.
    * Required for trusted runs; omitted in tests that inject their own staging.
    */

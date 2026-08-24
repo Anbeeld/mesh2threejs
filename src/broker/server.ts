@@ -29,7 +29,7 @@ import type { TaskState } from "../core/state.js";
  */
 
 export interface BrokerOptions {
-  /** Storage root for canonical authority records; MUST be outside builder-writable space. */
+  /** Storage root for canonical authority records; kept separate from the workspace. */
   storeRoot?: string;
   /** Package root used for toolchain identity; defaults to this installation. */
   packageRoot?: string;
@@ -139,7 +139,7 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
   const brokerInstanceId = randomBytes(12).toString("hex");
   const authority = new TrustedRunAuthority(store);
   // Broker-private execution scratch root (final closure §2): staging lives OUTSIDE the
-  // workspace/repo/builder-writable space, inside the broker-owned store directory. A
+  // workspace/repo space, inside the broker-owned store directory. A
   // workspace mutation after authorization cannot affect the private staged copy.
   const executionScratchRoot = options.storeRoot ? join(resolve(options.storeRoot), "runtime", "executions") : undefined;
   if (executionScratchRoot) await mkdir(executionScratchRoot, { recursive: true });

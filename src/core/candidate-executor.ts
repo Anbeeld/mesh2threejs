@@ -47,7 +47,7 @@ export interface ExecutorOptions {
   authorityExpectations?: DerivedGraphExpectations;
   /**
    * Broker-private execution scratch root (final closure §2). When supplied, the staged
-   * candidate graph is created OUTSIDE the workspace/repo/builder-writable space. Trusted
+    * candidate graph is created OUTSIDE the workspace/repo. Trusted
    * operations pass this; development callers omit it.
    */
   executionScratchRoot?: string;

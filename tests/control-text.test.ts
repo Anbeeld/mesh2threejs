@@ -28,6 +28,11 @@ const GLOBAL_FORBIDDEN: Array<{ pattern: RegExp; why: string }> = [
   { pattern: /export function repair/iu, why: "repair code snippets teach executable repairs" },
   { pattern: /CLI is the authoritative mutation surface/iu, why: "broker is the trusted authority surface; CLI is development-only" },
   { pattern: /\bmesh2threejs rebind\b/iu, why: "trusted policy drift requires an administrative rebase/new run, never builder rebind" },
+  { pattern: /edit contract to pass/iu, why: "agents must not edit contracts to escape failing gates" },
+  { pattern: /adjust threshold/iu, why: "agents must not adjust gate thresholds to escape failing gates" },
+  { pattern: /modify evaluator/iu, why: "agents must not modify evaluator code during reconstruction" },
+  { pattern: /directly write certified state/iu, why: "agents must not directly write certified state" },
+  { pattern: /manual review PASS/iu, why: "agents must not manually fabricate review PASS verdicts" },
 ];
 
 /** Unscoped trusted CLI command routes that must not appear outside a DEVELOPMENT MODE section. */
@@ -111,5 +116,37 @@ describe("agent control text describes the trusted workflow (§8)", () => {
     expect(root).toMatch(/HUMAN approval/i);
     const review = await readFile("skills/visual-review/SKILL.md", "utf8");
     expect(review).toMatch(/diagnostic data only/iu);
+  });
+
+  test("agent discipline wording is present in AGENTS.md", async () => {
+    const agents = await readFile("AGENTS.md", "utf8");
+    expect(agents).toMatch(/RECONSTRUCTION WORK/iu);
+    expect(agents).toMatch(/PIPELINE DEVELOPMENT/iu);
+    expect(agents).toMatch(/never.*change.*judge/iu);
+    expect(agents).toMatch(/must not.*fabricate/iu);
+  });
+
+  test("diagnose skill prohibits gate editing", async () => {
+    const diagnose = await readFile("skills/diagnose/SKILL.md", "utf8");
+    expect(diagnose).toMatch(/never.*permission.*edit.*gate/iu);
+  });
+
+  test("build skill prohibits pipeline source editing", async () => {
+    const build = await readFile("skills/build/SKILL.md", "utf8");
+    expect(build).toMatch(/Do not edit pipeline source/iu);
+  });
+
+  test("finalize skill prohibits self-approval", async () => {
+    const finalize = await readFile("skills/finalize/SKILL.md", "utf8");
+    expect(finalize).toMatch(/Do not self-approve/iu);
+  });
+
+  test("no OS-level security claims in instruction surfaces", async () => {
+    for (const surface of SURFACES) {
+      const text = await readFile(surface, "utf8");
+      expect(text).not.toMatch(/OS[- ]level security boundary/iu);
+      expect(text).not.toMatch(/builder physically cannot/iu);
+      expect(text).not.toMatch(/host-enforced private/iu);
+    }
   });
 });

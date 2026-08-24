@@ -351,7 +351,7 @@ export interface StagedCandidateGraph {
 export interface StageCandidateGraphOptions {
   /**
    * Broker-private execution root (final closure §2). When supplied, staging is created
-   * INSIDE this directory — outside the workspace, repo, and builder-writable space — so a
+    * INSIDE this directory — outside the workspace and repo — so a
    * workspace mutation after authorization cannot affect the private copy. When omitted,
    * staging falls back to a temp directory under the graph's common ancestor (development).
    */

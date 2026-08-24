@@ -13,4 +13,4 @@ Record the diagnosis and select a materially different evidence-backed action, g
 - **derived mode**: prefer a less aggressive derived seed (`derive --quality balanced|conservative`), protect the failing region/features via a declarative repair spec (model/repairs/<active-phase>.json compiled by derive), or switch representation only for the failing subcomponent.
 - **independent mode**: prefer changing the representation/control cage over another scalar sweep of the same primitive family.
 
-Route to onboarding/repair only for oracle defects, build for candidate defects, or visual review for missing human/vision judgment. Never relax assertions merely to obtain a pass.
+Route to onboarding/repair only for oracle defects, build for candidate defects, or visual review for missing human/vision judgment. Never relax assertions merely to obtain a pass. A failing gate is evidence to repair the candidate/oracle mapping. It is never permission to edit the gate implementation, threshold, or evaluator code.

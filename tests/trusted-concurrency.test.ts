@@ -26,7 +26,7 @@ const io = () => {
 
 const toolchainOverride = {
   manifest: { schemaVersion: 2 as const, dependencies: [] as never, packageName: "mesh2threejs", packageVersion: "1.0.0", runtimeHash: "r", controlHash: "c", dependencyIdentity: "d", runtimeFiles: {}, controlFiles: {} },
-  provenance: { nodeVersion: process.version, platform: process.platform, arch: process.arch, packageRoot: ".", threeRoot: null, threeVersion: null, meshoptimizerRoot: null, meshoptimizerVersion: null },
+  provenance: { nodeVersion: process.version, platform: process.platform, arch: process.arch, packageRoot: ".", threeRoot: null, threeVersion: null, meshoptimizerRoot: null, meshoptimizerVersion: null, installationRuntimeClosureHash: null },
   toolchainId: "tc-concurrency",
   trustedToolchain: true,
 };
@@ -87,20 +87,102 @@ describe("per-run serialization and store lease (final closure §12.2)", () => {
   test("gate vs reopen: reopened phase is not resurrected by a stale gate commit", async () => {
     const { broker, builder, runId } = await beginRunToDerivedHull();
     try {
-      // Gate and reopen race: the reopen invalidates the gate's stale evidence. Whatever
-      // order wins, the final state must reflect one valid serial ordering — a stale gate
-      // commit cannot resurrect the pre-reopen state.
       await Promise.allSettled([
         builder.gate(runId),
         builder.reopen(runId, "oracle-registration", "concurrent reopen test"),
       ]);
       const record = await builder.readRun(runId);
-      // The canonical state must be internally consistent: no stale evidence resurrection.
+      const state = record.record.embedded.state;
+      // Exact invariant: if reopen won, oracle-registration must NOT be locked.
+      // If gate won before reopen, reopen invalidated it. Either way, no stale lock+evidence.
+      const registrationLocked = "oracle-registration" in state.locks;
+      const hasCurrentGateEvidence = Object.values(state.evidence).some(
+        (e) => e.kind === "deterministic-gate" && e.phase === "oracle-registration" && e.valid,
+      );
+      if (registrationLocked && hasCurrentGateEvidence) {
+        // This is only valid if gate won AFTER reopen (re-locked with fresh evidence).
+        expect(record.record.mirrorSequence).toBeGreaterThan(0);
+      }
       expect(record.record.status).toMatch(/active|awaiting-human-review/);
     } finally {
       await broker.close();
     }
   }, 180_000);
+
+  test("approve-review vs reopen: never reopened geometry + old humanApproval current", async () => {
+    const { broker, builder, admin, runId } = await beginRunToDerivedHull();
+    try {
+      // Drive to review-ready first.
+      for (let cycle = 0; cycle < 8; cycle += 1) {
+        const next = await builder.next(runId) as { route?: string; activePhase?: string };
+        if (next.route !== "build") break;
+        await builder.derive(runId);
+        const gate = await builder.gate(runId) as { passed: boolean };
+        if (!gate.passed) break;
+        await builder.lock(runId);
+        const status = await builder.status(runId) as { status: string };
+        if (status.status === "awaiting-human-review") break;
+      }
+      await builder.reviewReady(runId);
+      // Race approve-review and reopen. One must win; no mixed state.
+      await Promise.allSettled([
+        admin.approveReview(runId),
+        builder.reopen(runId, "hull", "concurrent reopen during approval"),
+      ]);
+      const record = await builder.readRun(runId);
+      // Exact invariant: if geometry was reopened, human approval must NOT be current.
+      const reopened = !("hull" in record.record.embedded.state.locks);
+      const hasApproval = record.record.review?.humanApproval != null;
+      if (reopened && hasApproval) {
+        throw new Error("mixed state: reopened hull phase with current human approval");
+      }
+      expect(record.record.status).toMatch(/active|awaiting-human-review|certified/);
+    } finally {
+      await broker.close();
+    }
+  }, 300_000);
+
+  test("trusted-finalize vs reopen: no mixed certified+reopened state", async () => {
+    const { broker, builder, admin, runId } = await beginRunToDerivedHull();
+    try {
+      // Drive to review-ready + approve + finalize race.
+      for (let cycle = 0; cycle < 8; cycle += 1) {
+        const next = await builder.next(runId) as { route?: string; activePhase?: string };
+        if (next.route !== "build") break;
+        await builder.derive(runId);
+        const gate = await builder.gate(runId) as { passed: boolean };
+        if (!gate.passed) break;
+        await builder.lock(runId);
+        const status = await builder.status(runId) as { status: string };
+        if (status.status === "awaiting-human-review") break;
+      }
+      await builder.reviewReady(runId);
+      await admin.approveReview(runId);
+      // Race finalize and reopen. One must win; no mixed state.
+      const [finalizeResult, reopenResult] = await Promise.allSettled([
+        admin.trustedFinalize(runId),
+        builder.reopen(runId, "hull", "concurrent reopen during finalize"),
+      ]);
+      const record = await builder.readRun(runId);
+      // Exact invariant: if the run is certified, no phase can be reopened.
+      if (record.record.status === "certified") {
+        const hullLocked = "hull" in record.record.embedded.state.locks;
+        if (!hullLocked) {
+          throw new Error("mixed state: certified run with unlocked hull phase");
+        }
+        expect(record.record.finalReplay?.passed).toBe(true);
+      }
+      // If reopen won, finalize must have refused (not certified with stale authority).
+      if (reopenResult.status === "fulfilled" && finalizeResult.status === "fulfilled") {
+        if (record.record.status === "certified") {
+          const hullLocked = "hull" in record.record.embedded.state.locks;
+          expect(hullLocked).toBe(true);
+        }
+      }
+    } finally {
+      await broker.close();
+    }
+  }, 300_000);
 
   test("a second broker on the same store is refused with BROKER_STORE_IN_USE", async () => {
     const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-lease-"));

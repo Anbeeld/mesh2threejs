@@ -37,7 +37,7 @@ const toolchainOverride = {
     runtimeFiles: {},
     controlFiles: {},
   },
-  provenance: { nodeVersion: process.version, platform: process.platform, arch: process.arch, packageRoot: ".", threeRoot: null, threeVersion: null, meshoptimizerRoot: null, meshoptimizerVersion: null },
+  provenance: { nodeVersion: process.version, platform: process.platform, arch: process.arch, packageRoot: ".", threeRoot: null, threeVersion: null, meshoptimizerRoot: null, meshoptimizerVersion: null, installationRuntimeClosureHash: null },
   toolchainId: "tc-lifecycle-fixed",
   trustedToolchain: true,
 };

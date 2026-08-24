@@ -20,7 +20,7 @@ import type { OraclePreparationBinding } from "./oracle.js";
 import { assertCapability, type Capability } from "./capabilities.js";
 
 /**
- * Canonical run authority. The authoritative record lives OUTSIDE builder-writable space;
+ * Canonical run authority. The authoritative record lives separate from the workspace;
  * the workspace `.mesh2threejs/state.json` is only a signed/hashed mirror of it. All
  * mutations flow through typed transitions applied inside the authority; builders never
  * hand authoritative hashes or pass flags to it.
@@ -213,7 +213,7 @@ export class InMemoryRunAuthorityStore implements RunAuthorityStore {
   }
 }
 
-/** Broker-owned storage directory. Deployments must place this outside builder-writable authority. */
+/** Broker-owned storage directory. Kept separate from the workspace. */
 export class DirectoryRunAuthorityStore implements RunAuthorityStore {
   constructor(private readonly root: string) {}
   private path(runId: string): string {

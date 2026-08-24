@@ -4,6 +4,14 @@ Start with root `SKILL.md`, then read `project.json` and `.mesh2threejs/state.js
 
 Mode resolution comes FIRST: if `state.mirrorOfRun` is present, the workspace is bound to a trusted run and ALL operations go through the broker operation API (`mesh2threejs-broker`); raw CLI mutations are refused, and policy drift requires an administrative rebase/new run, never `rebind`. Unbound workspaces use the development CLI (`mesh2threejs`).
 
+## Reconstruction work vs pipeline development
+
+RECONSTRUCTION WORK: modify workspace reconstruction artifacts only (candidate modules, declarative repairs, workspace state). You must not modify repository source code, evaluator code, profile contracts, style contracts, schemas to weaken validation, broker/authority implementation, generated trust/integrity metadata by hand, package/runtime code, or gate thresholds/pass logic. You must not change authorship/policy to escape a failing gate. You must not use development-only commands on a managed run. You must not manually fabricate evidence, review approval, replay results, locks, or certification state.
+
+PIPELINE DEVELOPMENT: modify repository/toolchain code. This is a separate task from reconstruction. A reconstruction agent must never silently switch from reconstruction work to pipeline development.
+
+If a gate fails: inspect evidence/workorders, repair candidate geometry, re-derive when appropriate, repair oracle mapping only when evidence proves the mapping is wrong, or otherwise report a blocked/unsupported condition. Never change the judge to make the candidate pass.
+
 The candidate is procedural Three.js authored under the workspace's authorship mode. Runtime invariant: the candidate never loads the source oracle. In derived mode (default for new 3D-oracle workspaces), trusted pipeline tools may derive/simplify prepared-oracle geometry at build time into `model/.generated/` modules bound by `.mesh2threejs/derived/` manifests to the current preparation; in independent mode, source topology may be measured but not reused and everything is authored procedurally. Hand-authored modules never carry dense/opaque topology payloads; only verified generated modules may. Builders cannot alter source/prepared oracles. Visual reviewers consume immutable evidence and cannot edit candidates. Finalizers verify and cannot repair. Geometry repair in trusted derived runs is declarative data only (`model/repairs/<phase>.json` per `schemas/derived-repair.v1.json`, compiled by rerunning derive); executable repair modules are refused.
 
 Preserve source-oracle bytes and preparation lineage. Record self-hashed evidence artifacts before transitions. Accepted phases remain immutable until an explicit reasoned reopen invalidates that phase and every dependant. Oracle changes invalidate all comparison evidence; candidate geometry, material, semantic, or control changes invalidate dependent gates, captures, and visual review.

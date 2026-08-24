@@ -1,8 +1,4 @@
-# Host status
-
-The Codex, Claude Code, and OpenCode adapters are configuration surfaces only. Their manifests do not prove instruction discovery, permissions, resumption, image inspection, or end-to-end behavior.
-
-## Development vs trusted reconstruction
+# Host integration status
 
 This repository ships two runtime classes with different authority:
 
@@ -12,70 +8,76 @@ This repository ships two runtime classes with different authority:
   checks with exit 2. A verdict JSON recorded through `record-review` is
   **automated-visual-diagnostic** data only.
 - **Trusted.** Trusted operations run through the broker tool server (`src/broker/server.ts`)
-  launched from the packaged installation outside builder command control. The broker
-  verifies toolchain bytes at startup, strips unsafe launch configuration, owns the canonical
-  run-authority store outside the workspace, and exposes builder-safe operations only.
-  Human visual approval and trusted finalization require the separate admin token delivered
-  to the launching user's console — never to the builder model.
+  launched from the packaged installation. The broker verifies toolchain bytes at startup,
+  strips unsafe launch configuration, owns the canonical run-authority store, and exposes
+  builder-safe operations. Human visual approval and trusted finalization require the separate
+  admin token delivered to the launching user's console.
 
-A host may advertise `trustedReconstruction: true` only after a trial proves ALL of:
+## What "trusted" means
 
-- trusted broker outside builder write authority;
-- canonical authority storage outside builder write authority;
-- a verified candidate isolation backend (`trusted-isolated`);
-- human approval capability separated from builder tools;
-- toolchain byte verification on startup.
+In this project, `trusted` means:
 
-Until then every adapter declares `trustedReconstruction: false`,
-`builderToolIsolation/toolchainWriteIsolation/humanApprovalSeparation: "unverified"`, and
-`candidateSandboxBackend: "none"` — fail-closed truth per the plan's §26 promotion criteria.
+- pipeline-controlled operation path
+- canonical evaluator/policy
+- verified current artifacts
+- agent instructed not to mutate pipeline authority
+- fresh deterministic replay
+- human final review authority
 
-The durable state exposes the active phase, locks, reopens, attempts, evidence bindings, and visual-review status. Actual host trials are deferred and listed in [DEFERRED-VERIFICATION.md](DEFERRED-VERIFICATION.md).
+It does NOT mean "secure against a malicious local user/process." The broker/store/staging
+separation is ordinary application structure — it ensures authorized bytes are staged outside
+the candidate source tree so workspace mutations during one execution cannot change the bytes
+selected for that execution. It is not an OS-level security boundary.
+
+## Agent authority discipline
+
+The reconstruction agent is controlled through instructions, not OS permissions:
+
+```
+RECONSTRUCTION WORK
+  modify workspace reconstruction artifacts only
+
+PIPELINE DEVELOPMENT
+  modify repository/toolchain code
+```
+
+A reconstruction agent must never silently switch from the first mode to the second.
+
+For any reconstruction run bound to the managed/trusted workflow, the agent contract is:
+
+- You may modify reconstruction workspace candidate/repair data.
+- You must not modify repository source code, evaluator code, profile contracts, style
+  contracts, schemas to weaken validation, broker/authority implementation, generated
+  trust/integrity metadata by hand, package/runtime code, or gate thresholds/pass logic.
+- You must not change authorship/policy to escape a failing gate.
+- You must not use development-only commands on a managed run.
+- You must not manually fabricate evidence, review approval, replay results, locks, or
+  certification state.
+- If a gate fails: inspect evidence/workorders, repair candidate geometry, re-derive when
+  appropriate, repair oracle mapping only when evidence proves the mapping is wrong, or
+  otherwise report a blocked/unsupported condition. Never change the judge to make the
+  candidate pass.
+
+## Host integration checklist
+
+When integrating with a new agent host, verify:
+
+- which host instructions are discovered (AGENTS.md, SKILL.md, skills/)
+- which broker operations are available
+- whether image inspection works for visual review
+- whether state survives sessions (durable state)
+- whether final human review can be performed through the admin channel
+
+These are operational compatibility checks, not security certifications.
 
 ## Installed lifecycle evidence
 
 The `test:installed-lifecycle` validation proves the COMPLETE trusted certification path
 end-to-end from a clean `npm pack` → `npm install <tgz>` → installed broker → trusted
 create-workspace-run → onboard/register/derive/gate/lock → review-ready → human/admin
-approve-review → trusted-finalize → certified. This verifies the BROKER operation chain,
-toolchain byte verification, and certification logic. It does NOT verify host permission
-isolation (builder cannot write toolchain/store/admin) — that requires a real host trial
-with OS-level permission boundaries.
+approve-review → trusted-finalize → certified. This verifies the broker operation chain,
+toolchain byte verification, and certification logic.
 
-## Host trial procedure
-
-Before promoting an adapter from `unverified`, perform the following trial on the actual
-target host and record the results here:
-
-```
-host/version
-OS
-launch procedure
-toolchain install path
-broker store path
-builder permission boundary
-admin capability path
-attack checks
-results
-```
-
-### Builder attack checks
-
-From the actual builder command environment, attempt:
-
-1. Write installed runtime file (e.g. `dist/core/oracle.js`) — expected: refused
-2. Write profile contract (e.g. `profiles/tank/contract.json`) — expected: refused
-3. Write authority record (e.g. store directory) — expected: refused
-4. Write private execution staging root (e.g. storeRoot/runtime/executions/) — expected: refused
-5. Read admin token/channel — expected: unavailable
-
-### Builder positive checks
-
-1. Edit workspace `model/repairs/*.json` — expected: succeeds
-2. Read builder connection descriptor — expected: succeeds
-3. Invoke builder-safe broker operations — expected: succeeds
-
-### Admin separation checks
-
-Builder must NOT possess: `adminToken`, `approve-review`, `approve-viewer-start`,
-`trusted-finalize`. The human/operator channel must be separate.
+The `test:installed-lifecycle:negative` validation proves a real reconstruction failure
+(mislabeled semantic) is correctly rejected — the lifecycle exits non-zero, and the wrapper
+asserts this, exiting 0 for CI.

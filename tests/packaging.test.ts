@@ -26,7 +26,7 @@ describe("host packaging and progressive disclosure", () => {
     expect(codex.status).toContain("unverified");
     expect(codex.capabilities.actualVisualReview).toBe(false);
     expect(claude.status).toContain("not-installed");
-    expect(opencode.status).toContain("not-installed");
+    expect(opencode.status).toContain("configuration");
     expect(claude.capabilities.projectInstructionDiscovery).toBe(false);
   });
 

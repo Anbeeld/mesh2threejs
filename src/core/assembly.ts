@@ -71,6 +71,49 @@ function hasExplicitExclusion(mesh: THREE.Object3D): boolean {
   return false;
 }
 
+/**
+ * Subject-geometry disposition. A central classifier that determines whether a
+ * mesh participates in subject fidelity measurement and derivation, or is excluded from it.
+ *
+ * - `subject`: normal subject geometry, participates in all measurements and derivation.
+ * - `subject-microdetail`: excluded from assembly ownership but RETAINED in fidelity/derivation
+ *   (low-poly reconstruction may omit it, but it must not silently redefine macro geometry).
+ * - `non-subject`: excluded from ALL subject measurements and derivation (display stand, floor,
+ *   pedestal, etc.). Assembly coverage passes, but fidelity/derivation/snapshot must filter it.
+ */
+export type OracleGeometryDisposition = "subject" | "subject-microdetail" | "non-subject";
+
+/**
+ * Returns the disposition of a mesh based on ancestor-chain exclusion markers.
+ * `non-subject` and `presentation-fixture` kinds → `non-subject`.
+ * `microdetail` kind → `subject-microdetail`.
+ * No exclusion marker → `subject`.
+ */
+export function oracleGeometryDisposition(mesh: THREE.Object3D): OracleGeometryDisposition {
+  let current: THREE.Object3D | null = mesh;
+  let disposition: OracleGeometryDisposition = "subject";
+  while (current) {
+    if (current.userData.insignificant === true) {
+      const kind = current.userData.exclusionKind as string | undefined;
+      if (kind === "non-subject" || kind === "presentation-fixture") {
+        disposition = "non-subject";
+      } else if (kind === "microdetail") {
+        if (disposition === "subject") disposition = "subject-microdetail";
+      } else {
+        // insignificant without a known kind — treat as non-subject for safety.
+        if (disposition === "subject") disposition = "non-subject";
+      }
+    }
+    current = current.parent;
+  }
+  return disposition;
+}
+
+/** True if the mesh is non-subject and should be filtered from fidelity/derivation. */
+export function isNonSubject(mesh: THREE.Object3D): boolean {
+  return oracleGeometryDisposition(mesh) === "non-subject";
+}
+
 function triangleArea(ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number): number {
   return Math.hypot(
     (by - ay) * (cz - az) - (bz - az) * (cy - ay),

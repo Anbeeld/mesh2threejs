@@ -201,7 +201,7 @@ describe("durable workflow state", () => {
 
 describe("routing and permissions", () => {
   test.each([
-    ["Reconstruct this T-34 tank", "tank"],
+    ["Reconstruct this Sherman tank", "tank"],
     ["A tracked armored vehicle with turret and gun", "tank"],
     ["Reconstruct this house", "generic"],
     ["Industrial pressure machine with cylindrical barrel", "generic"],

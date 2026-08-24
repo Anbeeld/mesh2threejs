@@ -29,4 +29,4 @@ Run `npm run validate` for types, protected regression coverage, build, and arti
 
 ## Remaining evidence
 
-Large real references, the flagship reconstruction, non-tank agent flow, actual browser/headless WebGL captures, calibrated external visual review, and fresh Codex/Claude Code/OpenCode trials have not been claimed. [DEFERRED-VERIFICATION.md](DEFERRED-VERIFICATION.md) defines the exact campaign and production-claim gate.
+Large real references, the real-reference reconstruction, non-tank agent flow, actual browser/headless WebGL captures, calibrated external visual review, and fresh Codex/Claude Code/OpenCode trials have not been claimed. [DEFERRED-VERIFICATION.md](DEFERRED-VERIFICATION.md) defines the exact campaign and production-claim gate.

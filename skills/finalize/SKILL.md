@@ -5,7 +5,7 @@ description: Fail-closed certification and user handoff. Certification requires 
 
 # Finalize
 
-Certification is a trusted-run operation (fail-closed):
+Certification is a trusted-run operation (fail-closed). Do not self-approve or manufacture review/finalization authority.
 
 - An unbound (development) workspace has no trusted run and refuses certification. Development runs produce reports but never claim certification.
 - A workspace bound to a trusted run (`state.mirrorOfRun`) is finalized by the broker only: the admin channel runs `trusted-finalize`, which freshly replays the whole evaluation through the candidate sandbox, requires the current human approval bound to the exact packet/candidate/oracle/toolchain/replay hashes, and refuses when anything drifted.

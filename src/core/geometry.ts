@@ -1,6 +1,24 @@
 import * as THREE from "three";
 import type { Bounds3, Point3, SceneComponent, SceneSnapshot, SceneTriangle } from "../types.js";
 
+/**
+ * Inline non-subject check. Walks the ancestor chain to determine if a mesh
+ * is marked as non-subject or presentation-fixture. Inlined here to avoid a circular import
+ * with assembly.ts. The canonical classifier is `oracleGeometryDisposition` in assembly.ts;
+ * this mirrors its non-subject detection for the snapshot hot path.
+ */
+function isNonSubjectMesh(mesh: THREE.Object3D): boolean {
+  let current: THREE.Object3D | null = mesh;
+  while (current) {
+    if (current.userData.insignificant === true) {
+      const kind = current.userData.exclusionKind as string | undefined;
+      if (kind === "non-subject" || kind === "presentation-fixture" || kind === undefined) return true;
+    }
+    current = current.parent;
+  }
+  return false;
+}
+
 const emptyBounds = (): Bounds3 => ({
   min: [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY],
   max: [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY],
@@ -144,6 +162,8 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
   root.traverse((object) => {
     const semanticId = typeof object.userData.semanticId === "string" ? object.userData.semanticId : undefined;
     if (!semanticId) return;
+    // Non-subject geometry must not appear as a component stub either.
+    if (isNonSubjectMesh(object)) return;
     const previous = semanticOwners.get(semanticId);
     if (previous && previous !== object) throw new Error(`ambiguous duplicate semantic id: ${semanticId}`);
     semanticOwners.set(semanticId, object);
@@ -155,6 +175,7 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
   root.traverse((object) => {
     const mesh = object as THREE.Mesh;
     if (!mesh.isMesh || !mesh.visible || !mesh.geometry) return;
+    if (isNonSubjectMesh(mesh)) return; // filter non-subject from fidelity snapshot
     const position = mesh.geometry.getAttribute("position");
     if (!position) return;
     const index = mesh.geometry.index;

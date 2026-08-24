@@ -50,6 +50,14 @@ export interface RuntimeProvenance {
   threeVersion: string | null;
   meshoptimizerRoot: string | null;
   meshoptimizerVersion: string | null;
+  /**
+   * Hash over the actual installed production dependency closure (transitive), computed at
+   * broker startup. This is provenance, not publisher admission — it does NOT
+   * need to match the shipped manifest. It records the exact transitive runtime bytes the
+   * trusted process is using, so two installs of the same published package with different
+   * transitive resolutions get different provenance hashes.
+   */
+  installationRuntimeClosureHash: string | null;
 }
 
 export interface VerifiedToolchain {
@@ -149,7 +157,7 @@ const DEPENDENCY_ASSET_PATTERN = /\.(?:js|mjs|cjs|wasm)$/u;
  * a fresh install (e.g. `ajv` -> `fast-uri` resolved to 3.1.5 in source but 3.1.6 in a clean
  * install). Including transitive versions in the shipped manifest would make it
  * non-reproducible across install contexts and break the installed-package verification.
- * Real host write isolation remains the primary security boundary; dependency hashing is
+ * Direct dependency byte hashing is a reasonable tamper-resistance compromise; dependency hashing is
  * defense-in-depth covering the direct dependency closure (which includes all code the
  * trusted runtime actually imports at load time).
  */
@@ -241,9 +249,50 @@ export async function verifyToolchainManifest(manifest: ToolchainManifest, packa
   if (problem) throw new Error(`toolchain verification failed: ${problem}; trusted runs refuse tampered installations`);
 }
 
+/**
+ * Computes the transitive production dependency closure hash.
+ * Recursively visits all production dependencies, deduplicates by resolved package root,
+ * and hashes their runtime files. This is provenance — it does NOT need to match the shipped
+ * manifest (which uses direct-only hashing for reproducibility). It records the exact
+ * transitive runtime bytes the trusted process is using.
+ */
+async function computeInstallationRuntimeClosureHash(packageRoot: string): Promise<string> {
+  const visitedRoots = new Set<string>();
+  const closure: Array<{ name: string; version: string; runtimeFilesHash: string }> = [];
+
+  async function visitPackage(root: string): Promise<void> {
+    const rootKey = resolve(root);
+    if (visitedRoots.has(rootKey)) return;
+    visitedRoots.add(rootKey);
+    const depPkg = JSON.parse(await readFile(join(rootKey, "package.json"), "utf8")) as { name: string; version: string; dependencies?: Record<string, string> };
+    const files = (await listFilesRecursive(rootKey)).filter((file) => DEPENDENCY_ASSET_PATTERN.test(file));
+    const fileHashes: Record<string, string> = {};
+    for (const file of files) fileHashes[relative(rootKey, file).replaceAll("\\", "/")] = sha256(await readFile(file));
+    closure.push({ name: depPkg.name, version: depPkg.version, runtimeFilesHash: sha256(canonicalJson(fileHashes)) });
+    const depNames = Object.keys(depPkg.dependencies ?? {}).sort((a, b) => a.localeCompare(b));
+    for (const depName of depNames) {
+      const resolved = await resolveDependencyRoot(rootKey, depName);
+      if (resolved) await visitPackage(resolved.root);
+    }
+  }
+
+  const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
+  const names = Object.keys(pkg.dependencies ?? {}).sort((a, b) => a.localeCompare(b));
+  for (const name of names) {
+    const resolved = await resolveDependencyRoot(packageRoot, name);
+    if (resolved) await visitPackage(resolved.root);
+  }
+  closure.sort((a, b) => a.name.localeCompare(b.name));
+  return sha256(canonicalJson(closure));
+}
+
 export async function captureRuntimeProvenance(packageRoot: string): Promise<RuntimeProvenance> {
   const three = await resolvePackageRoot("three");
   const meshoptimizer = await resolvePackageRoot("meshoptimizer");
+  let installationRuntimeClosureHash: string | null = null;
+  try {
+    installationRuntimeClosureHash = await computeInstallationRuntimeClosureHash(packageRoot);
+  } catch { /* provenance is best-effort; do not block startup */ }
   return {
     nodeVersion: process.version,
     platform: process.platform,
@@ -251,6 +300,7 @@ export async function captureRuntimeProvenance(packageRoot: string): Promise<Run
     packageRoot,
     ...(three ? { threeRoot: three.root, threeVersion: three.version } : {}),
     ...(meshoptimizer ? { meshoptimizerRoot: meshoptimizer.root, meshoptimizerVersion: meshoptimizer.version } : {}),
+    installationRuntimeClosureHash,
   } as RuntimeProvenance;
 }
 

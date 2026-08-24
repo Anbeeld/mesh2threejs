@@ -28,7 +28,7 @@ Each fixture must record the expected failing gate and earliest route/phase:
 
 Exercise a clean multipart GLB, a fused mesh, transformed hierarchy, normalized/quantized attributes, sparse accessors, supported and unsupported compressed geometry, and a large CAD-like asset. Capture decoder coverage, semantic identity outcomes, lineage, time, peak memory, cache behavior, and actionable onboarding failures.
 
-Use a T-34-85 reconstruction as the flagship dependency flow. Record every workorder and repair group, phase locks/reopens, iterations, metric movement, regressions, deterministic/style/articulation results, visual findings, candidate complexity, reference defects, runtime, memory, and cache hits. Also run a non-tank multipart hard-surface subject to verify that tank laws do not leak into the generic profile.
+Use a multipart tank reconstruction as the real-reference dependency flow. Record every workorder and repair group, phase locks/reopens, iterations, metric movement, regressions, deterministic/style/articulation results, visual findings, candidate complexity, reference defects, runtime, memory, and cache hits. Also run a non-tank multipart hard-surface subject to verify that tank laws do not leak into the generic profile.
 
 ## Rendering and visual review
 
@@ -44,4 +44,4 @@ Run fresh Codex, Claude Code, and OpenCode sessions. Capture skill discovery and
 
 Run `mesh2threejs upstream-drift`, inspect relevant changed files without auto-merging, and update the dated source map only when an adaptation changes. Audit README, root/role skills, profile docs, adapters, package scripts, and handoff language against captured behavior.
 
-Production-readiness claims require every protected fixture, the real-reference corpus, flagship and non-tank flows, actual WebGL evidence, calibrated visual review, all three host trials, upstream review, and the final claim audit to pass with retained hashes.
+Production-readiness claims require every protected fixture, the real-reference corpus, real-reference and non-tank flows, actual WebGL evidence, calibrated visual review, all three host trials, upstream review, and the final claim audit to pass with retained hashes.
