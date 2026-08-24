@@ -4,7 +4,8 @@
   "description": "Reference-3D to simplified/stylized standalone Three.js reconstruction pipeline",
   "type": "module",
   "bin": {
-    "mesh2threejs": "dist/cli.js"
+    "mesh2threejs": "dist/cli.js",
+    "mesh2threejs-broker": "dist/broker/main.js"
   },
   "exports": {
     ".": {
@@ -21,6 +22,7 @@
     "adapters",
     "agents",
     "viewer",
+    "toolchain",
     "docs",
     "examples",
     "fixtures",
@@ -36,6 +38,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "generate:toolchain-manifest": "node dist/toolchain/generate-manifest.js .",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "benchmark": "tsx benchmarks/geometry.bench.ts",
@@ -49,7 +52,7 @@
     "validate:artifacts": "node dist/validation/artifacts.js",
     "test:e2e": "node dist/validation/e2e.js",
     "validate:release": "npm run ci && npm run benchmark:derive && npm run benchmark:heavy",
-    "prepack": "npm run validate:development"
+    "prepack": "npm run validate:development && npm run generate:toolchain-manifest"
   },
   "engines": {
     "node": ">=22"

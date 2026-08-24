@@ -23,4 +23,31 @@ The release-protected adversarial suite lives in five files (plan §22):
 - `tests/semantic-coverage.test.ts` — multipart assembly coverage attacks 43–46.
 
 Development runs can never certify (`finalize` exits 6); only a trusted broker run with a
-fresh passing replay, current human approval, and a trusted-isolated sandbox certifies.
+fresh passing replay, current human approval, and trusted-derived-generated or trusted-host-sandbox execution certifies.
+## Trusted pipeline closure (v1 hardening)
+
+The closure pass (F1–F8) replaced every builder-accessible authority mutation with typed
+trusted operations:
+
+- The broker exposes operation-level routes only (`begin-run`, `derive`, `gate`, `lock`,
+  `review-ready`, ...); generic `runtime-record`/`transition`/`certify` RPC is gone, and the
+  admin token never persists beside builder connection data.
+- `src/trusted/pipeline.ts` executes the real reconstruction workflow inside the trusted
+  boundary; CLI and broker share one evaluator path (`src/operations/workspace-gate.ts`).
+- Trusted derived mode executes zero builder-authored executable files: repairs are
+  declarative JSON specs (`schemas/derived-repair.v1.json`) validated mechanically and
+  compiled into generated modules by derive; any `model/repairs/*.mjs` fails closed.
+- Execution provenance is a runtime fact: `trusted-derived-generated` (no agent code in
+  graph), `trusted-host-sandbox` (verified adapter), or `development-untrusted` (never
+  certifies). A plain Node child process is never called a security sandbox.
+- `review-ready` performs the trusted capture itself and records the FULL review binding
+  (packet, replay, candidate, preparation, evaluation identity, toolchain, scene + capture
+  hashes) canonically; human approval seals from canonical values only; finalize always
+  runs a FRESH global replay before certification.
+- Toolchain identity anchors to the shipped `toolchain/manifest.v1.json` generated at pack
+  time; installed bytes are recomputed at startup and mismatches refuse. Development
+  checkouts carry no shipped manifest and cannot certify.
+
+Regression coverage lives in `tests/trusted-lifecycle.test.ts` (real broker lifecycle),
+`tests/trusted-pipeline.test.ts` (injection/tamper/repair-spec attacks), plus the earlier
+authority/sandbox/lineage/coverage suites.

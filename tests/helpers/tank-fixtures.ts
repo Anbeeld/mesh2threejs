@@ -120,7 +120,9 @@ export function createSlopedTank(options: { wheelSegments?: number; detailMultip
       wheel.rotation.z = Math.PI / 2;
       root.add(wheel);
     }
-    const track = semanticMesh(`track-${side}`, createTrackCourseGeometry(5.6, 1.15, 0.24, 0.32), [side * 1.48, 0.58, 0], "track-course");
+    // Tracks ride fully outboard of the hull AABB (max station half-width 1.55 + clearance)
+    // so neither the source nor the derived course intrudes into the hull envelope.
+    const track = semanticMesh(`track-${side}`, createTrackCourseGeometry(5.6, 1.15, 0.24, 0.32), [side * 1.82, 0.58, 0], "track-course");
     root.add(track);
   }
 

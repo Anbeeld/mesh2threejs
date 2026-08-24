@@ -12,7 +12,14 @@ User-review handoffs (mid-work or final) first refresh the full capture with `me
 (or geometry-passed) and reports `TRUSTED_CERTIFICATION_UNAVAILABLE` if asked to finalize.
 Trusted certification additionally requires: a fresh trusted global replay over the current
 candidate, human approval bound to the exact packet/candidate/oracle/toolchain/replay
-hashes, and a trusted-isolated candidate sandbox. The interactive viewer renders the
+hashes, and trusted execution provenance (trusted-derived-generated or a verified host sandbox). The interactive viewer renders the
 trusted serialized evaluated scene for bound workspaces; candidate JavaScript is never
 served or executed in the browser in that mode, and viewer start always needs explicit user
 approval.
+## Closure-pass handoff behavior
+
+Trusted `review-ready` computes the capture set itself, records the full review binding
+canonically (packet, replay, candidate, preparation, toolchain, scene + capture hashes),
+reports exact paths, and never starts the viewer. Human approval seals from canonical
+hashes; trusted finalize runs a fresh global replay first and demands re-approval whenever
+that replay differs from the approved binding.

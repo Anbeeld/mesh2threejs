@@ -1,10 +1,10 @@
-import type { BuilderAction, RunAuthorityRecord, RuntimeRecord } from "../core/run-authority.js";
-import type { HumanApproval } from "../core/run-authority.js";
-import type { Capability } from "../core/capabilities.js";
+import type { RunAuthorityRecord } from "../core/run-authority.js";
 
 /**
- * Typed client for the trusted reconstruction broker. Adapters and tooling call THIS, never
- * `node dist/cli.js` inside a writable checkout, when they need trusted operations.
+ * Typed client for the trusted reconstruction broker (closure plan §4.A5). Adapters and
+ * tooling call THESE operation-level methods — never generic state/record transitions.
+ * There is deliberately NO client method that submits runtime facts, evidence, isolation
+ * classifications, replay records, packet hashes, or approval payloads.
  */
 export class BrokerClient {
   constructor(private readonly options: { url: string; token: string }) {}
@@ -20,28 +20,74 @@ export class BrokerClient {
     return payload;
   }
 
-  readRun(runId: string): Promise<{ record: RunAuthorityRecord }> {
-    return this.call("read-run", { runId });
+  /** Builder-safe: begins an autonomous safe-default run; the request names a workspace only. */
+  beginRun(workspace: string): Promise<{ runId: string }> {
+    return this.call("begin-run", { payload: { workspace } });
   }
 
   findRuns(): Promise<{ runs: Array<Pick<RunAuthorityRecord, "runId" | "workspaceRoot" | "status">> }> {
     return this.call("find-runs");
   }
 
-  transition(runId: string, payload: BuilderAction): Promise<{ record: RunAuthorityRecord }> {
-    return this.call("transition", { runId, payload });
+  readRun(runId: string): Promise<{ record: RunAuthorityRecord }> {
+    return this.call("read-run", { runId });
   }
 
-  runtimeRecord(runId: string, payload: RuntimeRecord): Promise<{ record: RunAuthorityRecord }> {
-    return this.call("runtime-record", { runId, payload });
+  status(runId: string): Promise<Record<string, unknown>> {
+    return this.call("status", { runId });
   }
 
-  recordHumanApproval(runId: string, approval: Omit<HumanApproval, "approvedAt">, capability: Capability = "human-admin"): Promise<{ record: RunAuthorityRecord }> {
-    void capability;
-    return this.call("record-human-approval", { runId, payload: approval });
+  next(runId: string): Promise<Record<string, unknown>> {
+    return this.call("next", { runId });
   }
 
-  certify(runId: string): Promise<{ record: RunAuthorityRecord }> {
-    return this.call("certify", { runId });
+  onboardOracle(runId: string, config: unknown): Promise<Record<string, unknown>> {
+    return this.call("onboard-oracle", { runId, payload: config });
+  }
+
+  repairOracle(runId: string, config: unknown): Promise<Record<string, unknown>> {
+    return this.call("repair-oracle", { runId, payload: config });
+  }
+
+  register(runId: string, expectation: unknown): Promise<Record<string, unknown>> {
+    return this.call("register", { runId, payload: expectation });
+  }
+
+  oracleSanity(runId: string): Promise<Record<string, unknown>> {
+    return this.call("oracle-sanity", { runId });
+  }
+
+  derive(runId: string, quality?: "aggressive" | "balanced" | "conservative"): Promise<Record<string, unknown>> {
+    return this.call("derive", { runId, ...(quality ? { payload: { quality } } : {}) });
+  }
+
+  gate(runId: string): Promise<Record<string, unknown>> {
+    return this.call("gate", { runId });
+  }
+
+  lock(runId: string, phase?: string): Promise<Record<string, unknown>> {
+    return this.call("lock", { runId, ...(phase ? { payload: { phase } } : {}) });
+  }
+
+  reopen(runId: string, phase: string, reason: string): Promise<Record<string, unknown>> {
+    return this.call("reopen", { runId, payload: { phase, reason } });
+  }
+
+  reviewReady(runId: string): Promise<Record<string, unknown>> {
+    return this.call("review-ready", { runId });
+  }
+
+  // ---- human/admin channel (admin token required; builder tokens are rejected server-side) ----
+
+  approveReview(runId: string): Promise<{ status: string; approvedAt?: string }> {
+    return this.call("approve-review", { runId, payload: {} });
+  }
+
+  approveViewerStart(runId: string): Promise<{ status: string }> {
+    return this.call("approve-viewer-start", { runId });
+  }
+
+  finalize(runId: string): Promise<{ status: string; runId: string }> {
+    return this.call("trusted-finalize", { runId });
   }
 }

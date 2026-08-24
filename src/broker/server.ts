@@ -9,23 +9,22 @@ import {
   TrustedRunAuthority,
   mirroredTaskState,
   stateMirrorFor,
-  type BuilderAction,
   type RunAuthorityRecord,
-  type RuntimeRecord,
   type RunAuthorityStore,
 } from "../core/run-authority.js";
 import { establishToolchain, sanitizeLaunchEnvironment, assertSafeLaunchEnvironment } from "../core/toolchain.js";
-import type { Capability } from "../core/capabilities.js";
+import { assertCapability, classifyOperation, type Capability } from "../core/capabilities.js";
+import { TrustedPipeline } from "../trusted/pipeline.js";
 import type { TaskState } from "../core/state.js";
 
 /**
- * Trusted reconstruction broker (§6.1). Launched OUTSIDE builder command control by the
- * user/host from a packaged installation; owns the canonical run-authority store and
- * exposes builder-safe operations only. Human/admin operations require the separate admin
- * token, delivered to the launching user's console and never to the builder.
- *
- * Launch hygiene: startup rejects unsafe Node configuration and records runtime provenance;
- * toolchain bytes are re-verified from disk against the manifest computed at startup.
+ * Trusted reconstruction broker (closure plan §4/§10.G). Launched OUTSIDE builder command
+ * control by the user/host from a packaged installation; owns the canonical run-authority
+ * store and exposes ONLY operation-level routes backed by the trusted pipeline
+ * (src/trusted/pipeline.ts). There is no generic transition/runtime-record endpoint: no
+ * caller can submit a passing fact, evidence, isolation label, replay record, packet hash,
+ * or certification state. Human/admin operations require the separate admin token,
+ * delivered to the launching user's console and never persisted beside builder data.
  */
 
 export interface BrokerOptions {
@@ -37,6 +36,11 @@ export interface BrokerOptions {
   host?: string;
   /** Test hook: in-memory store instead of directory-backed storage. */
   store?: RunAuthorityStore;
+  /**
+   * Test hook: inject a verified toolchain instead of establishing from disk. Test brokers
+   * may mark it trusted to exercise certification; production launches never pass this.
+   */
+  toolchainOverride?: typeof import("../core/toolchain.js").establishToolchain extends (...args: never[]) => Promise<infer T> ? T : never;
 }
 
 export interface BrokerHandle {
@@ -45,29 +49,54 @@ export interface BrokerHandle {
   builderToken: string;
   adminToken: string;
   toolchainId: string;
+  trustedToolchain: boolean;
   close: () => Promise<void>;
-  /** Test-only injection point for executing pipeline work inside the trusted boundary. */
+  /** Test/diagnostic injection points INSIDE the trusted boundary (never builder RPC). */
   authority: TrustedRunAuthority;
+  pipeline: TrustedPipeline;
 }
 
 interface BrokerRequest {
   operation: string;
   runId?: string;
-  capability?: Capability;
   token?: string;
   payload?: unknown;
 }
 
+/** Builder-safe operations are executed for either capability; admin ops require human-admin. */
+const BUILDER_SAFE_ROUTES = new Set([
+  "begin-run",
+  "status",
+  "next",
+  "find-runs",
+  "read-run",
+  "probe",
+  "onboard-oracle",
+  "repair-oracle",
+  "register",
+  "oracle-sanity",
+  "derive",
+  "gate",
+  "lock",
+  "reopen",
+  "workorders",
+  "render-quick",
+  "review-ready",
+  "viewer-status",
+]);
 
+const ADMIN_ROUTES = new Set(["approve-review", "approve-viewer-start", "trusted-finalize", "viewer-start", "certify", "record-human-approval"]);
 
 export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHandle> {
   assertSafeLaunchEnvironment();
-  const sanitized = sanitizeLaunchEnvironment();
-  void sanitized;
+  void sanitizeLaunchEnvironment();
   const packageRoot = options.packageRoot ? resolve(options.packageRoot) : resolve(import.meta.dirname, "..", "..");
-  const toolchain = await establishToolchain(packageRoot);
+  const toolchain = options.toolchainOverride ?? await establishToolchain(packageRoot);
   const store = options.store ?? (options.storeRoot ? new DirectoryRunAuthorityStore(options.storeRoot) : new InMemoryRunAuthorityStore());
   const authority = new TrustedRunAuthority(store);
+  const pipeline = new TrustedPipeline({ authority, packageRoot, ...(options.toolchainOverride ? { toolchain: options.toolchainOverride } : {}) });
+  // Bind the already-established toolchain so the pipeline verifies the SAME bytes.
+  if (options.toolchainOverride) (pipeline as unknown as { toolchainValue: unknown }).toolchainValue = toolchain;
   const builderToken = randomBytes(24).toString("hex");
   const adminToken = randomBytes(24).toString("hex");
 
@@ -93,49 +122,120 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
         respond(res, 401, { error: "invalid or missing broker token" });
         return;
       }
-      const context = { requestedBy: capability };
-      switch (request.operation) {
-        case "read-run": {
-          if (!request.runId) throw new Error("runId required");
-          respond(res, 200, { record: await authority.readRun(request.runId) });
+      const operation = request.operation ?? "";
+      if (ADMIN_ROUTES.has(operation)) {
+        try {
+          assertCapability(operation, capability);
+        } catch {
+          respond(res, 403, { error: `operation ${operation} requires the human/admin channel; builders cannot invoke it` });
           return;
         }
-        case "find-runs": {
+      } else if (!BUILDER_SAFE_ROUTES.has(operation)) {
+        respond(res, 400, { error: `unknown broker operation: ${operation}` });
+        return;
+      }
+      void classifyOperation;
+      const runId = request.runId;
+      switch (operation) {
+        case "find-runs":
           respond(res, 200, { runs: await store.find() });
           return;
-        }
-        case "transition": {
-          if (!request.runId) throw new Error("runId required");
-          const record = await authority.applyBuilderTransition(request.runId, request.payload as BuilderAction, context);
-          respond(res, 200, { record });
+        case "read-run":
+          requireRun(runId);
+          respond(res, 200, { record: await authority.readRun(runId!) });
+          return;
+        case "begin-run": {
+          const payload = (request.payload ?? {}) as { workspace?: string };
+          if (!payload.workspace) throw new Error("begin-run requires payload.workspace");
+          respond(res, 200, await pipeline.beginRun({ workspaceRoot: payload.workspace }, capability));
           return;
         }
-        case "runtime-record": {
-          if (!request.runId) throw new Error("runId required");
-          const record = await authority.applyRuntimeRecord(request.runId, request.payload as RuntimeRecord);
-          respond(res, 200, { record });
+        case "status":
+          requireRun(runId);
+          respond(res, 200, await pipeline.status(runId!));
           return;
-        }
-        case "record-human-approval": {
-          if (!request.runId) throw new Error("runId required");
-          const approval = request.payload as Parameters<TrustedRunAuthority["recordHumanApproval"]>[1];
-          const record = await authority.recordHumanApproval(request.runId, approval, context);
-          respond(res, 200, { record });
+        case "next":
+          requireRun(runId);
+          respond(res, 200, await pipeline.next(runId!));
           return;
-        }
-        case "certify": {
-          if (!request.runId) throw new Error("runId required");
-          const record = await authority.certify(request.runId, context);
-          respond(res, 200, { record });
+        case "onboard-oracle":
+          requireRun(runId);
+          respond(res, 200, await pipeline.onboardOracle(runId!, (request.payload ?? {}) as never, capability));
           return;
+        case "repair-oracle":
+          requireRun(runId);
+          respond(res, 200, await pipeline.repairOracle(runId!, (request.payload ?? {}) as never));
+          return;
+        case "register":
+          requireRun(runId);
+          respond(res, 200, await pipeline.register(runId!, (request.payload ?? {}) as never));
+          return;
+        case "oracle-sanity":
+          requireRun(runId);
+          respond(res, 200, await pipeline.oracleSanity(runId!));
+          return;
+        case "derive":
+          requireRun(runId);
+          respond(res, 200, await pipeline.derive(runId!, (request.payload ?? {}) as { quality?: "aggressive" | "balanced" | "conservative" }, capability));
+          return;
+        case "gate":
+          requireRun(runId);
+          respond(res, 200, await pipeline.gate(runId!, (request.payload ?? {}) as { global?: boolean }, capability));
+          return;
+        case "lock":
+          requireRun(runId);
+          respond(res, 200, await pipeline.lock(runId!, (request.payload as { phase?: string } | undefined)?.phase, capability));
+          return;
+        case "reopen":
+          requireRun(runId);
+          respond(res, 200, await pipeline.reopen(runId!, (request.payload ?? {}) as { phase: string; reason: string }, capability));
+          return;
+        case "render-quick": {
+          requireRun(runId);
+          throw new Error("render-quick is served by the CLI diagnostic path; trusted runs report captures through review-ready");
         }
+        case "review-ready":
+          requireRun(runId);
+          respond(res, 200, await pipeline.reviewReady(runId!));
+          return;
+        case "viewer-status":
+          requireRun(runId);
+          respond(res, 200, { viewerStartApproved: (await authority.readRun(runId!)).viewerStartApproved });
+          return;
+        case "approve-review":
+          requireRun(runId);
+          respond(res, 200, await pipeline.approveReview(runId!, ((request.payload ?? {}) as { method?: "broker-console" }), capability));
+          return;
+        case "approve-viewer-start":
+          requireRun(runId);
+          respond(res, 200, await pipeline.approveViewerStart(runId!, capability));
+          return;
+        case "viewer-start":
+          requireRun(runId);
+          respond(res, 200, await pipeline.viewerStart(runId!, capability));
+          return;
+        case "trusted-finalize":
+          requireRun(runId);
+          respond(res, 200, await pipeline.finalize(runId!, capability));
+          return;
+        case "certify":
+        case "record-human-approval":
+          // Deliberately unreachable for builders (403 above); admins use the operation-level
+          // routes (approve-review / trusted-finalize) instead of raw authority calls.
+          respond(res, 400, { error: `${operation} is served by its operation-level route` });
+          return;
         default:
-          respond(res, 400, { error: `unknown broker operation: ${String(request.operation)}` });
+          respond(res, 400, { error: `unhandled broker operation: ${operation}` });
       }
     } catch (error) {
-      respond(res, 422, { error: error instanceof Error ? error.message : String(error) });
+      const code = (error as { code?: string }).code;
+      respond(res, 422, { error: error instanceof Error ? error.message : String(error), ...(code ? { code } : {}) });
     }
   });
+
+  const requireRun = (value: string | undefined): void => {
+    if (!value) throw new Error("runId required");
+  };
 
   const port = await new Promise<number>((resolvePort) => {
     server.listen(options.port ?? 0, options.host ?? "127.0.0.1", () => {
@@ -144,22 +244,24 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
     });
   });
 
-  const persistTokens = async (): Promise<void> => {
+  // §10.G3: only a BUILDER connection descriptor is persisted, and it contains no admin
+  // secret. The admin token goes to the operator's console/human channel only.
+  const persistBuilderDescriptor = async (): Promise<void> => {
     if (!options.storeRoot) return;
     await mkdir(options.storeRoot, { recursive: true });
-    await writeFile(join(options.storeRoot, "broker-tokens.json"), `${JSON.stringify({ builderToken, adminToken, url: `http://127.0.0.1:${port}` }, null, 2)}\n`, { flag: "wx" });
+    await writeFile(join(options.storeRoot, "broker-builder-connection.json"), `${JSON.stringify({ builderToken, url: `http://127.0.0.1:${port}` }, null, 2)}\n`, { flag: "wx" });
   };
-  await persistTokens();
+  await persistBuilderDescriptor();
 
   return {
     url: `http://127.0.0.1:${port}`,
     port,
     builderToken,
-    // The ADMIN token is the human channel: it goes to the operator's console only. Hosts
-    // that cannot keep it away from builder tools cannot provide trusted certification.
     adminToken,
     toolchainId: toolchain.toolchainId,
+    trustedToolchain: toolchain.trustedToolchain,
     authority,
+    pipeline,
     close: async () => {
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
     },

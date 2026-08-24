@@ -1,4 +1,5 @@
 ﻿import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import { join } from "node:path";
 import * as THREE from "three";
@@ -16,6 +17,7 @@ import {
   GENERATED_DIRECTORY,
   GENERATED_REGISTRY_PATH,
   REPAIRS_DIRECTORY,
+  assertNoExecutableRepairs,
   derivedDirectory,
   derivationManifestHash,
   discoverRepairs,
@@ -25,15 +27,24 @@ import {
   verifyDerivedLineage,
   type DerivationManifest,
 } from "./derivation.js";
+import { applyRepairSpec, validateRepairSpec, type DerivedRepairSpec } from "./repair-spec.js";
 import { assertAssemblyCoverage } from "./assembly.js";
 import { phaseOwnedSemantics } from "./phase-compose.js";
 import type { GenericSubjectContract } from "../profiles/generic.js";
+import type { TaskState } from "./state.js";
 import type { Bounds3, CandidateRuntime, Point3, ProfileId, SceneSnapshot, Workorder } from "../types.js";
 
 export type DeriveQuality = "aggressive" | "balanced" | "conservative";
 
 export interface DeriveOptions {
   quality?: DeriveQuality;
+  /**
+   * Trusted-run persistence hook: when present, durable derived-binding state mutations are
+   * applied through this callback (which routes them through the canonical run authority)
+   * instead of being written directly to the workspace state file. Receives the freshly
+   * loaded workspace state and returns the next durable state.
+   */
+  persistState?: (state: TaskState) => Promise<TaskState>;
 }
 
 export interface DeriveTierResult {
@@ -322,6 +333,8 @@ export interface SeedNode {
   positions?: Float32Array;
   indices?: Uint32Array;
   role?: string;
+  /** Style-compatible material parameters (declarative repairs only). */
+  material?: { color?: readonly [number, number, number]; roughness?: number; metalness?: number; flatShading?: boolean };
 }
 
 /** Builds the in-memory evaluation graph for one seed tier. */
@@ -347,8 +360,12 @@ export function buildSeedGroup(name: string, nodes: SeedNode[]): THREE.Group {
     geometry.setAttribute("position", new THREE.BufferAttribute(node.positions!, 3));
     geometry.setIndex(new THREE.BufferAttribute(node.indices!, 1));
     geometry.computeVertexNormals();
-    const material = new THREE.MeshStandardMaterial({ color: 0x6b7358, roughness: 0.7 });
-    material.flatShading = true;
+    const material = new THREE.MeshStandardMaterial({
+      color: node.material?.color ? new THREE.Color(...node.material.color) : 0x6b7358,
+      roughness: node.material?.roughness ?? 0.7,
+      ...(node.material?.metalness !== undefined ? { metalness: node.material.metalness } : {}),
+    });
+    material.flatShading = node.material?.flatShading ?? true;
     const object = new THREE.Mesh(geometry, material);
     object.name = node.semanticId;
     object.userData.semanticId = node.semanticId;
@@ -402,8 +419,9 @@ function emitGeneratedModule(name: string, nodes: SeedNode[]): string {
     lines.push(`    geometry.setAttribute("position", new THREE.BufferAttribute(P${index}, 3));`);
     lines.push(`    geometry.setIndex(new THREE.BufferAttribute(I${index}, 1));`);
     lines.push(`    geometry.computeVertexNormals();`);
-    lines.push(`    const material = new THREE.MeshStandardMaterial({ color: 0x6b7358, roughness: 0.7 });`);
-    lines.push(`    material.flatShading = true;`);
+    const materialColor = node.material?.color ? `new THREE.Color(${node.material.color.map((value) => Number(value.toFixed(5))).join(", ")})` : "0x6b7358";
+    lines.push(`    const material = new THREE.MeshStandardMaterial({ color: ${materialColor}, roughness: ${node.material?.roughness ?? 0.7}${node.material?.metalness !== undefined ? `, metalness: ${node.material.metalness}` : ""} });`);
+    lines.push(`    material.flatShading = ${node.material?.flatShading ?? true};`);
     lines.push(`    const mesh = new THREE.Mesh(geometry, material);`);
     lines.push(`    mesh.name = ${JSON.stringify(node.semanticId)};`);
     lines.push(`    mesh.userData.semanticId = ${JSON.stringify(node.semanticId)};`);
@@ -719,7 +737,7 @@ async function simplifyComponentwise(mesh: CleanedMesh, ratio: number | undefine
   return { positions: Float32Array.from(outPositions), indices: Uint32Array.from(outIndices), ...(simplifierError !== undefined ? { error: simplifierError } : {}) };
 }
 
-async function buildMeshSimplifySeed(snapshot: SceneSnapshot, profile: ProfileId, phase: string): Promise<PhaseSeed> {
+async function buildMeshSimplifySeed(snapshot: SceneSnapshot, profile: ProfileId, phase: string, simplifyOverrides: ReadonlyMap<string, { ratio?: number; error?: number }> = new Map()): Promise<PhaseSeed> {
   const route = phaseOperator(profile, phase)!;
   const soups = collectSemantics(snapshot, route.semantics);
   if (!soups.size) throw new Error(`prepared oracle carries no ${route.label} geometry to derive from`);
@@ -752,7 +770,8 @@ async function buildMeshSimplifySeed(snapshot: SceneSnapshot, profile: ProfileId
       if (pivotOrigin) nodes.push({ semanticId: "turret-pivot", kind: "group", position: pivotOrigin });
       for (const id of orderedIds) {
         const cleaned = cleanedPerSemantic.get(id)!;
-        const result = await simplifyComponentwise(cleaned, ratio, error);
+        const override = simplifyOverrides.get(id);
+        const result = await simplifyComponentwise(cleaned, override?.ratio ?? ratio, override?.error ?? error);
         if (result.error !== undefined) simplifierError = Math.max(simplifierError ?? 0, result.error);
         const parentSemanticId = pivotOrigin && id !== "turret-pivot" ? "turret-pivot" : undefined;
         const positions = parentSemanticId ? localPositions(result.positions, pivotOrigin!) : result.positions;
@@ -943,6 +962,8 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   const workspace = await resumeWorkspace(workspaceInput);
   const state = await loadTaskState(workspace.layout.internal.state);
   if (state.authorshipMode !== "derived") throw new Error("derive requires authorshipMode \"derived\"; independent workspaces must not consume source topology");
+  // Trusted derived mode executes NO builder-authored executable code (closure plan §6.C4).
+  await assertNoExecutableRepairs(workspace.root);
   const phase = state.activePhase;
   const route = phaseOperator(workspace.project.profile, phase);
   if (!route) {
@@ -965,6 +986,23 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
       localBindings[repair.path.replaceAll("\\", "/")] = repairBinding(repair, sha256(bytes), preparation.binding.identity);
     } catch { /* missing repair file surfaces through lineage verification */ }
   }
+  // The active phase's declarative repair spec (agent-owned DATA) is validated mechanically
+  // and compiled into generated module bytes by trusted derive (closure plan §6.C1/C3).
+  let phaseRepairSpec: DerivedRepairSpec | undefined;
+  let repairSpecRawHash: string | undefined;
+  try {
+    const specBytes = await readFile(resolve(workspace.root, REPAIRS_DIRECTORY, `${phase}.json`), "utf8");
+    repairSpecRawHash = sha256(Buffer.from(specBytes, "utf8"));
+    phaseRepairSpec = validateRepairSpec(JSON.parse(specBytes), phase);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const simplifyOverrides = new Map<string, { ratio?: number; error?: number }>();
+  if (phaseRepairSpec) {
+    for (const operation of phaseRepairSpec.operations) {
+      if (operation.op === "simplify-override") simplifyOverrides.set(operation.target, { ...(operation.ratio !== undefined ? { ratio: operation.ratio } : {}), ...(operation.error !== undefined ? { error: operation.error } : {}) });
+    }
+  }
   const trialAuditOptions = async (): Promise<{ trustedGeneratedModules: Map<string, unknown> }> => ({
     trustedGeneratedModules: await loadTrustedGeneratedModules({
       directory: derivedDirectory(workspace.layout.internal.root),
@@ -978,7 +1016,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   let seed: PhaseSeed;
   const analytic = route.operator !== "mesh-simplify";
   if (route.operator === "mesh-simplify") {
-    seed = await buildMeshSimplifySeed(snapshot, workspace.project.profile, phase);
+    seed = await buildMeshSimplifySeed(snapshot, workspace.project.profile, phase, simplifyOverrides);
   } else if (route.operator === "radial-fit") {
     const built = buildRadialSeed(snapshot);
     if (!built.nodes.length) throw new Error("prepared oracle carries no running-gear instances to derive from");
@@ -1013,7 +1051,10 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   const tierResults: DeriveTierResult[] = [];
   const evaluatedNodes = new Map<DeriveTierResultTier, SeedNode[]>();
   for (const tier of tiersForQuality(options.quality, analytic)) {
-    const built = await seed.simplify(tier.ratio, tier.error);
+    const simplified = await seed.simplify(tier.ratio, tier.error);
+    // Declarative repairs are compiled in by trusted code BEFORE any evaluation or byte
+    // emission, so repair effects participate in trial gates and module hashes alike.
+    const built = { ...simplified, nodes: phaseRepairSpec ? applyRepairSpec(simplified.nodes, phaseRepairSpec) : simplified.nodes };
     const outputTriangles = built.nodes.reduce((sum, node) => sum + (node.indices?.length ?? 0) / 3, 0);
     if (!outputTriangles) continue;
     // Materialize THIS tier as the pipeline-owned composition (seed module + registry), then
@@ -1043,6 +1084,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
       generatedModuleHash,
       inputTriangles: seed.inputTriangles,
       outputTriangles: Math.round(outputTriangles),
+      ...(repairSpecRawHash !== undefined ? { repairSpecHash: repairSpecRawHash, repairOperations: phaseRepairSpec?.operations.length ?? 0 } : {}),
     };
     const manifestDirectory = derivedDirectory(workspace.layout.internal.root);
     await mkdir(manifestDirectory, { recursive: true });
@@ -1098,6 +1140,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     inputTriangles: seed.inputTriangles,
     outputTriangles: chosen.triangles,
     ...(chosen.simplifierError !== undefined ? { simplifierError: chosen.simplifierError } : {}),
+    ...(repairSpecRawHash !== undefined ? { repairSpecHash: repairSpecRawHash, repairOperations: phaseRepairSpec?.operations.length ?? 0 } : {}),
   };
 
   let workorders: Workorder[] | undefined;
@@ -1125,23 +1168,41 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   const written = await writeDerivedArtifacts(workspace, manifest, moduleSource);
   const wiring = await wireGeneratedComposition(workspace, orderedDerivedPhases(workspace.project.profile, await readAllManifests(workspace)));
 
-  const nextState = await loadTaskState(workspace.layout.internal.state);
-  nextState.derivedBindings[manifest.generatedModulePath] = {
-    manifestHash: derivationManifestHash(manifest),
-    generatedModuleHash: manifest.generatedModuleHash,
-    oraclePreparationIdentity: manifest.oraclePreparationIdentity,
+  /** Applies the derive's durable binding/state mutations to one base TaskState. */
+  const applyDeriveMutations = (base: TaskState): TaskState => {
+    const next = { ...base, derivedBindings: { ...base.derivedBindings } };
+    next.derivedBindings[manifest.generatedModulePath] = {
+      manifestHash: derivationManifestHash(manifest),
+      generatedModuleHash: manifest.generatedModuleHash,
+      oraclePreparationIdentity: manifest.oraclePreparationIdentity,
+    };
+    for (const repair of repairEntries) {
+      next.derivedBindings[repair.key] = {
+        manifestHash: sha256(canonicalJson({ kind: "repair-binding", phase: repair.phase })),
+        generatedModuleHash: repair.specHash,
+        oraclePreparationIdentity: preparation.binding.identity,
+      };
+    }
+    next.systemDecisions.push({
+      id: `derived-seed-${next.systemDecisions.length + 1}`,
+      value: manifest.generatedModulePath,
+      reason: `derive produced a ${chosen.tier} ${route.operator} seed for phase ${phase} (${seed.inputTriangles} -> ${chosen.triangles} triangles, status ${status})`,
+    });
+    return next;
   };
-  for (const repair of await discoverRepairs(workspace.root)) {
-    try {
-      nextState.derivedBindings[repair.path.replaceAll("\\", "/")] = repairBinding(repair, sha256(await readFile(resolve(workspace.root, repair.path))), preparation.binding.identity);
-    } catch { /* missing repair surfaces through lineage verification */ }
-  }
-  nextState.systemDecisions.push({
-    id: `derived-seed-${nextState.systemDecisions.length + 1}`,
-    value: manifest.generatedModulePath,
-    reason: `derive produced a ${chosen.tier} ${route.operator} seed for phase ${phase} (${seed.inputTriangles} -> ${chosen.triangles} triangles, status ${status})`,
-  });
-  await saveTaskState(workspace.layout.internal.state, nextState);
+  const repairEntries = (await discoverRepairs(workspace.root)).map((repair) => ({
+    key: repair.path.replaceAll("\\", "/"),
+    phase: repair.phase,
+    specHash: sha256(readFileSync(resolve(workspace.root, repair.path))),
+  }));
+
+  const nextState = options.persistState
+    ? await options.persistState(applyDeriveMutations(state))
+    : await (async () => {
+        const mutated = applyDeriveMutations(await loadTaskState(workspace.layout.internal.state));
+        await saveTaskState(workspace.layout.internal.state, mutated);
+        return mutated;
+      })();
   // Derived lineage preconditions (§10.6): canonical entry, pipeline registry, five-way
   // generated authority, and repair bindings must all verify BEFORE any fidelity gate runs.
   await verifyDerivedLineage({

@@ -94,3 +94,36 @@ export function validatePolicyCreation(policy: RunPolicy, decisions: PolicyDecis
 }
 
 export const TRUSTED_SANDBOX_UNAVAILABLE = "TRUSTED_CANDIDATE_SANDBOX_UNAVAILABLE" as const;
+
+/**
+ * Computes the safe-default run policy from trusted inputs only (closure plan §4.A3):
+ * the project's goal/reference selection, the trusted router, and the presence of an
+ * oracle. The builder request identifies a workspace; it never carries authorship mode,
+ * thresholds, certification level, or any other policy field. A project manifest that
+ * requests a non-default configuration is NOT silently adopted — beginRun surfaces
+ * POLICY_APPROVAL_REQUIRED instead.
+ */
+export function computeSafeDefaultPolicy(input: {
+  project: ProjectManifest;
+  references: ReferenceIndex;
+  routedProfile: ProfileId;
+  defaultStyle: string;
+  defaultCertification: CertificationLevel;
+}): { policy: RunPolicy; decisions: PolicyDecision[] } | { blocked: "POLICY_APPROVAL_REQUIRED"; conflicts: string[] } {
+  const { project, references, routedProfile } = input;
+  const expectedAuthorship: AuthorshipMode = project.oracle ? "derived" : "independent";
+  const conflicts: string[] = [];
+  if (project.profile !== routedProfile) conflicts.push(`project profile ${project.profile} differs from the trusted router result ${routedProfile}`);
+  if (project.style && project.style !== input.defaultStyle) conflicts.push(`project style ${project.style} is not the package default`);
+  if (project.certification && project.certification !== input.defaultCertification) conflicts.push(`project certification ${project.certification} is not the package default`);
+  if (project.authorshipMode && project.authorshipMode !== expectedAuthorship) conflicts.push(`project authorshipMode ${project.authorshipMode} is not the safe default for this subject`);
+  if (conflicts.length) return { blocked: "POLICY_APPROVAL_REQUIRED", conflicts };
+  const identity = projectPolicyIdentity(project, references);
+  return {
+    policy: identity,
+    decisions: [
+      { field: "authorshipMode", value: expectedAuthorship, source: "safe-default", reason: "derived from oracle presence" },
+      { field: "profile", value: routedProfile, source: "trusted-router", reason: "router classification of the project goal" },
+    ],
+  };
+}

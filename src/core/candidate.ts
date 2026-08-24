@@ -14,8 +14,14 @@ export interface CandidateAudit {
 /** Findings that a verified pipeline-generated module is allowed to carry: density itself is expected tool output. */
 const GENERATED_WAIVABLE_FINDINGS = new Set(["dense-binary-payload", "topology-dump", "opaque-topology-payload"]);
 
-/** Bare specifiers a candidate may import; everything else is refused at audit time. */
-const ALLOWED_BARE_SPECIFIERS = new Set(["three", "mesh2threejs"]);
+/** Bare specifiers a candidate may import; everything else is refused at audit time.
+ *  The pipeline package itself is NOT importable: candidates must never reach pipeline
+ *  state/workspace/CLI/oracle/derive exports (closure plan §7.D2). */
+const ALLOWED_BARE_SPECIFIERS = new Set(["three"]);
+
+/** Direct privileged-global uses flagged as unsupported in restricted candidate modes (§7.D3).
+ *  This list is diagnostics, not proof: trusted safety is structural (no agent-authored code). */
+const PRIVILEGED_GLOBALS = ["process", "fetch", "WebSocket", "eval", "Function", "require", "globalThis", "global", "Bun", "Deno"];
 
 export interface CandidateAuditOptions {
   /**
@@ -156,6 +162,8 @@ export interface ScannedImports {
   static: string[];
   /** Dynamic import() specifiers that are plain string literals. */
   dynamic: string[];
+  /** True when ANY dynamic `import(` call appears, regardless of its argument shape. */
+  hasDynamicImportCall: boolean;
 }
 
 export function scanModuleSpecifiers(source: string): ScannedImports {
@@ -167,11 +175,18 @@ export function scanModuleSpecifiers(source: string): ScannedImports {
   for (const match of code.matchAll(/\bexport\s+(?:[\w$*{}\s,]*?\bfrom\s*)["']([^"'\n]+)["']/gu)) {
     staticSpecifiers.push(match[1]!);
   }
+  // §7.D1: reject ALL dynamic import syntax. The argument shape is irrelevant — literal,
+  // variable, concatenated, or a function call — because any import( is an escape from the
+  // statically audited graph.
   const dynamic: string[] = [];
-  for (const match of code.matchAll(/\bimport\s*\(\s*["']([^"'\n]+)["']\s*\)/gu)) {
-    dynamic.push(match[1]!);
+  let hasDynamicImportCall = false;
+  for (const match of code.matchAll(/(?:^|[^\w$.])import\s*\(/gu)) {
+    hasDynamicImportCall = true;
+    const literal = /\bimport\s*\(\s*["']([^"'\n]+)["']\s*\)/gu.exec(code.slice(match.index));
+    if (literal) dynamic.push(literal[1]!);
+    else dynamic.push("<computed>");
   }
-  return { static: staticSpecifiers, dynamic };
+  return { static: staticSpecifiers, dynamic, hasDynamicImportCall };
 }
 
 async function assertRealpathInside(root: string, target: string, label: string): Promise<void> {
@@ -225,6 +240,14 @@ export async function auditCandidateModule(entryPath: string, options: Candidate
     const scanned = scanModuleSpecifiers(source);
     for (const specifier of scanned.dynamic) {
       findings.push({ code: "dynamic-local-import", message: `${absolute}: dynamic import ${specifier} escapes the staged source graph; use a static import` });
+    }
+    void scanned.hasDynamicImportCall;
+    // §7.D3: flag direct privileged-global use as unsupported in restricted modes.
+    const codeOnly = stripJavascriptComments(source);
+    for (const globalName of PRIVILEGED_GLOBALS) {
+      if (new RegExp(`(?:^|[^\\w$.])${globalName}\\s*(?:\\.|\\(|,|\\)|;|=|\\]|$)`, "u").test(codeOnly)) {
+        findings.push({ code: "privileged-global", message: `${absolute}: direct use of privileged global ${globalName} is unsupported in restricted candidate code` });
+      }
     }
     for (const specifier of scanned.static) {
       const kind = classifySpecifier(specifier);

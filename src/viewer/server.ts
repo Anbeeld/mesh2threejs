@@ -1,4 +1,5 @@
 import { readFile, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { IncomingMessage } from "node:http";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -16,6 +17,8 @@ export interface ViewerServerOptions {
   instanceId: string;
   host?: string;
   startedAt?: number;
+  /** Authority-bound trusted scene binding (closure plan §9.F4). */
+  trustedScene?: { path: string; sha256: string };
 }
 
 export interface ViewerServerHandle {
@@ -28,6 +31,10 @@ export interface ViewerServerHandle {
 
 export const VIEWER_HOST = "127.0.0.1";
 export const VIEWER_DEFAULT_PORT = 5173;
+
+function sha256OfBuffer(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
 
 /** Static browser client shipped with the package (repo-root `viewer/`). */
 export function viewerAssetsDirectory(): string {
@@ -291,10 +298,22 @@ export async function createViewerServer(options: ViewerServerOptions): Promise<
     if (path === "/api/scene") {
       try {
         if (!context) throw new Error("workspace context is unavailable");
+        // §9.F4: a trusted run serves ONLY the authority-bound scene file, re-hashed on
+        // every request. Workspace-tampered bytes yield TRUSTED_VIEWER_ARTIFACT_DRIFT.
+        if (options.trustedScene) {
+          const bytes = await readFile(options.trustedScene.path);
+          const liveSha = sha256OfBuffer(bytes);
+          if (liveSha !== options.trustedScene.sha256) throw new Error("TRUSTED_VIEWER_ARTIFACT_DRIFT: the bound review scene changed after review-ready; rerun review-ready to regenerate captures");
+          const parsed = JSON.parse(bytes.toString("utf8")) as { candidateHash?: string; sceneHash?: string; serialization?: unknown };
+          if (!parsed.serialization || !parsed.sceneHash) throw new Error("bound scene artifact is malformed; rerun review-ready");
+          sendJson(response, 200, { schemaVersion: 1, status: "ok", candidateHash: parsed.candidateHash ?? null, sceneHash: parsed.sceneHash, serialization: parsed.serialization });
+          return;
+        }
         const scene = await loadTrustedSceneArtifact(workspaceRoot, context.state.candidateHash ?? null);
         sendJson(response, 200, { schemaVersion: 1, status: "ok", ...scene });
       } catch (error) {
-        sendJson(response, 200, { schemaVersion: 1, status: "unavailable", error: error instanceof Error ? error.message : String(error) });
+        const message = error instanceof Error ? error.message : String(error);
+        sendJson(response, 200, { schemaVersion: 1, status: "unavailable", ...(message.startsWith("TRUSTED_VIEWER_ARTIFACT_DRIFT") ? { code: "TRUSTED_VIEWER_ARTIFACT_DRIFT" } : {}), error: message });
       }
       return;
     }

@@ -192,28 +192,14 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
     expect(detectWorkspaceStateDrift({ ...mirror, sequence: mirror.sequence + 5 }, record)).toMatch(/sequence is ahead/);
   });
 
-  test("certification demands fresh replay, current approval, isolation; changes kill approvals (attacks 49–51)", async () => {
+  test("certification demands fresh replay, current approval, trusted execution; changes kill approvals (attacks 49–51)", async () => {
     const authority = new TrustedRunAuthority(new InMemoryRunAuthorityStore());
-    await authority.createRun({
-      runId: "run-cert",
-      workspaceRoot: ".",
-      policy: basePolicy(),
-      policyDecisions: [],
-      initialState: completedState(),
-      toolchain,
-      defaults: { hasOracle: true, routedProfile: "tank" },
-      requestedBy: "human-admin",
-    });
-    await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).rejects.toThrow(/trusted-isolated candidate sandbox/);
-
-    await authority.applyRuntimeRecord("run-cert", { kind: "candidate-isolation", isolation: "trusted-isolated" });
-    await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).rejects.toThrow(/final replay/);
-
     const seeded = (): TaskState => completedState({
       oraclePreparation: { identity: "prep-1", sourceHash: "s1", preparedHash: "p1" },
       evaluationIdentityHash: "ei-1",
+      candidateHash: "cand-1",
+      oracleHash: "oracle-1",
     });
-
     await authority.createRun({
       runId: "run-cert",
       workspaceRoot: ".",
@@ -224,41 +210,49 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
       defaults: { hasOracle: true, routedProfile: "tank" },
       requestedBy: "human-admin",
     });
-    await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).rejects.toThrow(/trusted-isolated candidate sandbox/);
-
-    await authority.applyRuntimeRecord("run-cert", { kind: "candidate-isolation", isolation: "trusted-isolated" });
+    // No execution authority recorded yet: certification refuses.
+    await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).rejects.toThrow(/trusted-derived-generated/);
+    // A development/untrusted classification can never certify.
+    await expect(authority.recordExecutionAuthority("run-cert", { authority: "development-untrusted", backendId: "bounded-child-process", backendIdentityHash: "bx" })).resolves.toBeTruthy();
+    await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).rejects.toThrow(/trusted-derived-generated/);
     await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).rejects.toThrow(/final replay/);
 
-    const builderContext = { requestedBy: "builder" as const };
-    // Preparation binding matches the seeded state, so this transition is a no-op keeper.
-    await authority.applyBuilderTransition("run-cert", { kind: "bind-oracle-preparation", binding: { identity: "prep-1", sourceHash: "s1", preparedHash: "p1" }, reason: "onboarded" }, builderContext);
-    await authority.applyBuilderTransition("run-cert", { kind: "set-candidate", candidateHash: "cand-1", phaseGeometryHashes: {} }, builderContext);
-    await authority.applyRuntimeRecord("run-cert", {
-      kind: "final-replay",
-      replay: { replayHash: "replay-1", passed: true, evaluationIdentityHash: "ei-1", candidateHash: "cand-1", oraclePreparationIdentity: "prep-1", evaluatedAt: new Date().toISOString() },
-    });
-    await authority.applyBuilderTransition("run-cert", { kind: "mark-review-ready", packetHash: "packet-1" }, builderContext);
+    // Trusted pipeline records runtime facts internally (never via builder RPC).
+    await authority.recordExecutionAuthority("run-cert", { authority: "trusted-derived-generated", backendId: "bounded-child-process", backendIdentityHash: "bg" });
+    await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).rejects.toThrow(/final replay/);
 
-    const approval = {
-      packetHash: "packet-1",
+    const replayRecord = {
+      replayHash: "replay-1",
+      passed: true,
+      evaluationIdentityHash: "ei-1",
       candidateHash: "cand-1",
       oraclePreparationIdentity: "prep-1",
-      toolchainId: "tc-1",
-      trustedReplayHash: "replay-1",
-      method: "test-capability" as const,
+      evaluatedAt: new Date().toISOString(),
     };
-    // Attack 49: the builder cannot deliver human approval.
-    await expect(authority.recordHumanApproval("run-cert", approval, { requestedBy: "builder" })).rejects.toThrow(/human-admin capability/);
-    // A mismatching approval is refused even from the human channel.
-    await expect(authority.recordHumanApproval("run-cert", { ...approval, candidateHash: "other" }, { requestedBy: "human-admin" })).rejects.toThrow(/does not bind the current candidate/);
+    await authority.recordComputedReplay("run-cert", replayRecord);
+    await authority.recordComputedReviewPacket("run-cert", {
+      packetHash: "packet-1",
+      replayHash: "replay-1",
+      candidateHash: "cand-1",
+      oraclePreparationIdentity: "prep-1",
+      evaluationIdentityHash: "ei-1",
+      toolchainId: toolchain.toolchainId,
+      scene: { path: ".mesh2threejs/captures/render-0001/viewer-scene.json", sha256: "e".repeat(64), sceneHash: "scene-1" },
+      captures: [],
+      humanApproval: null,
+    });
 
-    await authority.recordHumanApproval("run-cert", approval, { requestedBy: "human-admin" });
-    await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).resolves.toMatchObject({ status: "certified" });
+    // Attack 49: the builder cannot deliver human approval (route/capability absent).
+    const adminContext = { requestedBy: "human-admin" as const };
+    await expect(authority.approveReview("run-cert", { method: "test-capability" }, { requestedBy: "builder" })).rejects.toThrow(/human-admin capability/);
+    await authority.approveReview("run-cert", { method: "test-capability" }, adminContext);
+    await expect(authority.certify("run-cert", adminContext)).resolves.toMatchObject({ status: "certified" });
 
-    // Attack 50/51 analogue: a certified run is immutable to further builder transitions.
-    await expect(authority.applyBuilderTransition("run-cert", { kind: "set-candidate", candidateHash: "cand-2", phaseGeometryHashes: {} }, builderContext)).rejects.toThrow(/already certified/);
+    // A certified run is immutable to further transitions or computed records.
+    await expect(authority.applyBuilderTransition("run-cert", { kind: "reopen-phase", phase: "hull", reason: "x" }, { requestedBy: "builder" })).rejects.toThrow(/already certified/);
+    await expect(authority.recordComputedReplay("run-cert", replayRecord)).rejects.toThrow(/certified/);
 
-    // And on an ACTIVE run, editing the candidate invalidates approval + replay before certify.
+    // On an ACTIVE run, editing the candidate invalidates approval + replay before certify.
     await authority.createRun({
       runId: "run-stale",
       workspaceRoot: ".",
@@ -269,21 +263,56 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
       defaults: { hasOracle: true, routedProfile: "tank" },
       requestedBy: "human-admin",
     });
-    await authority.applyRuntimeRecord("run-stale", { kind: "candidate-isolation", isolation: "trusted-isolated" });
-    await authority.applyBuilderTransition("run-stale", { kind: "bind-oracle-preparation", binding: { identity: "prep-1", sourceHash: "s1", preparedHash: "p1" }, reason: "onboarded" }, builderContext);
-    await authority.applyBuilderTransition("run-stale", { kind: "set-candidate", candidateHash: "cand-1", phaseGeometryHashes: {} }, builderContext);
-    await authority.applyRuntimeRecord("run-stale", {
-      kind: "final-replay",
-      replay: { replayHash: "replay-1", passed: true, evaluationIdentityHash: "ei-1", candidateHash: "cand-1", oraclePreparationIdentity: "prep-1", evaluatedAt: new Date().toISOString() },
+    await authority.recordExecutionAuthority("run-stale", { authority: "trusted-derived-generated", backendId: "bounded-child-process", backendIdentityHash: "bg" });
+    await authority.recordComputedCandidate("run-stale", { candidateHash: "cand-1", phaseGeometryHashes: {} });
+    await authority.recordComputedReplay("run-stale", replayRecord);
+    await authority.recordComputedReviewPacket("run-stale", {
+      packetHash: "packet-1",
+      replayHash: "replay-1",
+      candidateHash: "cand-1",
+      oraclePreparationIdentity: "prep-1",
+      evaluationIdentityHash: "ei-1",
+      toolchainId: toolchain.toolchainId,
+      scene: null,
+      captures: [],
+      humanApproval: null,
     });
-    await authority.applyBuilderTransition("run-stale", { kind: "mark-review-ready", packetHash: "packet-1" }, builderContext);
-    await authority.recordHumanApproval("run-stale", approval, { requestedBy: "human-admin" });
+    await authority.approveReview("run-stale", { method: "test-capability" }, adminContext);
     // Candidate edit AFTER approval: approval and replay are invalidated automatically.
-    await authority.applyBuilderTransition("run-stale", { kind: "set-candidate", candidateHash: "cand-2", phaseGeometryHashes: {} }, builderContext);
+    await authority.recordComputedCandidate("run-stale", { candidateHash: "cand-2", phaseGeometryHashes: {} });
     const drifted = await authority.readRun("run-stale");
     expect(drifted.review.humanApproval).toBeNull();
     expect(drifted.finalReplay).toBeNull();
     expect(drifted.status).toBe("active");
-    await expect(authority.certify("run-stale", { requestedBy: "human-admin" })).rejects.toThrow();
+    await expect(authority.certify("run-stale", adminContext)).rejects.toThrow();
+
+    // A changed replay hash invalidates an existing approval too.
+    await authority.createRun({
+      runId: "run-rehash",
+      workspaceRoot: ".",
+      policy: basePolicy(),
+      policyDecisions: [],
+      initialState: seeded(),
+      toolchain,
+      defaults: { hasOracle: true, routedProfile: "tank" },
+      requestedBy: "human-admin",
+    });
+    await authority.recordExecutionAuthority("run-rehash", { authority: "trusted-host-sandbox", backendId: "host-container", backendIdentityHash: "hc" });
+    await authority.recordComputedReplay("run-rehash", { ...replayRecord, replayHash: "replay-A" });
+    await authority.recordComputedReviewPacket("run-rehash", {
+      packetHash: "packet-1",
+      replayHash: "replay-A",
+      candidateHash: "cand-1",
+      oraclePreparationIdentity: "prep-1",
+      evaluationIdentityHash: "ei-1",
+      toolchainId: toolchain.toolchainId,
+      scene: null,
+      captures: [],
+      humanApproval: null,
+    });
+    await authority.approveReview("run-rehash", { method: "test-capability" }, adminContext);
+    await authority.recordComputedReplay("run-rehash", { ...replayRecord, replayHash: "replay-B" });
+    const rehashed = await authority.readRun("run-rehash");
+    expect(rehashed.review.humanApproval).toBeNull();
   });
 });

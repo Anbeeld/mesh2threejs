@@ -18,8 +18,9 @@ function logLine(message: string): void {
 }
 
 async function main(): Promise<void> {
-  const [workspace, portArgument, shutdownToken, instanceId] = process.argv.slice(2);
-  if (!workspace || !portArgument || !shutdownToken || !instanceId) throw new Error("usage: server-main <workspace> <port> <shutdownToken> <instanceId>");
+  const argv = process.argv.slice(2);
+  const [workspace, portArgument, shutdownToken, instanceId] = argv;
+  if (!workspace || !portArgument || !shutdownToken || !instanceId) throw new Error("usage: server-main <workspace> <port> <shutdownToken> <instanceId> [--trusted-scene path --trusted-scene-sha256 hash]");
   const port = Number(portArgument);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`invalid viewer port: ${portArgument}`);
   const workspaceRoot = resolve(workspace);
@@ -27,7 +28,13 @@ async function main(): Promise<void> {
   await mkdir(runtime, { recursive: true });
   logPath = join(runtime, "server.log");
   const recordPath = join(runtime, "server.json");
-  const handle = await createViewerServer({ workspaceRoot, port, shutdownToken, instanceId });
+  let trustedScene: { path: string; sha256: string } | undefined;
+  const sceneFlag = argv.indexOf("--trusted-scene");
+  const sceneHashFlag = argv.indexOf("--trusted-scene-sha256");
+  if (sceneFlag >= 0 && sceneHashFlag >= 0 && argv[sceneFlag + 1] && argv[sceneHashFlag + 1]) {
+    trustedScene = { path: resolve(argv[sceneFlag + 1]!), sha256: argv[sceneHashFlag + 1]! };
+  }
+  const handle = await createViewerServer({ workspaceRoot, port, shutdownToken, instanceId, ...(trustedScene ? { trustedScene } : {}) });
   const record: ViewerRuntimeRecord = {
     schemaVersion: 1,
     pid: process.pid,

@@ -25,7 +25,7 @@ export interface CandidateExecutionSample extends SandboxSample {
 export interface CandidateExecutionResult {
   audit: CandidateModuleAudit;
   sourceHash: string;
-  isolation: string;
+  isolation: import("./candidate-sandbox.js").CandidateIsolation;
   samples: CandidateExecutionSample[];
   /** True when an independent repeated execution produced identical output hashes. */
   deterministic: boolean;

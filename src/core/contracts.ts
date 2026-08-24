@@ -63,6 +63,8 @@ export interface ProfilePhaseContract {
   dependsOn: string[];
   owner: "oracle" | "builder" | "reviewer" | "finalizer";
   requiredGates: string[];
+  /** True when trusted derive generates this phase's geometry from the prepared oracle. */
+  derivable?: boolean;
 }
 
 export interface ProfileGateContract {

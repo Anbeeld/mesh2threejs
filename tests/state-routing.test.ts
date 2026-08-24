@@ -1,4 +1,4 @@
-﻿import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -153,7 +153,7 @@ describe("durable workflow state", () => {
   test("certifies only a complete set bound to the final hashes", async () => {
     let state = bindCandidatePhases(bindOracle(createTaskState({ taskId: "complete", profile: "generic", style: "low-poly-faithful" }), "oracle-final"), "candidate-final", { "primary-mass": "primary-mass", attachments: "attachments", "identity-features": "identity-features", "style-complexity": "style-complexity", "visual-review": "visual-review" });
     state.profileContractHash = profileContractHash(await loadProfileContract("generic"));
-    const identity = createEvaluationIdentity({ evaluatorVersion: "fixture", measurementVersion: "fixture", profile: "generic", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, subjectContractHash: null, certification: "oracle-relative", oraclePreparationHash: "preparation-final", preparedOracleHash: "oracle-final", authoritativeDimensionsHash: null, candidateSourceHash: "source", candidateNeutralHash: "neutral", toolchainId: null, projectPolicyHash: null, candidateIsolation: "development-process" });
+    const identity = createEvaluationIdentity({ evaluatorVersion: "fixture", measurementVersion: "fixture", profile: "generic", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, subjectContractHash: null, certification: "oracle-relative", oraclePreparationHash: "preparation-final", preparedOracleHash: "oracle-final", authoritativeDimensionsHash: null, candidateSourceHash: "source", candidateNeutralHash: "neutral", toolchainId: null, projectPolicyHash: null, candidateIsolation: "development-untrusted" });
     const identityHash = evaluationIdentityHash(identity);
     state.evaluationIdentity = identity;
     state.evaluationIdentityHash = identityHash;
@@ -191,7 +191,7 @@ describe("durable workflow state", () => {
     for (const kind of ["style", "complexity", "articulation", "turntable"] as const) {
       state = recordEvidenceArtifact(state, `${kind}.json`, createEvidenceArtifact({ id: kind, kind, phase: "style-fabrication", oracleHash: "oracle", candidateHash: "candidate", profileContractHash: state.profileContractHash, configHash: "fixture", result: { passed: true, summary: "fixture" } }));
     }
-    const identity = createEvaluationIdentity({ evaluatorVersion: "fixture", measurementVersion: "fixture", profile: "tank", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, subjectContractHash: null, certification: "oracle-relative", oraclePreparationHash: "preparation", preparedOracleHash: "oracle", authoritativeDimensionsHash: null, candidateSourceHash: "source", candidateNeutralHash: "neutral", toolchainId: null, projectPolicyHash: null, candidateIsolation: "development-process" });
+    const identity = createEvaluationIdentity({ evaluatorVersion: "fixture", measurementVersion: "fixture", profile: "tank", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, subjectContractHash: null, certification: "oracle-relative", oraclePreparationHash: "preparation", preparedOracleHash: "oracle", authoritativeDimensionsHash: null, candidateSourceHash: "source", candidateNeutralHash: "neutral", toolchainId: null, projectPolicyHash: null, candidateIsolation: "development-untrusted" });
     state.evaluationIdentity = identity;
     state.evaluationIdentityHash = evaluationIdentityHash(identity);
     state = recordEvidenceArtifact(state, "claimed-final.json", createEvidenceArtifact({ id: "claimed-final", kind: "deterministic-gate", phase: "final", oracleHash: "oracle", candidateHash: "candidate", profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash, configHash: "fixture", gateResults: [{ code: "curves.whole", passed: true, score: 100 }], result: { passed: true, summary: "claimed final pass" } }));

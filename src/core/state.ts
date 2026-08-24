@@ -481,7 +481,10 @@ export function bindEvidenceConfig(state: TaskState, kind: EvidenceRecord["kind"
   const next = clone(state);
   const previous = next.evidenceConfigHashes[kind];
   if (previous && previous !== configHash) {
-    invalidate(next, (evidence) => evidence.kind === kind);
+    // Evidence frozen inside a phase lock stays valid: a lock is only released by an
+    // explicit reopen, never silently by later evaluation-configuration changes.
+    const lockedIds = new Set(Object.values(next.locks).flatMap((lock) => lock.evidence.map((binding) => binding.id)));
+    invalidate(next, (evidence) => evidence.kind === kind && !lockedIds.has(evidence.id));
     next.systemDecisions.push({ id: `config-${kind}-${next.systemDecisions.length + 1}`, value: configHash, reason: reason.trim() });
     if (kind === "visual-review") next.visualReviewStatus = "awaiting";
   }
@@ -597,7 +600,8 @@ export function certifyState(state: TaskState): TaskState {
   if (state.certification === "exact-real" && state.authoritativeDimensions.status !== "admitted") {
     throw new Error("exact-real certification requires admitted authoritative dimensions");
   }
-  const unlocked = contract.phases.map((phase) => phase.id).filter((phase) => phase !== "final" && !state.locks[phase] && state.phaseStatus[phase] !== "skipped");
+  // visual-review is satisfied by canonical human approval, not a builder lock.
+  const unlocked = contract.phases.map((phase) => phase.id).filter((phase) => phase !== "final" && phase !== "visual-review" && !state.locks[phase] && state.phaseStatus[phase] !== "skipped");
   if (unlocked.length) throw new Error(`certification has unlocked phases: ${unlocked.join(", ")}`);
   for (const phase of contract.phases.filter((item) => item.id !== "final")) {
     const lock = state.locks[phase.id];
@@ -745,7 +749,7 @@ export async function loadTaskState(path: string): Promise<TaskState> {
     if (evidence.valid && ((state.oracleHash && evidence.oracleHash !== state.oracleHash) || (staleCandidate && !lockedEvidenceIds.has(evidence.id)))) {
       throw new Error(`task state is contradictory: valid evidence ${evidence.id} is bound to stale hashes`);
     }
-    if (evidence.valid && evidence.verified && evidence.configHash !== state.evidenceConfigHashes[evidence.kind]) throw new Error(`task state is contradictory: valid evidence ${evidence.id} has a stale config hash`);
+    if (evidence.valid && evidence.verified && !lockedEvidenceIds.has(evidence.id) && evidence.configHash !== state.evidenceConfigHashes[evidence.kind]) throw new Error(`task state is contradictory: valid evidence ${evidence.id} has a stale config hash`);
   }
   if (state.status === "certified") certifyState(state);
   return state;

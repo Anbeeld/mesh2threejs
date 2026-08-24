@@ -5,7 +5,7 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, test, afterAll } from "vitest";
 import { auditCandidateModule } from "../src/core/candidate.js";
 import { executeCandidate } from "../src/core/candidate-executor.js";
-import { SandboxViolationError, createTrustedChildProcessBackend } from "../src/core/candidate-sandbox.js";
+import { SandboxViolationError, createBoundedChildProcessBackend } from "../src/core/candidate-sandbox.js";
 import { developmentInProcessBackend } from "../src/core/dev-sandbox.js";
 
 /**
@@ -49,8 +49,8 @@ await writeFile(outputPath, JSON.stringify({ samples }));
   return pathToFileURL(runnerPath).href;
 }
 
-function trustedBackend(runnerUrl: string) {
-  return createTrustedChildProcessBackend({ runnerModuleUrl: runnerUrl });
+function boundedBackend(runnerUrl: string) {
+  return createBoundedChildProcessBackend({ runnerModuleUrl: runnerUrl });
 }
 
 describe("candidate source-graph boundary (§7)", () => {
@@ -148,10 +148,10 @@ describe("sandbox execution boundary (§8)", () => {
     const entry = join(modelDir, "model.mjs");
     await writeFile(entry, `import * as THREE from "three";\nexport function createCandidate(){ const g = new THREE.Group(); g.name = "ok"; return g; }`);
     const backendRoot = await scratch();
-    const backend = trustedBackend(await writeRunner(backendRoot));
+    const backend = boundedBackend(await writeRunner(backendRoot));
     const result = await executeCandidate({ entryPath: entry, poses: [{}] }, { backend });
     expect(result.deterministic).toBe(true);
-    expect(result.isolation).toBe("trusted-isolated");
+    expect(result.isolation).toBe("development-untrusted");
   }, 30_000);
 
   test("an infinite loop dies as a bounded SANDBOX_TIMEOUT (§8.5)", async () => {
@@ -161,7 +161,7 @@ describe("sandbox execution boundary (§8)", () => {
     const entry = join(modelDir, "model.mjs");
     await writeFile(entry, `export function createCandidate(){ for(;;){} }`);
     const backendRoot = await scratch();
-    const backend = trustedBackend(await writeRunner(backendRoot));
+    const backend = boundedBackend(await writeRunner(backendRoot));
     await expect(executeCandidate({ entryPath: entry, poses: [{}] }, {
       backend,
       limits: { cpuTimeoutMs: 1500 },
@@ -175,26 +175,57 @@ describe("sandbox execution boundary (§8)", () => {
     const entry = join(modelDir, "model.mjs");
     await writeFile(entry, `export function createCandidate(){ const bomb = []; for(;;) bomb.push(new Array(1e6).fill(1.1)); return bomb; }`);
     const backendRoot = await scratch();
-    const backend = trustedBackend(await writeRunner(backendRoot));
+    const backend = boundedBackend(await writeRunner(backendRoot));
     await expect(executeCandidate({ entryPath: entry, poses: [{}] }, {
       backend,
       limits: { maxOldSpaceMb: 64, cpuTimeoutMs: 20_000 },
     })).rejects.toBeInstanceOf(SandboxViolationError);
   }, 60_000);
 
-  test("network attempts inside the sandbox fail without escaping bounds", async () => {
+  test("network-capable candidate code is flagged privileged-global and the backend is NOT trusted isolation (§7.D3/D4)", async () => {
     const root = await scratch();
     const modelDir = join(root, "model");
     await mkdir(modelDir, { recursive: true });
     const entry = join(modelDir, "model.mjs");
-    await writeFile(entry, `import * as THREE from "three";\nexport async function createCandidate(){ try { const r = await fetch("http://127.0.0.1:9/nope"); void r; } catch { /* expected: nothing listens */ } return new THREE.Group(); }`);
+    await writeFile(entry, `import * as THREE from "three";\nexport function createCandidate(){ return new THREE.Group(); }`);
+    // The bounded child process is a RESOURCE boundary only; it must never be labeled
+    // trusted isolation. Network denial cannot be proven from it — that proof belongs to
+    // a real verified host sandbox adapter.
     const backendRoot = await scratch();
-    const backend = trustedBackend(await writeRunner(backendRoot));
-    const result = await executeCandidate({ entryPath: entry, poses: [{}] }, { backend, limits: { cpuTimeoutMs: 15_000 } });
-    expect(result.samples[0]?.serialization.root.type).toBeDefined();
+    const backend = boundedBackend(await writeRunner(backendRoot));
+    expect(backend.isolation).toBe("development-untrusted");
+    const result = await executeCandidate({ entryPath: entry, poses: [{}] }, { backend });
+    expect(result.isolation).toBe("development-untrusted");
+    // A fetch-using candidate is rejected at audit time as privileged-global diagnostics.
+    const entry2 = join(modelDir, "network.mjs");
+    await writeFile(entry2, `export function createCandidate(){ return fetch("http://127.0.0.1:9/nope").catch(() => null); }`);
+    const audit = await auditCandidateModule(entry2);
+    expect(audit.passed).toBe(false);
+    expect(audit.findings.map((finding) => finding.code)).toContain("privileged-global");
   }, 40_000);
 
+  test("computed dynamic import syntax is rejected regardless of argument shape (§7.D1)", async () => {
+    const root = await scratch();
+    const modelDir = join(root, "model");
+    await mkdir(modelDir, { recursive: true });
+    const shapes = [
+      `import(variable)`,
+      `import("node:" + "fs")`,
+      `import(getPath())`,
+    ].map((expression, index) => [
+      `const variable = ${JSON.stringify(`./x${index}.mjs`)};`,
+      `function getPath(){ return ${JSON.stringify(`./y${index}.mjs`)}; }`,
+      `export function createCandidate(){ ${expression}; return null; }`,
+    ].join("\n"));
+    for (const [index, source] of shapes.entries()) {
+      const entry = join(modelDir, `dyn${index}.mjs`);
+      await writeFile(entry, source);
+      const audit = await auditCandidateModule(entry);
+      expect(audit.findings.some((finding) => finding.code === "dynamic-local-import")).toBe(true);
+    }
+  });
+
   test("the development backend never claims trusted isolation", () => {
-    expect(developmentInProcessBackend().isolation).toBe("development-process");
+    expect(developmentInProcessBackend().isolation).toBe("development-untrusted");
   });
 });

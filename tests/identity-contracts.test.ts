@@ -1,4 +1,4 @@
-﻿import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as THREE from "three";
@@ -153,7 +153,7 @@ describe("canonical candidate and evaluation identity", () => {
       candidateNeutralHash: "neutral-a",
       toolchainId: null,
       projectPolicyHash: null,
-      candidateIsolation: "development-process",
+      candidateIsolation: "development-untrusted",
     });
     const changes = [
       { evaluatorVersion: "5" },

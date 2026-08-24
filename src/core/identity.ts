@@ -4,7 +4,13 @@ import { canonicalJson, sha256 } from "./hashing.js";
 export const EVALUATOR_VERSION = "8";
 export const MEASUREMENT_VERSION = "4";
 
-export type CandidateIsolationIdentity = "development-process" | "trusted-isolated" | "unconfigured";
+/**
+ * Execution provenance of the sandbox that evaluated the candidate (closure plan §6.C5):
+ * `trusted-derived-generated` means every executed module was pipeline-generated
+ * (no builder-authored executable code crossed the boundary); `trusted-host-sandbox`
+ * requires an actually verified host isolation backend; everything else is untrusted.
+ */
+export type CandidateIsolationIdentity = "trusted-derived-generated" | "trusted-host-sandbox" | "development-untrusted";
 
 export interface EvaluationIdentity {
   schemaVersion: 2;
@@ -40,9 +46,10 @@ export function evaluationIdentityHash(identity: EvaluationIdentity): string {
   return sha256(canonicalJson(identity));
 }
 
-/** True when the identity was produced under a trusted-isolated execution and trusted toolchain. */
+/** True when the identity was produced under a trusted execution authority and trusted toolchain. */
 export function isTrustedEvaluationIdentity(identity: EvaluationIdentity): boolean {
-  return identity.toolchainId !== null && identity.candidateIsolation === "trusted-isolated";
+  return identity.toolchainId !== null
+    && (identity.candidateIsolation === "trusted-derived-generated" || identity.candidateIsolation === "trusted-host-sandbox");
 }
 
 export function optionalContractHash(value: unknown): string | null {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { auditCandidateModule } from "./core/candidate.js";
@@ -28,7 +28,10 @@ import { assertAssemblyCoverage, evaluateAssemblyCoverage } from "./core/assembl
 import { serializeScene, serializedSceneHash } from "./core/scene-serialization.js";
 import type { SandboxBackend } from "./core/candidate-sandbox.js";
 import { developmentInProcessBackend } from "./core/dev-sandbox.js";
+import { inspectWorkspaceCandidateViaExecutor, assertPhaseSemanticScope, workspaceGateOutcome, computeWorkspaceGate, applyGateEvidence } from "./operations/workspace-gate.js";
 import type { TaskState } from "./core/state.js";
+
+export { assertPhaseSemanticScope, workspaceGateOutcome };
 
 interface CliIo {
   stdout: (value: string) => void;
@@ -79,10 +82,6 @@ function json(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
-export function workspaceGateOutcome(evaluation: Pick<PosedEvaluationBundle, "passed" | "phaseGates">, activePhase: string): { activePhase: string; activePhasePassed: boolean; globalPassed: boolean } {
-  return { activePhase, activePhasePassed: evaluation.phaseGates[activePhase]?.passed ?? false, globalPassed: evaluation.passed };
-}
-
 function workspacePath(path: string, root?: string): string {
   return root && !isAbsolute(path) ? createWorkspaceResolver(root).resolveProjectPath(path) : resolve(path);
 }
@@ -90,24 +89,6 @@ function workspacePath(path: string, root?: string): string {
 function storedArtifactPath(path: string, root?: string): string {
   if (!root) return path;
   try { return createWorkspaceResolver(root).toProjectPath(path); } catch { return resolve(path); }
-}
-
-/**
- * Cumulative active-phase semantic scope from the single authoritative ownership model:
- * a phase may carry its own semantics plus everything prerequisite phases legitimately
- * contributed. Future-phase geometry (a box turret parked in a hull-phase candidate) is
- * refused with a phase-scope error before any gate runs, so placeholders cannot survive
- * merely by being ignored by active gates.
- */
-export function assertPhaseSemanticScope(profile: ProfileId, activePhase: string | undefined, root: import("three").Object3D): void {
-  if (!activePhase) return;
-  const allows = phaseSemanticScope(profile, activePhase);
-  if (!allows) return; // profile without an ownership model imposes no mechanical restriction.
-  const snapshot = snapshotScene(root);
-  const violations = Object.entries(snapshot.components)
-    .filter(([id, component]) => !allows(id, component.role))
-    .map(([id]) => id);
-  if (violations.length) throw new Error(`phase-scope violation: active phase ${activePhase} does not permit future-phase semantics ${violations.join(", ")}; remove the placeholder or advance to that phase first`);
 }
 
 /**
@@ -138,58 +119,6 @@ async function optionalWorkspace(input: string): Promise<Awaited<ReturnType<type
 /** In-process sandbox used by DEVELOPMENT runs only; it can never certify. */
 export function developmentSandboxBackend(): SandboxBackend {
   return developmentInProcessBackend();
-}
-
-interface WorkspaceExecutionInspection {
-  candidateHash: string;
-  sourceHash: string;
-  neutralSceneHash: string;
-  candidateFiles: Array<{ path: string; sha256: string }>;
-  neutralRoot: import("three").Object3D;
-  posedRoots: Array<{ pose: Record<string, number>; root: import("three").Object3D }>;
-  serialization: ReturnType<typeof serializeScene>;
-  sceneHash: string;
-  isolation: string;
-  deterministic: boolean;
-}
-
-/**
- * The one authoritative workspace-candidate inspection path: audit -> sandbox execution ->
- * trusted reconstruction. No live untrusted runtime object is produced.
- */
-async function inspectWorkspaceCandidateViaExecutor(input: {
-  workspaceRoot?: string;
-  modelEntryPath: string;
-  boundaryRoot?: string;
-  poses: Array<Record<string, number>>;
-  auditOptions?: Parameters<typeof auditCandidateModule>[1];
-  backend?: SandboxBackend;
-}): Promise<WorkspaceExecutionInspection> {
-  const { executeWorkspaceModel, deserializeExecutionSamples } = await import("./core/composition-exec.js");
-  const { composeCandidateHash } = await import("./core/candidate.js");
-  const result = await executeWorkspaceModel({
-    ...(input.workspaceRoot !== undefined ? { workspaceRoot: input.workspaceRoot } : {}),
-    modelEntryPath: input.modelEntryPath,
-    boundaryRoot: input.boundaryRoot ?? dirname(input.modelEntryPath),
-    poses: input.poses,
-    auditOptions: input.auditOptions,
-    backend: input.backend ?? developmentSandboxBackend(),
-  });
-  const samples = deserializeExecutionSamples(result);
-  const neutralSerialization = result.samples[0]!.serialization;
-  const neutralSceneHash = fingerprintScene(samples.neutralRoot);
-  return {
-    candidateHash: composeCandidateHash(neutralSceneHash, result.sourceHash),
-    sourceHash: result.sourceHash,
-    neutralSceneHash,
-    candidateFiles: result.audit.candidateFiles.map((file) => ({ ...file })),
-    neutralRoot: samples.neutralRoot,
-    posedRoots: samples.posedRoots,
-    serialization: neutralSerialization,
-    sceneHash: serializedSceneHash(neutralSerialization),
-    isolation: result.isolation,
-    deterministic: result.deterministic,
-  };
 }
 
 /** Refuses builder mutations against a workspace bound to a trusted run. */
@@ -734,147 +663,44 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
         if (workspace) assertDevelopmentWorkspace(workspace);
-        let manifest: OracleManifest;
-        let preparationIdentity: string;
         if (workspace) {
-          const preparation = await verifyWorkspaceOraclePreparation(workspace);
-          manifest = preparation.manifest;
-          preparationIdentity = preparation.binding.identity;
-        } else {
-          manifest = JSON.parse(await readFile(resolve(required(parsed.options, "oracle")), "utf8")) as OracleManifest;
-          if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
-          preparationIdentity = oraclePreparationIdentity(manifest);
-        }
-        const profile = (workspace?.project.profile ?? required(parsed.options, "profile")) as ProfileId;
-        if (profile !== "tank" && profile !== "generic") throw new Error("--profile must be tank or generic");
-        const subjectContractPath = workspace?.resolved.subjectContract ?? (parsed.options["subject-contract"] ? resolve(parsed.options["subject-contract"]) : undefined);
-        const subjectContract = subjectContractPath ? JSON.parse(await readFile(subjectContractPath, "utf8")) as GenericSubjectContract : undefined;
-        const candidatePath = workspace?.resolved.model ?? resolve(required(parsed.options, "candidate"));
-        const isGlobal = parsed.flags.has("global");
-        const activePhase = workspace?.state.activePhase;
-        const profileContract = getProfileContract(profile);
-        // Phase isolation at identity time: a partial candidate without physical controls is
-        // inspected without applying articulation controls unless this gate actually evaluates
-        // the phase that owns them.
-        const needsArticulation = !activePhase || isGlobal || profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === activePhase);
-        const candidateAuditOptions = workspace ? await trustedGeneratedAuditOptions(workspace, preparationIdentity) : undefined;
-        // One trusted execution path: audit -> sandbox -> serialized scene samples.
-        const poses = needsArticulation ? requiredPosesForProfile(profile, subjectContract) : [neutralPoseForProfile(profile, subjectContract)];
-        const execution = await inspectWorkspaceCandidateViaExecutor({
-          ...(workspace ? { workspaceRoot: workspace.root, boundaryRoot: resolve(workspace.root, "model") } : {}),
-          modelEntryPath: candidatePath,
-          poses,
-          auditOptions: { ...candidateAuditOptions },
-        });
-        if (workspace && !isGlobal) assertPhaseSemanticScope(profile, activePhase, execution.neutralRoot);
-        const candidateIdentity = {
-          candidateHash: execution.candidateHash,
-          sourceHash: execution.sourceHash,
-          neutralSceneHash: execution.neutralSceneHash,
-          candidateFiles: execution.candidateFiles,
-        };
-        const candidateFiles = candidateIdentity.candidateFiles;
-        const certification = workspace?.state.certification ?? (manifest.authoritativeDimensions ? "exact-real" : "oracle-relative");
-        const selectedStyle = workspace ? { contract: workspace.styleContract, hash: workspace.styleContractHash } : await loadStyleContract(parsed.options.style ?? "low-poly-faithful");
-        const evaluationIdentity = createEvaluationIdentity({
-          evaluatorVersion: EVALUATOR_VERSION,
-          measurementVersion: MEASUREMENT_VERSION,
-          profile,
-          profileContractHash: workspace?.state.profileContractHash ?? profileContractHash(getProfileContract(profile)),
-          styleContractHash: selectedStyle.hash,
-          subjectContractHash: optionalContractHash(subjectContract),
-          certification,
-          oraclePreparationHash: preparationIdentity,
-          preparedOracleHash: manifest.preparedHash,
-          authoritativeDimensionsHash: optionalContractHash(manifest.authoritativeDimensions),
-          candidateSourceHash: candidateIdentity.sourceHash,
-          candidateNeutralHash: candidateIdentity.neutralSceneHash,
-          toolchainId: null,
-          projectPolicyHash: null,
-          candidateIsolation: execution.isolation === "trusted-isolated" ? "trusted-isolated" : "development-process",
-        });
-        const currentEvaluationHash = evaluationIdentityHash(evaluationIdentity);
-        const cachePath = workspace && isGlobal ? join(workspace.layout.internal.reports, "gate-cache.json") : undefined;
-        let evaluation: PosedEvaluationBundle | undefined;
-        if (cachePath) {
-          try {
-            const cached = JSON.parse(await readFile(cachePath, "utf8")) as { identity?: unknown; evaluation?: PosedEvaluationBundle };
-            const cachedWithFiles = cached as { identity?: unknown; candidateFiles?: unknown; evaluation?: PosedEvaluationBundle };
-            if (canonicalJson(cachedWithFiles.identity) === canonicalJson(evaluationIdentity) && canonicalJson(cachedWithFiles.candidateFiles) === canonicalJson(candidateFiles)) evaluation = cachedWithFiles.evaluation;
-          } catch { /* cache miss or incomplete cache */ }
-        }
-        if (!evaluation) {
-          const oracle = await loadPreparedOracle(manifest, workspace?.root);
-          const { evaluateCandidateFromSamples } = await import("./core/orchestration.js");
-          evaluation = await evaluateCandidateFromSamples({
-            oracle,
-            candidateSamples: [
-              { pose: poses[0]!, root: execution.neutralRoot },
-              ...execution.posedRoots.map((sample) => ({ pose: sample.pose, root: sample.root })),
-            ],
-            profile,
-            candidateNeutralHash: candidateIdentity.neutralSceneHash,
-            candidateSourceHash: candidateIdentity.sourceHash,
-            style: selectedStyle.contract,
-            certification,
-            ...(subjectContract ? { subjectContract } : {}),
-            ...(manifest.authoritativeDimensions ? { authoritativeDimensions: manifest.authoritativeDimensions } : {}),
-            // Normal workspace gates execute ONLY the active phase and its already-locked
-            // prerequisites; --global remains the explicit whole-object evaluation.
-            ...(workspace && !isGlobal && activePhase ? { phase: activePhase } : {}),
-          });
+          // Workspace mode shares the ONE operation implementation with the trusted pipeline
+          // (closure plan §5.B1): compute -> persist evidence files -> mutate state.
+          const isGlobal = parsed.flags.has("global");
+          const gateRun = await createRunDirectory(workspace.layout.internal.evidence, "gate");
+          const computation = await computeWorkspaceGate(workspace, { isGlobal, toolchainId: null, projectPolicyHash: null, artifactRunId: gateRun.id });
+          const evaluation = computation.evaluation;
+          const currentEvaluationHash = computation.evaluationIdentityHash;
+          const reportPath = join(workspace.layout.internal.reports, `${gateRun.id}.json`);
+          await mkdir(dirname(reportPath), { recursive: true });
+          await writeFile(reportPath, `${json(evaluation)}\n`, { flag: "wx" });
+          const cachePath = isGlobal ? join(workspace.layout.internal.reports, "gate-cache.json") : undefined;
           if (cachePath) {
+            // Identity-keyed whole-object gate cache: identical candidate bytes + identity reuse
+            // the cached evaluation; any drift recomputes from scratch.
+            try { await rm(cachePath); } catch { /* first write */ }
             const temporary = `${cachePath}.${process.pid}.tmp`;
-            await writeFile(temporary, `${json({ identity: evaluationIdentity, candidateFiles, evaluation })}\n`, { flag: "wx" });
+            await writeFile(temporary, `${json({ identity: computation.evaluationIdentity, candidateFiles: computation.execution.candidateFiles, evaluation })}\n`, { flag: "wx" });
             await rename(temporary, cachePath);
           }
-        }
-        const rendered = `${json(evaluation)}\n`;
-        const workspaceGateRun = workspace ? await createRunDirectory(workspace.layout.internal.evidence, "gate") : undefined;
-        const reportPath = workspaceGateRun ? join(workspace!.layout.internal.reports, `${workspaceGateRun.id}.json`) : (parsed.options.out ? resolve(parsed.options.out) : undefined);
-        if (reportPath) { await mkdir(dirname(reportPath), { recursive: true }); await writeFile(reportPath, rendered, { flag: "wx" }); }
-        const stateOption = workspace?.layout.internal.state ?? parsed.options.state;
-        const artifactOption = workspace?.layout.internal.evidence ?? parsed.options["artifact-dir"];
-        let postGateState: TaskState | undefined;
-        if (stateOption || artifactOption) {
-          if (!stateOption || !artifactOption) throw new Error("gate state recording requires both --state and --artifact-dir");
-          const statePath = resolve(stateOption);
-          let state = await loadTaskState(statePath);
-          state = bindOracle(state, evaluation.oracleHash);
-          state = bindCandidatePhases(state, evaluation.candidateHash, evaluation.phaseGeometryHashes, evaluationIdentity);
-          const parentDirectory = resolve(artifactOption);
-          const run = workspaceGateRun ?? await createRunDirectory(parentDirectory, "gate");
-          const directory = run.path;
-          const configHash = currentEvaluationHash;
-          const recordsStyle = !activePhase || isGlobal || activePhase === (profile === "tank" ? "style-fabrication" : "style-complexity");
-          for (const kind of ["deterministic-gate", ...(recordsStyle ? ["style", "complexity"] as const : []), ...(evaluation.articulation.rows.length ? ["articulation" as const] : [])] as const) state = bindEvidenceConfig(state, kind, configHash, "canonical evaluation identity changed");
-          // Only phase-relevant new evidence is recorded; locked prerequisite evidence is reused.
-          const complexityRows = evaluation.style.rows.filter((row) => row.code.startsWith("style.complexity"));
-          const complexityReport = { profile, passed: complexityRows.every((row) => row.passed), score: complexityRows.length ? Math.min(...complexityRows.map((row) => row.score)) : 0, rows: complexityRows, workorders: evaluation.style.workorders.filter((item) => item.errorKind.startsWith("style.complexity")) };
-          const artifacts = [
-            ...Object.entries(evaluation.phaseGates).map(([phase, report]) => createRuntimeGateEvidenceArtifact({ id: `${run.id}-${phase}`, phase, oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report })),
-            ...(recordsStyle ? [
-              createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-style`, kind: "style", phase: profile === "tank" ? "style-fabrication" : "style-complexity", oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report: evaluation.style }),
-              createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-complexity`, kind: "complexity", phase: profile === "tank" ? "style-fabrication" : "style-complexity", oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report: complexityReport }),
-            ] : []),
-            ...(evaluation.articulation.rows.length ? [createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-articulation`, kind: "articulation", phase: evaluation.articulation.rows[0]!.phase ?? (profile === "tank" ? "fittings-articulation" : "attachments"), oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash, report: evaluation.articulation })] : []),
-          ];
-          for (const artifact of artifacts) {
-            const artifactPath = join(directory, `${artifact.id}.json`);
+          const written: Array<{ path: string; artifact: EvidenceArtifact }> = [];
+          for (const { artifact } of computation.artifacts) {
+            const artifactPath = join(gateRun.path, `${artifact.id}.json`);
             await writeFile(artifactPath, `${json(artifact)}\n`, { flag: "wx" });
-            state = recordEvidenceArtifact(state, storedArtifactPath(artifactPath, workspace?.root), artifact);
+            written.push({ path: artifactPath, artifact });
           }
-          await saveTaskState(statePath, state);
-          postGateState = state;
-        }
-        if (workspace) {
+          let state = applyGateEvidence(await loadTaskState(workspace.layout.internal.state), computation, (s, artifact) => {
+            const entry = written.find((item) => item.artifact.id === artifact.id)!;
+            return recordEvidenceArtifact(s, storedArtifactPath(entry.path, workspace.root), artifact);
+          }, computation.evaluationIdentity);
+          await saveTaskState(resolve(workspace.layout.internal.state), state);
           const outcome = workspaceGateOutcome(evaluation, workspace.state.activePhase);
           // A failed active-phase gate is automatically an attempt record: three equivalent
           // no-progress failures now reach diagnose without manual `attempt` bookkeeping.
-          if (!isGlobal && !outcome.activePhasePassed && postGateState) {
+          if (!isGlobal && !outcome.activePhasePassed) {
             const activeReport = evaluation.phaseGates[workspace.state.activePhase];
-            const updated = await recordFailedGateAttempt(resolve(workspace.layout.internal.state), postGateState, workspace.state.activePhase, activeReport ? { rows: activeReport.rows, score: activeReport.score } : undefined);
-            postGateState = updated;
+            const updated = await recordFailedGateAttempt(resolve(workspace.layout.internal.state), state, workspace.state.activePhase, activeReport ? { rows: activeReport.rows, score: activeReport.score } : undefined);
+            state = updated;
           }
           if (!isGlobal) {
             const active = workspace.state.activePhase;
@@ -901,6 +727,85 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           }
           const { activePhasePassed, globalPassed } = outcome;
           return (isGlobal ? globalPassed : activePhasePassed) ? 0 : 4;
+        }
+        let manifest: OracleManifest;
+        let preparationIdentity: string;
+        manifest = JSON.parse(await readFile(resolve(required(parsed.options, "oracle")), "utf8")) as OracleManifest;
+        if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
+        preparationIdentity = oraclePreparationIdentity(manifest);
+        const profile = required(parsed.options, "profile") as ProfileId;
+        if (profile !== "tank" && profile !== "generic") throw new Error("--profile must be tank or generic");
+        const subjectContractPath = parsed.options["subject-contract"] ? resolve(parsed.options["subject-contract"]) : undefined;
+        const subjectContract = subjectContractPath ? JSON.parse(await readFile(subjectContractPath, "utf8")) as GenericSubjectContract : undefined;
+        const candidatePath = resolve(required(parsed.options, "candidate"));
+        const isGlobal = parsed.flags.has("global");
+        const profileContract = getProfileContract(profile);
+        const needsArticulation = isGlobal || profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === undefined);
+        void needsArticulation;
+        const poses = requiredPosesForProfile(profile, subjectContract);
+        const execution = await inspectWorkspaceCandidateViaExecutor({
+          modelEntryPath: candidatePath,
+          poses,
+        });
+        const candidateFiles = execution.candidateFiles;
+        const certification: TaskState["certification"] = manifest.authoritativeDimensions ? "exact-real" : "oracle-relative";
+        const selectedStyle = await loadStyleContract(parsed.options.style ?? "low-poly-faithful");
+        const evaluationIdentity = createEvaluationIdentity({
+          evaluatorVersion: EVALUATOR_VERSION,
+          measurementVersion: MEASUREMENT_VERSION,
+          profile,
+          profileContractHash: profileContractHash(getProfileContract(profile)),
+          styleContractHash: selectedStyle.hash,
+          subjectContractHash: optionalContractHash(subjectContract),
+          certification,
+          oraclePreparationHash: preparationIdentity,
+          preparedOracleHash: manifest.preparedHash,
+          authoritativeDimensionsHash: optionalContractHash(manifest.authoritativeDimensions),
+          candidateSourceHash: execution.sourceHash,
+          candidateNeutralHash: execution.neutralSceneHash,
+          toolchainId: null,
+          projectPolicyHash: null,
+          candidateIsolation: execution.isolation,
+        });
+        const currentEvaluationHash = evaluationIdentityHash(evaluationIdentity);
+        const oracle = await loadPreparedOracle(manifest);
+        const { evaluateCandidateFromSamples } = await import("./core/orchestration.js");
+        const evaluation = await evaluateCandidateFromSamples({
+          oracle,
+          candidateSamples: [
+            { pose: poses[0]!, root: execution.neutralRoot },
+            ...execution.posedRoots.map((sample) => ({ pose: sample.pose, root: sample.root })),
+          ],
+          profile,
+          candidateNeutralHash: execution.neutralSceneHash,
+          candidateSourceHash: execution.sourceHash,
+          style: selectedStyle.contract,
+          certification,
+          ...(subjectContract ? { subjectContract } : {}),
+          ...(manifest.authoritativeDimensions ? { authoritativeDimensions: manifest.authoritativeDimensions } : {}),
+        });
+        const rendered = `${json(evaluation)}\n`;
+        const reportPath2 = parsed.options.out ? resolve(parsed.options.out) : undefined;
+        if (reportPath2) { await mkdir(dirname(reportPath2), { recursive: true }); await writeFile(reportPath2, rendered, { flag: "wx" }); }
+        const artifactDirOption = parsed.options["artifact-dir"];
+        if (artifactDirOption) {
+          const parentDirectory = resolve(artifactDirOption);
+          const run = await createRunDirectory(parentDirectory, "gate");
+          for (const kind of ["deterministic-gate", "style", "complexity"] as const) {
+            void kind;
+            break;
+          }
+          const complexityRows = evaluation.style.rows.filter((row) => row.code.startsWith("style.complexity"));
+          const complexityReport = { profile, passed: complexityRows.every((row) => row.passed), score: complexityRows.length ? Math.min(...complexityRows.map((row) => row.score)) : 0, rows: complexityRows, workorders: [] };
+          const artifacts = [
+            ...Object.entries(evaluation.phaseGates).map(([phase, report]) => createRuntimeGateEvidenceArtifact({ id: `${run.id}-${phase}`, phase, oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: evaluationIdentity.profileContractHash, styleContractHash: evaluationIdentity.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash: currentEvaluationHash, report })),
+            createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-style`, kind: "style", phase: profile === "tank" ? "style-fabrication" : "style-complexity", oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: evaluationIdentity.profileContractHash, styleContractHash: evaluationIdentity.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash: currentEvaluationHash, report: evaluation.style }),
+            createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-complexity`, kind: "complexity", phase: profile === "tank" ? "style-fabrication" : "style-complexity", oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: evaluationIdentity.profileContractHash, styleContractHash: evaluationIdentity.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash: currentEvaluationHash, report: complexityReport }),
+            ...(evaluation.articulation.rows.length ? [createRuntimeEvaluationEvidenceArtifact({ id: `${run.id}-articulation`, kind: "articulation", phase: evaluation.articulation.rows[0]!.phase ?? (profile === "tank" ? "fittings-articulation" : "attachments"), oracleHash: evaluation.oracleHash, candidateHash: evaluation.candidateHash, profileContractHash: evaluationIdentity.profileContractHash, styleContractHash: evaluationIdentity.styleContractHash, evaluationIdentityHash: currentEvaluationHash, configHash: currentEvaluationHash, report: evaluation.articulation })] : []),
+          ];
+          for (const artifact of artifacts) {
+            await writeFile(join(run.path, `${artifact.id}.json`), `${json(artifact)}\n`, { flag: "wx" });
+          }
         }
         io.stdout(rendered.trimEnd());
         return evaluation.passed ? 0 : 4;
@@ -1032,9 +937,9 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         if (action === "start") {
           const workspace = await resumeWorkspace(root);
           if (workspace.state.mirrorOfRun) {
-            // Mechanical ask-first boundary (§19): a trusted-run viewer start is a user
-            // approval, never a builder-autonomous operation.
-            throw new Error(`viewer start for trusted run ${workspace.state.mirrorOfRun.mirrorOfRun} requires explicit user approval through the run authority; the builder cannot start it`);
+            // Mechanical ask-first boundary (§19/closure §9.F5): a trusted-run viewer start
+            // is a user approval executed by the trusted broker's human/admin channel.
+            throw new Error(`viewer start for trusted run ${workspace.state.mirrorOfRun.mirrorOfRun} requires explicit human approval through the broker admin channel (approve-viewer-start); the builder cannot start it`);
           }
           const portOption = parsed.options.port ? (parsed.options.port === "auto" ? "auto" as const : Number(parsed.options.port)) : undefined;
           if (portOption !== undefined && portOption !== "auto" && !Number.isInteger(portOption)) throw new Error("--port must be an integer or auto");

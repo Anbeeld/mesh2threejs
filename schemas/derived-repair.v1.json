@@ -1,0 +1,170 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "mesh2threejs/derived-repair.v1.json",
+  "title": "mesh2threejs declarative derived-repair specification (v1)",
+  "description": "Agent-owned geometry repairs are DATA, never executable code. Trusted derive validates this structure mechanically and compiles it into pipeline-generated phase modules. JavaScript expressions, imports, callbacks, file paths, URLs, shell commands, code strings, and runtime state reads are structurally impossible in this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "phase", "operations"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "phase": {
+      "type": "string",
+      "description": "The builder phase this repair belongs to. Must equal the active repair owner; phase escape is refused at compile time."
+    },
+    "operations": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/definitions/operation" }
+    }
+  },
+  "definitions": {
+    "vec3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "operation": {
+      "type": "object",
+      "required": ["op", "target"],
+      "properties": {
+        "op": {
+          "enum": [
+            "component-transform",
+            "simplify-override",
+            "component-keep",
+            "component-drop",
+            "hierarchy-parent",
+            "primitive-replace",
+            "mesh-replace",
+            "material"
+          ]
+        },
+        "target": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "component-transform" },
+            "target": {},
+            "translate": { "$ref": "#/definitions/vec3" },
+            "rotateDegrees": { "$ref": "#/definitions/vec3" },
+            "scale": { "$ref": "#/definitions/vec3" }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "simplify-override" },
+            "target": {},
+            "ratio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+            "error": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "component-keep" },
+            "target": {}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "component-drop" },
+            "target": {}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "hierarchy-parent" },
+            "target": {},
+            "parent": { "type": ["string", "null"] }
+          },
+          "required": ["parent"]
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "primitive-replace" },
+            "target": {},
+            "primitive": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["kind", "size"],
+                  "properties": {
+                    "kind": { "const": "box" },
+                    "size": { "$ref": "#/definitions/vec3" }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["kind", "radius", "height", "segments"],
+                  "properties": {
+                    "kind": { "const": "cylinder" },
+                    "radius": { "type": "number", "exclusiveMinimum": 0 },
+                    "height": { "type": "number", "exclusiveMinimum": 0 },
+                    "segments": { "type": "integer", "minimum": 3, "maximum": 64 },
+                    "axis": { "enum": ["x", "y", "z"] }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["kind", "from", "to", "radius", "segments"],
+                  "properties": {
+                    "kind": { "const": "tube" },
+                    "from": { "$ref": "#/definitions/vec3" },
+                    "to": { "$ref": "#/definitions/vec3" },
+                    "radius": { "type": "number", "exclusiveMinimum": 0 },
+                    "segments": { "type": "integer", "minimum": 3, "maximum": 64 }
+                  }
+                }
+              ]
+            }
+          },
+          "required": ["primitive"]
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "mesh-replace" },
+            "target": {},
+            "positions": {
+              "type": "array",
+              "items": { "type": "number" },
+              "minItems": 3,
+              "maxItems": 15000,
+              "description": "Finite xyz triples; length must be a multiple of 3 and within the 5000-vertex ceiling."
+            },
+            "indices": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 },
+              "minItems": 3,
+              "maxItems": 30000,
+              "description": "Triangle indices; length must be a multiple of 3, in vertex range, and within the 10000-triangle ceiling."
+            }
+          },
+          "required": ["positions", "indices"]
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "material" },
+            "target": {},
+            "color": { "$ref": "#/definitions/vec3" },
+            "roughness": { "type": "number", "minimum": 0, "maximum": 1 },
+            "metalness": { "type": "number", "minimum": 0, "maximum": 1 },
+            "flatShading": { "type": "boolean" }
+          }
+        }
+      ]
+    }
+  }
+}

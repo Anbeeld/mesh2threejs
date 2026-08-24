@@ -30,6 +30,11 @@ export interface ViewerStartOptions {
   /** Test hook replacing the platform launcher. Receives the daemon argv including the entry. */
   spawnServer?: (daemonArguments: string[]) => void;
   readyTimeoutMs?: number;
+  /**
+   * Authority-bound trusted scene (closure plan §9.F4): when present the daemon serves ONLY
+   * this exact file after re-hashing its bytes, never a "latest matching" workspace scan.
+   */
+  trustedScene?: { path: string; sha256: string };
 }
 
 export type ViewerStartResult =
@@ -173,6 +178,7 @@ export async function startViewer(workspaceRoot: string, options: ViewerStartOpt
   const instanceId = randomBytes(12).toString("hex");
   mkdirSync(viewerRuntimeDirectory(root), { recursive: true });
   const entryArguments = [...viewerServerEntryArguments(), root, String(port), shutdownToken, instanceId];
+  if (options.trustedScene) entryArguments.push("--trusted-scene", options.trustedScene.path, "--trusted-scene-sha256", options.trustedScene.sha256);
   (options.spawnServer ?? spawnViewerDaemon)(entryArguments);
   const deadline = Date.now() + (options.readyTimeoutMs ?? 15_000);
   while (Date.now() < deadline) {

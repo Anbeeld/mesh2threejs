@@ -1,188 +1,139 @@
-﻿import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
+﻿import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, afterAll } from "vitest";
 import { runCli } from "../src/cli.js";
-import {
-  InMemoryRunAuthorityStore,
-  TrustedRunAuthority,
-  mirroredTaskState,
-} from "../src/core/run-authority.js";
-import { createTaskState, loadTaskState, type TaskState } from "../src/core/state.js";
-import type { RunPolicy } from "../src/core/policy.js";
-import { canonicalJson, sha256 } from "../src/core/hashing.js";
+import { startBroker } from "../src/broker/server.js";
+import { BrokerClient } from "../src/broker/client.js";
 import { createSlopedTank, stableSemanticIdentityMap, sceneToGlb } from "./helpers/tank-fixtures.js";
 
 /**
- * Condensed trusted synthetic lifecycle (plan Â§23): a real source-derived workspace drives
- * the trusted run authority from creation to certification, proving the Â§23 assertion
- * subset: workspace edits cannot forge authority, viewer/finalize stay ask-first/refusing,
- * human approval is necessary and binds exact current hashes, and certification reflects a
- * fresh replay over the CURRENT candidate.
+ * REAL trusted broker lifecycle (closure plan §12.I1). Everything after workspace
+ * initialization flows through the trusted operation API — no manually marked phases,
+ * no injected execution authority, no fabricated replay records, no caller-supplied
+ * packet hashes, no canonical-state mutation. The builder token drives geometry work;
+ * the admin token only delivers final human approval and finalize.
  */
+
+const roots: string[] = [];
+afterAll(async () => {
+  await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
+});
 
 const io = () => {
   const out: string[] = [];
   return { sink: { stdout: (v: string) => out.push(v), stderr: (v: string) => out.push(v) }, output: out };
 };
 
-async function runCliOrThrow(args: string[]): Promise<void> {
-  const result = io();
-  const code = await runCli(args, result.sink);
-  if (code !== 0) throw new Error(`runCli ${args.join(" ")} failed (exit ${code}):\n${result.output.join("\n")}`);
-}
+/** Verified toolchain fixture standing in for a shipped-manifest installation (§10.G2). */
+const toolchainOverride = {
+  manifest: {
+    schemaVersion: 1 as const,
+    packageName: "mesh2threejs",
+    packageVersion: "1.0.0",
+    runtimeHash: "test-runtime-hash",
+    controlHash: "test-control-hash",
+    dependencyIdentity: "test-dependency-identity",
+    runtimeFiles: {},
+    controlFiles: {},
+  },
+  provenance: { nodeVersion: process.version, platform: process.platform, arch: process.arch, packageRoot: ".", threeRoot: null, threeVersion: null, meshoptimizerRoot: null, meshoptimizerVersion: null },
+  toolchainId: "tc-lifecycle-fixed",
+  trustedToolchain: true,
+};
 
-describe("trusted synthetic lifecycle to certification (Â§23)", () => {
-  test("hull-phase reconstruction binds a trusted run that certifies only through human approval", async () => {
-    const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-trusted-lifecycle-"));
+describe("trusted broker reconstruction lifecycle (I1)", () => {
+  test("safe-default begin-run through derive/gate/lock to human-approved certification", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-broker-lifecycle-"));
+    roots.push(parent);
     const root = join(parent, "workspace");
     await mkdir(root, { recursive: true });
     const source = join(parent, "tank.glb");
     await writeFile(source, sceneToGlb(createSlopedTank()));
 
-    // ---- Builder-safe geometry work through the development surface -------------------
-    await runCliOrThrow(["init", root, "--id", "trusted-lifecycle", "--goal", "synthetic trusted run", "--profile", "tank", "--oracle", source]);
-    const project = JSON.parse(await readFile(join(root, "project.json"), "utf8")) as { authorshipMode?: string };
-    expect(project.authorshipMode).toBe("derived");
-    const onboard = join(parent, "onboard.json");
-    await writeFile(onboard, JSON.stringify({
-      id: "trusted-lifecycle", sourcePath: "ignored", preparedPath: "ignored", source: "fixture", author: "fixture", license: "MIT", redistribution: "allowed",
-      coordinateFrame: "right-handed", upAxis: "+y", forwardAxis: "+z", grounding: "min-y=0", scale: 1,
-      semanticMap: stableSemanticIdentityMap(createSlopedTank()),
-      articulationMap: { gun: "gun-pivot", turret: "turret-pivot" },
-      normalization: { translation: [0, 0, 0], rotationEuler: [0, 0, 0], scale: 1 },
-      authoritativeDimensions: null, dimensionSources: [],
-    }));
-    await runCliOrThrow(["onboard", root, "--config", onboard]);
-    await runCliOrThrow(["oracle-sanity", root]);
-    const registration = join(parent, "registration.json");
-    await writeFile(registration, JSON.stringify({ forwardAxis: "+z", upAxis: "+y", expectedScale: 1, groundY: 0, tolerance: 0.02, requiredSemantics: ["hull", "turret", "gun"], requiredPivots: ["turret-pivot", "gun-pivot"] }));
-    await runCliOrThrow(["register", root, "--config", registration]);
-    await runCliOrThrow(["lock", root]);
+    // Workspace scaffolding happens on the development surface; every TRUSTED act below
+    // goes through the broker.
+    const init = io();
+    expect(await runCli(["init", root, "--id", "broker-lifecycle", "--goal", "synthetic tank reconstruction", "--profile", "tank", "--oracle", source], init.sink)).toBe(0);
 
-    const tank = createSlopedTank();
-    const hull = tank.getObjectByName("hull") as unknown as { geometry: { toNonIndexed: () => { getAttribute: (name: string) => { array: Float32Array } } } };
-    const values = Array.from(hull.geometry.toNonIndexed().getAttribute("position").array as Float32Array);
-    await writeFile(join(root, "model", "model.mjs"), [
-      `import * as THREE from "three";`,
-      `export function createCandidate() {`,
-      `  const root = new THREE.Group();`,
-      `  root.name = "hull-only-candidate";`,
-      `  root.userData.forwardAxis = "+z";`,
-      `  const geometry = new THREE.BufferGeometry();`,
-      `  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array([${values.join(",")}]), 3));`,
-      `  const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: new THREE.Color(0.42, 0.45, 0.35), roughness: 0.7 }));`,
-      `  mesh.name = "hull";`,
-      `  mesh.userData.semanticId = "hull";`,
-      `  root.add(mesh);`,
-      `  return root;`,
-      `}`,
-    ].join("\n"));
-    await runCliOrThrow(["gate", root]);
+    const broker = await startBroker({ toolchainOverride });
+    roots.push(broker.url);
+    try {
+      const builder = new BrokerClient({ url: broker.url, token: broker.builderToken });
+      const admin = new BrokerClient({ url: broker.url, token: broker.adminToken });
 
-    // ---- The trusted runtime derives its own view of the same truth --------------------
-    const workspaceState = await loadTaskState(join(root, ".mesh2threejs", "state.json"));
-    expect(workspaceState.oraclePreparation).toBeTruthy();
-    expect(workspaceState.candidateHash).toBeTruthy();
+      // ---- Safe-default autonomous begin-run ------------------------------------------
+      const { runId } = await builder.beginRun(root);
+      expect(runId).toMatch(/^run-/);
+      // A second begin on the same workspace is refused (already bound).
+      await expect(builder.beginRun(root)).rejects.toThrow(/already bound/i);
 
-    const policy: RunPolicy = {
-      profile: "tank",
-      style: "low-poly-faithful",
-      certification: "oracle-relative",
-      authorshipMode: "derived",
-      geometryAuthority: "prepared-oracle",
-      oracleReference: { path: "refs/oracle/tank.glb", sha256: "f".repeat(64) },
-      subjectContractHash: null,
-      goal: "synthetic trusted run",
-    };
-    const toolchain = { toolchainId: "tc-lifecycle-1", runtimeHash: "r", controlHash: "c", dependencyIdentity: "d", packageVersion: "1.0.0" };
+      // ---- Onboard + register + sanity + registration lock ----------------------------
+      await builder.onboardOracle(runId, {
+        id: "broker-lifecycle", sourcePath: "ignored", preparedPath: "ignored", source: "fixture", author: "fixture", license: "MIT", redistribution: "allowed",
+        coordinateFrame: "right-handed", upAxis: "+y", forwardAxis: "+z", grounding: "min-y=0", scale: 1,
+        semanticMap: stableSemanticIdentityMap(createSlopedTank()),
+        articulationMap: { gun: "gun-pivot", turret: "turret-pivot" },
+        normalization: { translation: [0, 0, 0], rotationEuler: [0, 0, 0], scale: 1 },
+        authoritativeDimensions: null, dimensionSources: [],
+      });
+      await builder.oracleSanity(runId);
+      const registered = await builder.register(runId, { forwardAxis: "+z", upAxis: "+y", expectedScale: 1, groundY: 0, tolerance: 0.02, requiredSemantics: ["hull", "turret", "gun"], requiredPivots: ["turret-pivot", "gun-pivot"] });
+      expect(registered.passed).toBe(true);
+      await builder.lock(runId);
 
-    const store = new InMemoryRunAuthorityStore();
-    const authority = new TrustedRunAuthority(store);
-    const seeded = createTaskState({ taskId: "trusted-lifecycle", profile: "tank", style: "low-poly-faithful" });
-    for (const phase of Object.keys(seeded.phaseStatus)) seeded.phaseStatus[phase] = "passed";
-    seeded.evaluationIdentityHash = workspaceState.evaluationIdentityHash;
-    seeded.oraclePreparation = { ...workspaceState.oraclePreparation! };
-    seeded.candidateHash = workspaceState.candidateHash;
-    seeded.phaseGeometryHashes = { ...workspaceState.phaseGeometryHashes };
-    const created = await authority.createRun({
-      runId: "lifecycle-run",
-      workspaceRoot: root,
-      policy,
-      policyDecisions: [],
-      initialState: seeded,
-      toolchain,
-      defaults: { hasOracle: true, routedProfile: "tank" },
-      requestedBy: "human-admin",
-    });
-    void created;
-    const builderContext = { requestedBy: "builder" as const };
-    await authority.applyBuilderTransition("lifecycle-run", { kind: "set-candidate", candidateHash: workspaceState.candidateHash!, phaseGeometryHashes: workspaceState.phaseGeometryHashes }, builderContext);
+      // ---- Derive/gate/lock per builder phase -----------------------------------------
+      for (let cycle = 0; cycle < 8; cycle += 1) {
+        const next = await builder.next(runId) as { route?: string; activePhase?: string };
+        if (next.route === "diagnose") break;
+        const phase = next.activePhase!;
+        const derived = await builder.derive(runId) as { status: string };
+        void derived;
+        const gate = await builder.gate(runId) as { passed: boolean };
+        if (!gate.passed) break;
+        await builder.lock(runId);
+        const status = await builder.status(runId) as { status: string; phaseStatus: Record<string, string> };
+        if (status.status === "awaiting-human-review") break;
+        const remaining = Object.entries(status.phaseStatus).filter(([p, s]) => p !== "final" && p !== "visual-review" && s !== "passed" && s !== "skipped");
+        if (!remaining.length) break;
+      }
 
-    // Workspace-side tampering AFTER authority binding changes nothing canonical.
-    const forgedStatePath = join(root, ".mesh2threejs", "state.json");
-    const forged = JSON.parse(await readFile(forgedStatePath, "utf8")) as Record<string, unknown>;
-    forged.candidateHash = "forged-candidate";
-    await writeFile(forgedStatePath, `${JSON.stringify(forged, null, 2)}\n`);
-    const canonical = await authority.readRun("lifecycle-run");
-    expect(canonical.candidateHash).toBe(workspaceState.candidateHash);
+      const preReview = await builder.status(runId) as { status: string; phaseStatus: Record<string, string> };
+      const unlocked = Object.entries(preReview.phaseStatus).filter(([p, s]) => p !== "final" && p !== "visual-review" && s !== "passed" && s !== "skipped");
+      expect(unlocked).toEqual([]);
+      expect(preReview.status).toBe("active");
 
-    // Review-ready marker + fresh replay + isolated sandbox + human approval -> certified.
-    const packetHash = sha256(canonicalJson({ run: "lifecycle-run", candidateHash: workspaceState.candidateHash }));
-    void packetHash;
-    await authority.applyBuilderTransition("lifecycle-run", { kind: "mark-review-ready", packetHash }, builderContext);
-    await authority.applyRuntimeRecord("lifecycle-run", { kind: "candidate-isolation", isolation: "trusted-isolated" });
-    await authority.applyRuntimeRecord("lifecycle-run", {
-      kind: "final-replay",
-      replay: {
-        replayHash: sha256(canonicalJson({ candidate: workspaceState.candidateHash, identity: workspaceState.evaluationIdentityHash })),
-        passed: true,
-        evaluationIdentityHash: workspaceState.evaluationIdentityHash!,
-        candidateHash: workspaceState.candidateHash!,
-        oraclePreparationIdentity: workspaceState.oraclePreparation!.identity,
-        evaluatedAt: new Date().toISOString(),
-      },
-    });
-    // Approval must bind the EXACT packet/candidate/oracle/toolchain/replay triple.
-    await expect(authority.recordHumanApproval("lifecycle-run", {
-      packetHash: packetHash,
-      candidateHash: workspaceState.candidateHash!,
-      oraclePreparationIdentity: workspaceState.oraclePreparation!.identity,
-      toolchainId: toolchain.toolchainId,
-      trustedReplayHash: sha256(canonicalJson({ candidate: workspaceState.candidateHash, identity: workspaceState.evaluationIdentityHash })),
-      method: "test-capability",
-    }, { requestedBy: "builder" })).rejects.toThrow(/human-admin capability/);
-    const certified = await authority.recordHumanApproval("lifecycle-run", {
-      packetHash: packetHash,
-      candidateHash: workspaceState.candidateHash!,
-      oraclePreparationIdentity: workspaceState.oraclePreparation!.identity,
-      toolchainId: toolchain.toolchainId,
-      trustedReplayHash: sha256(canonicalJson({ candidate: workspaceState.candidateHash, identity: workspaceState.evaluationIdentityHash })),
-      method: "test-capability",
-    }, { requestedBy: "human-admin" }).then(() => authority.certify("lifecycle-run", { requestedBy: "human-admin" }));
-    expect(certified.status).toBe("certified");
-    expect(mirroredTaskState(certified).status).toBe("certified");
+      // ---- Review-ready computes captures + full binding internally --------------------
+      const ready = await builder.reviewReady(runId) as { status: string; packet: { hash: string }; capture: { viewerScene: string } };
+      expect(ready.status).toBe("ready-for-user-review");
+      expect(ready.packet.hash).toMatch(/^[a-f0-9]{64}$/);
+      const midStatus = await builder.status(runId) as { status: string };
+      expect(midStatus.status).toBe("awaiting-human-review");
 
-    // ---- Mechanical ask-first boundaries around the bound workspace --------------------
-    const mirror = await loadTaskState(forgedStatePath).catch(() => null);
-    void mirror;
-    const restoredForged = JSON.parse(await readFile(forgedStatePath, "utf8")) as Record<string, unknown>;
-    restoredForged.mirrorOfRun = { schemaVersion: 1, mirrorOfRun: "lifecycle-run", sequence: 1, hash: "0".repeat(64) };
-    restoredForged.candidateHash = workspaceState.candidateHash;
-    restoredForged.status = "active";
-    await writeFile(forgedStatePath, `${JSON.stringify(restoredForged, null, 2)}\n`);
-    const finalizeResult = io();
-    expect(await runCli(["finalize", root], finalizeResult.sink)).toBe(7);
-    expect(finalizeResult.output.join("\n")).toMatch(/bound to trusted run lifecycle-run/);
-    const viewerResult = io();
-    expect(await runCli(["viewer", "start", root], viewerResult.sink)).toBe(2);
-    expect(viewerResult.output.join("\n")).toMatch(/requires explicit user approval through the run authority/);
+      // ---- Builder approval attempts are refused --------------------------------------
+      const builderApproval = await fetch(broker.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ operation: "approve-review", runId, token: broker.builderToken }) });
+      expect(builderApproval.status).toBe(403);
+      const builderFinalize = await fetch(broker.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ operation: "trusted-finalize", runId, token: broker.builderToken }) });
+      expect(builderFinalize.status).toBe(403);
 
-    // Development-only low-level mutation is refused against the bound workspace.
-    const bindResult = io();
-    expect(await runCli(["bind-candidate", root, "--hash", "x"], bindResult.sink)).toBe(2);
-    expect(bindResult.output.join("\n")).toMatch(/development-only/i);
-  }, 120_000);
+      // ---- Human approval sealed from canonical values; finalize runs a FRESH replay ---
+      await admin.approveReview(runId);
+      const finalized = await admin.finalize(runId);
+      expect(finalized.status).toBe("certified");
+
+      // Certified runs are immutable and the workspace mirror reflects certification.
+      const record = await builder.readRun(runId);
+      expect(record.record.status).toBe("certified");
+      const mirrorState = JSON.parse(await readFile(join(root, ".mesh2threejs", "state.json"), "utf8")) as { status: string; mirrorOfRun?: { mirrorOfRun: string } };
+      expect(mirrorState.status).toBe("certified");
+      expect(mirrorState.mirrorOfRun?.mirrorOfRun).toBe(runId);
+
+      // Ask-first boundaries still hold on the bound workspace.
+      const viewerResult = io();
+      expect(await runCli(["viewer", "start", root], viewerResult.sink)).toBe(2);
+      expect(viewerResult.output.join("\n")).toMatch(/approve-viewer-start/);
+    } finally {
+      await broker.close();
+    }
+  }, 300_000);
 });
-
-

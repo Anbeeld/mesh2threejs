@@ -9,6 +9,7 @@ export type Capability = "builder" | "human-admin";
 
 /** Operations a reconstruction builder may invoke autonomously. */
 export const BUILDER_OPERATIONS = new Set([
+  "begin-run",
   "status",
   "next",
   "probe",
@@ -38,6 +39,8 @@ export const HUMAN_ADMIN_OPERATIONS = new Set([
   "approve-policy",
   "migrate-rebase",
   "record-human-approval",
+  "approve-review",
+  "approve-viewer-start",
   "viewer-start",
   "trusted-finalize",
   "certify",

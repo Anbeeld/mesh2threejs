@@ -1,5 +1,34 @@
 import * as THREE from "three";
-import { createTrackCourseGeometry } from "mesh2threejs";
+
+// Candidates import ONLY "three": pipeline package exports are not part of the audited
+// candidate allowlist (closure plan §7.D2), so the example inlines its track-course helper.
+function createTrackCourseGeometry(length, height, width, wrapRadius) {
+  if ([length, height, width, wrapRadius].some((value) => !Number.isFinite(value) || value <= 0) || wrapRadius * 2 >= Math.min(length, height)) throw new Error("track course parameters are invalid");
+  const roundedRectangle = (target, inset, radius) => {
+    const left = -length / 2 + inset; const right = length / 2 - inset;
+    const bottom = -height / 2 + inset; const top = height / 2 - inset;
+    target.moveTo(left + radius, bottom);
+    target.lineTo(right - radius, bottom);
+    target.absarc(right - radius, bottom + radius, radius, -Math.PI / 2, 0, false);
+    target.lineTo(right, top - radius);
+    target.absarc(right - radius, top - radius, radius, 0, Math.PI / 2, false);
+    target.lineTo(left + radius, top);
+    target.absarc(left + radius, top - radius, radius, Math.PI / 2, Math.PI, false);
+    target.lineTo(left, bottom + radius);
+    target.absarc(left + radius, bottom + radius, radius, Math.PI, Math.PI * 1.5, false);
+    target.closePath();
+  };
+  const outer = new THREE.Shape();
+  roundedRectangle(outer, 0, wrapRadius);
+  const inner = new THREE.Path();
+  const inset = Math.min(width, wrapRadius * 0.6);
+  roundedRectangle(inner, inset, Math.max(wrapRadius - inset, 0.01));
+  outer.holes.push(inner);
+  const geometry = new THREE.ExtrudeGeometry(outer, { depth: width, bevelEnabled: false, curveSegments: 8, steps: 1 });
+  geometry.translate(0, 0, -width / 2);
+  geometry.rotateY(Math.PI / 2);
+  return geometry;
+}
 
 function part(id, geometry, position = [0, 0, 0], critical = false) {
   const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0x66705a, roughness: 0.72 }));

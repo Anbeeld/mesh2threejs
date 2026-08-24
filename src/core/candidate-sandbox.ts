@@ -4,13 +4,17 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { SerializedScene } from "./scene-serialization.js";
 import { sanitizeLaunchEnvironment } from "./toolchain.js";
+import { backendIdentity } from "./exec-authority.js";
 
 /**
- * Candidate sandbox boundary. Trusted certification requires a `trusted-isolated` backend;
- * the in-process development backend exists for development runs only and can never certify.
+ * Candidate sandbox boundary (closure plan §6.C5/C6). Execution authority is a runtime
+ * fact, never a caller option: a plain child process is a RESOURCE boundary, not a
+ * hostile-code sandbox. The default trusted derived route is safe structurally — it
+ * executes only pipeline-generated modules (`trusted-derived-generated`) — while
+ * `trusted-host-sandbox` requires an actually verified host isolation adapter.
  */
 
-export type CandidateIsolation = "development-process" | "trusted-isolated";
+export type CandidateIsolation = "development-untrusted" | "trusted-host-sandbox";
 
 export interface CandidateExecutionLimits {
   /** Wall-clock budget for the whole pose batch; violation kills the sandbox. */
@@ -46,6 +50,8 @@ export interface SandboxExecutionResult {
 export interface SandboxBackend {
   readonly name: string;
   readonly isolation: CandidateIsolation;
+  /** Stable provenance identity of this backend instance (runtime fact, not a label). */
+  readonly identityHash?: string;
   execute(request: SandboxPoseRequest): Promise<SandboxExecutionResult>;
 }
 
@@ -71,7 +77,8 @@ function assertStagedPaths(request: SandboxPoseRequest): void {
 export function createInProcessBackend(loadStaged: (entryHref: string) => Promise<{ setPose: (pose: Record<string, number>) => void | Promise<void>; root: import("three").Object3D }>): SandboxBackend {
   return {
     name: "in-process",
-    isolation: "development-process",
+    isolation: "development-untrusted",
+    identityHash: backendIdentity({ name: "in-process" }),
     async execute(request) {
       assertStagedPaths(request);
       const { pathToFileURL } = await import("node:url");
@@ -95,19 +102,21 @@ interface ChildRequestFile {
 }
 
 /**
- * Trusted-isolated backend: executes the staged candidate in a fresh child process with an
- * empty sanitized environment, no shell, a heap ceiling, a hard wall-clock timeout, and a
+ * Bounded child-process backend: executes the staged candidate in a fresh child process with
+ * an empty sanitized environment, no shell, a heap ceiling, a hard wall-clock timeout, and a
  * serialized-output size limit. Violations terminate the process and fail boundedly.
  *
- * Classification honesty: this backend qualifies as `trusted-isolated` only when deployed
- * by the trusted broker/host configuration that verifies the boundary (see §8.4 examples:
- * "platform sandbox verified by tests"). Hosts that cannot verify it must keep
- * `candidateIsolation = development-process|unconfigured`, and certification refuses.
+ * Classification honesty (closure plan §6.C6): these are RESOURCE controls, not trusted
+ * hostile-code isolation. This backend always reports `development-untrusted`; it can only
+ * participate in certification when the executed graph is proven to be fully
+ * pipeline-generated (`trusted-derived-generated`) or when a real verified host isolation
+ * adapter wraps it (`trusted-host-sandbox`). It is never promoted based on a caller option.
  */
-export function createTrustedChildProcessBackend(options: { runnerModuleUrl: string; verifiedByTests?: boolean }): SandboxBackend {
+export function createBoundedChildProcessBackend(options: { runnerModuleUrl: string }): SandboxBackend {
   return {
-    name: "trusted-child-process",
-    isolation: "trusted-isolated",
+    name: "bounded-child-process",
+    isolation: "development-untrusted",
+    identityHash: backendIdentity({ name: "bounded-child-process", detail: options.runnerModuleUrl }),
     async execute(request) {
       assertStagedPaths(request);
       const work = await mkdtemp(join(tmpdir(), "mesh2threejs-sandbox-"));
