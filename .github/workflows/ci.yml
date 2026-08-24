@@ -21,6 +21,4 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run validate:development
-      - run: npm run test:e2e
-      - run: npm pack --dry-run
+      - run: npm run ci

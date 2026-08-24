@@ -40,11 +40,17 @@ export interface ExecutorOptions {
   limits?: Partial<CandidateExecutionLimits>;
   auditOptions?: Parameters<typeof auditCandidateModule>[1];
   /**
-    * Derived byte expectations computed by trusted code from canonical run state. When
-    * present, execution is refused unless every audited file matches the expected pipeline
-    * bytes exactly — BEFORE any import occurs.
-    */
+   * Derived byte expectations computed by trusted code from canonical run state. When
+   * present, execution is refused unless every audited file matches the expected pipeline
+   * bytes exactly — BEFORE any import occurs.
+   */
   authorityExpectations?: DerivedGraphExpectations;
+  /**
+   * Broker-private execution scratch root (final closure §2). When supplied, the staged
+   * candidate graph is created OUTSIDE the workspace/repo/builder-writable space. Trusted
+   * operations pass this; development callers omit it.
+   */
+  executionScratchRoot?: string;
 }
 
 export async function executeCandidate(request: CandidateExecutionRequest, options: ExecutorOptions): Promise<CandidateExecutionResult> {
@@ -64,7 +70,10 @@ export async function executeCandidate(request: CandidateExecutionRequest, optio
     backendIsolation: options.backend.isolation,
     backendIdentityHash: options.backend.identityHash ?? `unidentified:${options.backend.name}`,
   });
-  const stage = await stageCandidateGraph(request.entryPath, audit);
+  const stage = await stageCandidateGraph(request.entryPath, audit, {
+    ...(options.executionScratchRoot ? { stagingRoot: options.executionScratchRoot } : {}),
+    authorityLedger: graphAuthority.files.map((file) => ({ absolutePath: file.absolutePath, sha256: file.sha256 })),
+  });
   try {
     for (const file of graphAuthority.files) {
       const staged = stage.stagedFiles.find((item) => resolve(item.absolutePath) === resolve(file.absolutePath));
@@ -97,8 +106,4 @@ export async function executeCandidate(request: CandidateExecutionRequest, optio
 /** Reconstructs trusted Object3D roots from executor samples for downstream evaluation/rendering. */
 export function deserializeSamples(samples: ReadonlyArray<{ pose: Record<string, number>; serialization: SerializedScene }>): Array<{ pose: Record<string, number>; root: ReturnType<typeof deserializeScene> }> {
   return samples.map((sample) => ({ pose: sample.pose, root: deserializeScene(sample.serialization) }));
-}
-
-export function stageDirectoryMarker(): string {
-  return ".mesh2threejs-candidate-";
 }

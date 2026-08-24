@@ -30,6 +30,8 @@ export interface WorkspaceExecutionRequest {
   backend: SandboxBackend;
   /** Derived byte expectations enforced before execution by the executor boundary. */
   authorityExpectations?: DerivedGraphExpectations;
+  /** Broker-private execution scratch root (final closure §2). Trusted callers pass this. */
+  executionScratchRoot?: string;
 }
 
 export async function executeWorkspaceModel(request: WorkspaceExecutionRequest): Promise<CandidateExecutionResult> {
@@ -44,12 +46,16 @@ export async function executeWorkspaceModel(request: WorkspaceExecutionRequest):
       ...(request.boundaryRoot !== undefined ? { boundaryRoot: request.boundaryRoot } : {}),
     },
     ...(request.authorityExpectations ? { authorityExpectations: request.authorityExpectations } : {}),
+    ...(request.executionScratchRoot ? { executionScratchRoot: request.executionScratchRoot } : {}),
   });
 }
 
 export interface ComposedTrialRequest {
   workspaceRoot: string;
+  /** Where the trial composition is assembled (workspace tmp for dev, broker-private for trusted). */
   scratchRoot: string;
+  /** Broker-private execution scratch root (final closure §2); trusted trials stage here. */
+  executionScratchRoot?: string;
   profile: ProfileId;
   poses: Array<Record<string, number>>;
   auditOptions?: Parameters<typeof auditCandidateModule>[1];
@@ -98,6 +104,7 @@ export async function executeComposedDerivedTrial(request: ComposedTrialRequest)
         trustedGeneratedModules: remappedTrusted,
         boundaryRoot: modelDirectory,
       },
+      ...(request.executionScratchRoot ? { executionScratchRoot: request.executionScratchRoot } : {}),
     });
     return {
       result,

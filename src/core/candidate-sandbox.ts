@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, writeFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { SerializedScene } from "./scene-serialization.js";
 import { sanitizeLaunchEnvironment } from "./toolchain.js";
@@ -65,11 +65,10 @@ export class SandboxViolationError extends Error {
 }
 
 function assertStagedPaths(request: SandboxPoseRequest): void {
-  const stageMarker = ".mesh2threejs-candidate-";
   const stage = resolve(request.stageRoot);
   const entry = resolve(request.entryPath);
-  if (!stage.includes(stageMarker)) throw new Error("sandbox execution requires a freshly staged candidate graph");
-  if (!entry.startsWith(stage)) throw new Error("sandbox entry escapes the staged candidate graph");
+  const rel = relative(stage, entry);
+  if (!rel || rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) throw new Error("sandbox entry escapes the staged candidate graph");
 }
 
 /**

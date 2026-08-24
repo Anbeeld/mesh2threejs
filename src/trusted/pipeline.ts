@@ -68,15 +68,24 @@ export interface TrustedPipelineOptions {
   packageRoot?: string;
   /** Test hook: fixed verified toolchain instead of establishing from disk. */
   toolchain?: VerifiedToolchain;
+  /**
+   * Broker-private execution scratch root (final closure §2). Trusted candidate staging is
+   * created INSIDE this directory — outside the workspace, repo, and builder-writable space
+   * — so a workspace mutation after authorization cannot affect the private staged copy.
+   * Required for trusted runs; omitted in tests that inject their own staging.
+   */
+  executionScratchRoot?: string;
 }
 
 export class TrustedPipeline {
   readonly authority: TrustedRunAuthority;
   private readonly toolchainPromise: Promise<VerifiedToolchain>;
   private toolchainValue: VerifiedToolchain | null = null;
+  private readonly executionScratchRoot: string | null;
 
   constructor(options: TrustedPipelineOptions) {
     this.authority = options.authority;
+    this.executionScratchRoot = options.executionScratchRoot ?? null;
     if (options.toolchain) {
       this.toolchainValue = options.toolchain;
       this.toolchainPromise = Promise.resolve(options.toolchain);
@@ -191,7 +200,7 @@ export class TrustedPipeline {
    * workspace. Trusted code routes the profile and computes every policy field — the
    * builder never supplies profile, authorship mode, certification, style, or thresholds.
    */
-  async createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string }, capability: Capability): Promise<{ runId: string }> {
+  async createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string }, capability: Capability): Promise<{ runId: string; intake: string }> {
     assertCapability("create-workspace-run", capability);
     const routedProfile = routeSubject(input.goal);
     if (!/^[\w.-]+$/u.test(basename(input.oraclePath)) && !/\.glb$/iu.test(input.oraclePath)) {
@@ -211,7 +220,8 @@ export class TrustedPipeline {
     if (workspace.state.mirrorOfRun) {
       throw new PipelineError("WORKSPACE_ALREADY_BOUND", `workspace is already bound to trusted run ${workspace.state.mirrorOfRun.mirrorOfRun}`);
     }
-    return this.bindSafeDefaultRun(workspace, "trusted", capability);
+    const result = await this.bindSafeDefaultRun(workspace, "trusted", capability);
+    return { runId: result.runId, intake: "trusted" };
   }
 
   /** Shared safe-default binding: route + policy computation + canonical run creation. */
@@ -386,15 +396,19 @@ export class TrustedPipeline {
 
   /** Read-only oracle facts for autonomous onboarding (§7.1); never mutates anything. */
   async probe(runId: string): Promise<Record<string, unknown>> {
-    const record = await this.authority.readRun(runId);
-    if (!record) throw new PipelineError("RUN_NOT_FOUND", `no trusted run ${runId} exists`);
-    const workspace = await resumeWorkspace(record.workspaceRoot);
+    const record = await this.loadRecord(runId);
+    const workspace = await this.loadRunWorkspace(record);
+    await this.assertBindingsCurrent(record, workspace);
     if (!workspace.project.oracle) throw new PipelineError("NO_ORACLE", "workspace has no oracle reference to probe");
     const oracleRecord = workspace.references.records.find((entry) => entry.kind === "oracle" && entry.operationalPath === workspace.project.oracle);
     if (!oracleRecord) throw new PipelineError("ORACLE_NOT_INDEXED", "workspace oracle is absent from the reference index");
     const { probeGlb } = await import("../core/oracle.js");
     const bytes = await readFile(this.resolveWorkspace(oracleRecord.operationalPath, workspace));
     return {
+      runId,
+      intake: record.intake,
+      profile: record.policy.profile,
+      oracleHash: oracleRecord.sha256,
       status: "probed",
       oraclePath: oracleRecord.operationalPath,
       sha256: oracleRecord.sha256,
@@ -452,6 +466,7 @@ export class TrustedPipeline {
       poses: [neutralPoseForProfile(workspace.project.profile)],
       auditOptions: await (await import("../core/derive.js")).trustedGeneratedAuditOptions(workspace, manifest.binding.identity),
       trusted: true,
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
     });
     const result = await performQuickDiagnosticRun(workspace, manifest.manifest, oracle, { candidateHash: execution.candidateHash }, execution.neutralRoot);
     return {
@@ -490,6 +505,7 @@ export class TrustedPipeline {
       // Tier trials execute the pipeline-owned composition in the bounded child process —
       // never inside the broker (remaining closure §2.6/§2.7).
       backend: trustedDerivedBackend(),
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
     });
     // Lineage re-verification against canonical bindings (defense in depth).
     const fresh = await this.authority.readRun(runId);
@@ -523,6 +539,7 @@ export class TrustedPipeline {
       projectPolicyHash: record.projectPolicyHash,
       artifactRunId: runTag,
       trusted: true,
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
     });
     // Persist evidence artifacts into the workspace reports tree (provenance paths).
     const evidenceDirectory = join(workspace.layout.internal.evidence, runTag);
@@ -654,6 +671,7 @@ export class TrustedPipeline {
       projectPolicyHash: record.projectPolicyHash,
       artifactRunId: `replay-${record.runId}-${record.mirrorSequence + 1}`,
       trusted: true,
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
     });
     if (!computation.evaluation.passed) {
       throw new PipelineError("REPLAY_FAILED", "fresh global replay failed; certification refuses until every gate passes");

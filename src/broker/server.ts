@@ -1,8 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
-import { resolve } from "node:path";
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { resolve, join, dirname } from "node:path";
+import { mkdir, writeFile, readFile, rename } from "node:fs/promises";
 import {
   DirectoryRunAuthorityStore,
   InMemoryRunAuthorityStore,
@@ -12,6 +11,7 @@ import {
   type RunAuthorityRecord,
   type RunAuthorityStore,
 } from "../core/run-authority.js";
+import { RunOperationCoordinator } from "../core/run-coordinator.js";
 import { establishToolchain, sanitizeLaunchEnvironment, assertSafeLaunchEnvironment } from "../core/toolchain.js";
 import { assertCapability, classifyOperation, type Capability } from "../core/capabilities.js";
 import { IMPLEMENTED_BUILDER_ROUTES, RECOGNIZED_ADMIN_ROUTES } from "./operations.js";
@@ -64,11 +64,66 @@ interface BrokerRequest {
   payload?: unknown;
 }
 
+/** Mutating operations that must serialize per run (final closure §3). */
+const MUTATING_OPERATIONS = new Set([
+  "onboard-oracle",
+  "repair-oracle",
+  "register",
+  "oracle-sanity",
+  "derive",
+  "gate",
+  "lock",
+  "reopen",
+  "render-quick",
+  "review-ready",
+  "approve-review",
+  "approve-viewer-start",
+  "viewer-start",
+  "trusted-finalize",
+]);
+
 /** Builder-safe operations are executed for either capability; admin ops require human-admin.
  *  Both sets derive from the canonical registry (src/broker/operations.ts). */
 const BUILDER_SAFE_ROUTES = IMPLEMENTED_BUILDER_ROUTES;
 
 const ADMIN_ROUTES = RECOGNIZED_ADMIN_ROUTES;
+
+/**
+ * Acquires a store lease (final closure §3.4): one live broker per store directory. A second
+ * broker using the same storeRoot fails with BROKER_STORE_IN_USE. Stale-lock recovery is
+ * explicit (the operator deletes the lock file). Returns a release function.
+ */
+async function acquireStoreLease(storeRoot: string | undefined): Promise<() => Promise<void>> {
+  if (!storeRoot) return async () => {};
+  const lockPath = join(resolve(storeRoot), ".broker.lock");
+  await mkdir(resolve(storeRoot), { recursive: true });
+  try {
+    await writeFile(lockPath, `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2)}\n`, { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      let existing = "unknown";
+      try { existing = await readFile(lockPath, "utf8"); } catch { /* unreadable lock */ }
+      throw new Error(`BROKER_STORE_IN_USE: another broker is using ${resolve(storeRoot)} (lock: ${existing.trim()}); stop it first or remove ${lockPath} if stale`);
+    }
+    throw error;
+  }
+  return async () => {
+    try { await import("node:fs/promises").then((fs) => fs.unlink(lockPath)); } catch { /* best-effort cleanup */ }
+  };
+}
+
+/**
+ * Writes a restart-safe builder connection descriptor (final closure §9): a sibling temp file
+ * renamed into place, so a restart on the same store replaces the stale descriptor atomically.
+ * Contains only the builder token, url, broker instance identity, and startedAt — never admin.
+ */
+async function writeBuilderDescriptor(storeRoot: string, builderToken: string, url: string, instanceId: string): Promise<void> {
+  const descriptorPath = join(resolve(storeRoot), "broker-builder-connection.json");
+  const tempPath = `${descriptorPath}.${process.pid}.tmp`;
+  await mkdir(resolve(storeRoot), { recursive: true });
+  await writeFile(tempPath, `${JSON.stringify({ builderToken, url, instanceId, startedAt: new Date().toISOString() }, null, 2)}\n`);
+  await rename(tempPath, descriptorPath);
+}
 
 export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHandle> {
   assertSafeLaunchEnvironment();
@@ -76,10 +131,17 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
   const packageRoot = options.packageRoot ? resolve(options.packageRoot) : resolve(import.meta.dirname, "..", "..");
   const toolchain = options.toolchainOverride ?? await establishToolchain(packageRoot);
   const store = options.store ?? (options.storeRoot ? new DirectoryRunAuthorityStore(options.storeRoot) : new InMemoryRunAuthorityStore());
+  // Store lease (final closure §3.4): one live broker per directory store.
+  const releaseLease = await acquireStoreLease(options.store ? undefined : options.storeRoot);
+  const coordinator = new RunOperationCoordinator();
+  const brokerInstanceId = randomBytes(12).toString("hex");
   const authority = new TrustedRunAuthority(store);
-  const pipeline = new TrustedPipeline({ authority, packageRoot, ...(options.toolchainOverride ? { toolchain: options.toolchainOverride } : {}) });
-  // Bind the already-established toolchain so the pipeline verifies the SAME bytes.
-  if (options.toolchainOverride) (pipeline as unknown as { toolchainValue: unknown }).toolchainValue = toolchain;
+  // Broker-private execution scratch root (final closure §2): staging lives OUTSIDE the
+  // workspace/repo/builder-writable space, inside the broker-owned store directory. A
+  // workspace mutation after authorization cannot affect the private staged copy.
+  const executionScratchRoot = options.storeRoot ? join(resolve(options.storeRoot), "runtime", "executions") : undefined;
+  if (executionScratchRoot) await mkdir(executionScratchRoot, { recursive: true });
+  const pipeline = new TrustedPipeline({ authority, packageRoot, toolchain, ...(executionScratchRoot ? { executionScratchRoot } : {}) });
   const builderToken = randomBytes(24).toString("hex");
   const adminToken = randomBytes(24).toString("hex");
 
@@ -119,6 +181,9 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
       }
       void classifyOperation;
       const runId = request.runId;
+      // Per-run serialization coordinator (final closure §3): mutating operations serialize
+      // per runId so no stale gate/derive/review can race a reopen and resurrect stale state.
+      const executeMutating = <T>(runId: string, fn: () => Promise<T>): Promise<T> => coordinator.runExclusive(runId, fn);
       switch (operation) {
         case "find-runs":
           respond(res, 200, { runs: await store.find() });
@@ -149,39 +214,39 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
           return;
         case "onboard-oracle":
           requireRun(runId);
-          respond(res, 200, await pipeline.onboardOracle(runId!, (request.payload ?? {}) as never, capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.onboardOracle(runId!, (request.payload ?? {}) as never, capability)));
           return;
         case "repair-oracle":
           requireRun(runId);
-          respond(res, 200, await pipeline.repairOracle(runId!, (request.payload ?? {}) as never));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.repairOracle(runId!, (request.payload ?? {}) as never)));
           return;
         case "register":
           requireRun(runId);
-          respond(res, 200, await pipeline.register(runId!, (request.payload ?? {}) as never));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.register(runId!, (request.payload ?? {}) as never)));
           return;
         case "oracle-sanity":
           requireRun(runId);
-          respond(res, 200, await pipeline.oracleSanity(runId!));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.oracleSanity(runId!)));
           return;
         case "derive":
           requireRun(runId);
-          respond(res, 200, await pipeline.derive(runId!, (request.payload ?? {}) as { quality?: "aggressive" | "balanced" | "conservative" }, capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.derive(runId!, (request.payload ?? {}) as { quality?: "aggressive" | "balanced" | "conservative" }, capability)));
           return;
         case "gate":
           requireRun(runId);
-          respond(res, 200, await pipeline.gate(runId!, (request.payload ?? {}) as { global?: boolean }, capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.gate(runId!, (request.payload ?? {}) as { global?: boolean }, capability)));
           return;
         case "lock":
           requireRun(runId);
-          respond(res, 200, await pipeline.lock(runId!, (request.payload as { phase?: string } | undefined)?.phase, capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.lock(runId!, (request.payload as { phase?: string } | undefined)?.phase, capability)));
           return;
         case "reopen":
           requireRun(runId);
-          respond(res, 200, await pipeline.reopen(runId!, (request.payload ?? {}) as { phase: string; reason: string }, capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.reopen(runId!, (request.payload ?? {}) as { phase: string; reason: string }, capability)));
           return;
         case "render-quick":
           requireRun(runId);
-          respond(res, 200, await pipeline.renderQuick(runId!));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.renderQuick(runId!)));
           return;
         case "probe":
           requireRun(runId);
@@ -193,7 +258,7 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
           return;
         case "review-ready":
           requireRun(runId);
-          respond(res, 200, await pipeline.reviewReady(runId!));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.reviewReady(runId!)));
           return;
         case "viewer-status":
           requireRun(runId);
@@ -201,19 +266,19 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
           return;
         case "approve-review":
           requireRun(runId);
-          respond(res, 200, await pipeline.approveReview(runId!, ((request.payload ?? {}) as { method?: "broker-console" }), capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.approveReview(runId!, ((request.payload ?? {}) as { method?: "broker-console" }), capability)));
           return;
         case "approve-viewer-start":
           requireRun(runId);
-          respond(res, 200, await pipeline.approveViewerStart(runId!, capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.approveViewerStart(runId!, capability)));
           return;
         case "viewer-start":
           requireRun(runId);
-          respond(res, 200, await pipeline.viewerStart(runId!, capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.viewerStart(runId!, capability)));
           return;
         case "trusted-finalize":
           requireRun(runId);
-          respond(res, 200, await pipeline.finalize(runId!, capability));
+          respond(res, 200, await executeMutating(runId!, () => pipeline.finalize(runId!, capability)));
           return;
         case "certify":
         case "record-human-approval":
@@ -241,14 +306,11 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
     });
   });
 
-  // §10.G3: only a BUILDER connection descriptor is persisted, and it contains no admin
-  // secret. The admin token goes to the operator's console/human channel only.
-  const persistBuilderDescriptor = async (): Promise<void> => {
-    if (!options.storeRoot) return;
-    await mkdir(options.storeRoot, { recursive: true });
-    await writeFile(join(options.storeRoot, "broker-builder-connection.json"), `${JSON.stringify({ builderToken, url: `http://127.0.0.1:${port}` }, null, 2)}\n`, { flag: "wx" });
-  };
-  await persistBuilderDescriptor();
+  // §10.G3 + final closure §9: only a BUILDER connection descriptor is persisted, atomically
+  // replaced on restart so a stale descriptor never blocks recovery. Contains no admin secret.
+  if (options.storeRoot) {
+    await writeBuilderDescriptor(options.storeRoot, builderToken, `http://127.0.0.1:${port}`, brokerInstanceId);
+  }
 
   return {
     url: `http://127.0.0.1:${port}`,
@@ -261,6 +323,7 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
     pipeline,
     close: async () => {
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      await releaseLease();
     },
   };
 }

@@ -87,3 +87,11 @@ export function assertCapability(operation: OperationName, capability: Capabilit
   if (required === "development-only") throw new Error(`operation ${operation} is development-only and cannot mutate a trusted run`);
   throw new Error(`unknown operation: ${operation}`);
 }
+
+/**
+ * v1 limitation (final closure §11): one trusted broker instance is assumed to serve one
+ * builder authority domain. The broker-wide builder token can discover and operate on every
+ * run. Run-scoped capability binding (token.runId must equal request.runId) is deferred to a
+ * future release. Until then, deployments that need multi-agent isolation must run separate
+ * broker instances with separate stores.
+ */

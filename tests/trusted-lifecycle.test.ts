@@ -50,11 +50,8 @@ describe("trusted broker reconstruction lifecycle (I1)", () => {
     await mkdir(root, { recursive: true });
     const source = join(parent, "tank.glb");
     await writeFile(source, sceneToGlb(createSlopedTank()));
-
     // Workspace scaffolding happens on the development surface; every TRUSTED act below
-    // goes through the broker.
-    const init = io();
-    expect(await runCli(["init", root, "--id", "broker-lifecycle", "--goal", "synthetic tank reconstruction", "--profile", "tank", "--oracle", source], init.sink)).toBe(0);
+    // goes through the broker. The trusted intake creates the workspace itself.
 
     const broker = await startBroker({ toolchainOverride });
     roots.push(broker.url);
@@ -62,8 +59,9 @@ describe("trusted broker reconstruction lifecycle (I1)", () => {
       const builder = new BrokerClient({ url: broker.url, token: broker.builderToken });
       const admin = new BrokerClient({ url: broker.url, token: broker.adminToken });
 
-      // ---- Safe-default autonomous begin-run ------------------------------------------
-      const { runId } = await builder.beginRun(root);
+      // ---- Trusted intake: admin creates the workspace+run pinned to the oracle ---
+      const created = await admin.createWorkspaceRun({ workspaceRoot: root, goal: "synthetic tank reconstruction", oraclePath: source });
+      const runId = created.runId;
       expect(runId).toMatch(/^run-/);
       // A second begin on the same workspace is refused (already bound).
       await expect(builder.beginRun(root)).rejects.toThrow(/already bound/i);

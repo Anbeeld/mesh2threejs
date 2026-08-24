@@ -168,7 +168,8 @@ export function combineDependencyIdentity(dependencies: ReadonlyArray<RuntimeDep
 
 /** Generates the toolchain manifest from the actual bytes under `packageRoot`. */
 export async function generateToolchainManifest(packageRoot: string): Promise<ToolchainManifest> {
-  const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { name: string; version: string };
+  const pkgPath = join(packageRoot, "package.json");
+  const pkg = JSON.parse(await readFile(pkgPath, "utf8")) as { name: string; version: string };
   const runtimeFiles: Array<{ root: string; glob: string[] }> = RUNTIME_ROOTS.map((root) => ({ root, glob: [] }));
   const runtimePaths: string[] = [];
   for (const { root } of runtimeFiles) runtimePaths.push(...await listFilesRecursive(join(packageRoot, root)));

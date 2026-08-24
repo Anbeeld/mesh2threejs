@@ -51,6 +51,11 @@ export interface DeriveOptions {
    * closure §2.7) so tier trials never execute inside the broker process.
    */
   backend?: import("./candidate-sandbox.js").SandboxBackend;
+  /**
+   * Broker-private execution scratch root (final closure §2). Trusted callers pass this so
+   * tier-trial staging lives outside the workspace/repo; development callers omit it.
+   */
+  executionScratchRoot?: string;
 }
 
 export interface DeriveTierResult {
@@ -799,7 +804,8 @@ async function evaluateTrialComposition(
   oracle: THREE.Object3D,
   authoritativeDimensions: Record<string, number> | undefined,
   auditOptions: { trustedGeneratedModules: Map<string, unknown> },
-  backend?: import("./candidate-sandbox.js").SandboxBackend,
+  backend: import("./candidate-sandbox.js").SandboxBackend | undefined,
+  executionScratchRoot?: string,
 ): Promise<{
   passed: boolean;
   score: number;
@@ -824,6 +830,7 @@ async function evaluateTrialComposition(
     poses,
     auditOptions,
     ...(backend ? { backend } : {}),
+    ...(executionScratchRoot ? { executionScratchRoot } : {}),
   });
   try {
     if (!trial.result.audit.passed) throw new Error(`trial composition audit failed: ${trial.result.audit.findings.map((finding) => finding.code).join(", ")}`);
@@ -1101,7 +1108,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     await wireGeneratedComposition(workspace, orderedDerivedPhases(workspace.project.profile, [trialManifestSeed, ...(await readAllManifests(workspace)).filter((manifest) => manifest.phase !== phase)]));
     let verdict: Awaited<ReturnType<typeof evaluateTrialComposition>>;
     try {
-      verdict = await evaluateTrialComposition(workspace, phase, oracle, authoritativeDimensions, await trialAuditOptions(), options.backend);
+      verdict = await evaluateTrialComposition(workspace, phase, oracle, authoritativeDimensions, await trialAuditOptions(), options.backend, options.executionScratchRoot);
     } catch (error) {
       // A trial that cannot even execute (e.g. audit failure) is a failing tier, not a crash:
       // the derive ladder must remain bounded and informative.

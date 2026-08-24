@@ -348,23 +348,50 @@ export interface StagedCandidateGraph {
  * load sees the bytes that produced the source hash. Each byte is re-hashed against the
  * pre-execution audit ledger during the copy (remaining closure §2.5).
  */
-export async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudit): Promise<StagedCandidateGraph> {
+export interface StageCandidateGraphOptions {
+  /**
+   * Broker-private execution root (final closure §2). When supplied, staging is created
+   * INSIDE this directory — outside the workspace, repo, and builder-writable space — so a
+   * workspace mutation after authorization cannot affect the private copy. When omitted,
+   * staging falls back to a temp directory under the graph's common ancestor (development).
+   */
+  stagingRoot?: string;
+  /**
+   * Pre-execution authority ledger (remaining closure §2.1). When supplied, every file is
+   * re-hashed against this ledger BEFORE the staged copy is written, and the staged copy is
+   * re-hashed AFTER writing. Either mismatch throws CANDIDATE_STAGE_DRIFT.
+   */
+  authorityLedger?: ReadonlyArray<{ absolutePath: string; sha256: string }>;
+}
+
+export async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudit, options?: StageCandidateGraphOptions): Promise<StagedCandidateGraph> {
   const entry = resolve(entryPath);
-  const hashByAbsolute = new Map(audit.candidateFiles.map((file) => [resolve(dirname(entry), file.path), file.sha256]));
+  const ledger = options?.authorityLedger;
+  const hashByAbsolute = ledger
+    ? new Map(ledger.map((file) => [resolve(file.absolutePath), file.sha256]))
+    : new Map(audit.candidateFiles.map((file) => [resolve(dirname(entry), file.path), file.sha256]));
   const files = audit.files.map((file) => resolve(file));
   if (files.some((file) => !hashByAbsolute.has(file))) throw new Error("candidate audit files and hashes disagree");
   const ancestor = commonAncestor([entry, ...files]);
-  const root = await mkdtemp(join(ancestor, STAGE_PREFIX));
+  const root = options?.stagingRoot ? await mkdtemp(join(resolve(options.stagingRoot), "exec-")) : await mkdtemp(join(ancestor, STAGE_PREFIX));
   try {
     const stagedFiles: Array<{ absolutePath: string; stagedPath: string }> = [];
     for (const file of files) {
       const bytes = await readFile(file);
-      if (sha256(bytes) !== hashByAbsolute.get(file)) {
+      const expected = hashByAbsolute.get(file);
+      if (!expected || sha256(bytes) !== expected) {
         throw new Error("CANDIDATE_CHANGED_DURING_AUTHORIZATION: candidate bytes changed between authority audit and staging; rerun from a fresh audit");
       }
       const staged = resolve(root, relative(ancestor, file));
       await mkdir(dirname(staged), { recursive: true });
       await writeFile(staged, bytes, { flag: "wx" });
+      // Post-write re-verification (final closure §2): the staged copy must hash to the same
+      // value as the authority ledger. A mismatch means the staged file was altered between
+      // write and re-read, or the filesystem is unreliable.
+      const stagedBytes = await readFile(staged);
+      if (sha256(stagedBytes) !== expected) {
+        throw new Error("CANDIDATE_STAGE_DRIFT: staged copy hash disagrees with the authority ledger; rerun from a fresh audit");
+      }
       stagedFiles.push({ absolutePath: file, stagedPath: staged });
     }
     await exposePipelineThree(root);

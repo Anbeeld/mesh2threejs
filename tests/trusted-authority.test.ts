@@ -221,6 +221,7 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
       toolchain,
       defaults: { hasOracle: true, routedProfile: "tank" },
       requestedBy: "human-admin",
+      intake: "trusted",
     });
     // No execution authority recorded yet: certification refuses.
     await expect(authority.certify("run-cert", { requestedBy: "human-admin" })).rejects.toThrow(/trusted-derived-generated/);

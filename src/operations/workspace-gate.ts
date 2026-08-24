@@ -79,6 +79,8 @@ export async function inspectWorkspaceCandidateViaExecutor(input: {
   trusted?: boolean;
   /** Derived byte expectations; required for trusted derived runs, computed by trusted code. */
   authorityExpectations?: DerivedGraphExpectations;
+  /** Broker-private execution scratch root (final closure §2); trusted callers pass this. */
+  executionScratchRoot?: string;
 }): Promise<WorkspaceExecutionInspection & { auditFiles: ReadonlyArray<string>; trustedGeneratedModules: ReadonlyArray<string>; graphAuthority: import("../core/exec-authority.js").ExecutableGraphAuthority }> {
   const { executeWorkspaceModel, deserializeExecutionSamples } = await import("../core/composition-exec.js");
   const result = await executeWorkspaceModel({
@@ -89,6 +91,7 @@ export async function inspectWorkspaceCandidateViaExecutor(input: {
     auditOptions: input.auditOptions,
     backend: input.trusted ? resolveTrustedBackend(input.backend) : input.backend ?? (await import("../core/dev-sandbox.js")).developmentInProcessBackend(),
     ...(input.authorityExpectations ? { authorityExpectations: input.authorityExpectations } : {}),
+    ...(input.executionScratchRoot ? { executionScratchRoot: input.executionScratchRoot } : {}),
   });
   const samples = deserializeExecutionSamples(result);
   const neutralSerialization = result.samples[0]!.serialization;
@@ -159,6 +162,8 @@ export async function computeWorkspaceGate(workspace: ResumedWorkspace, options:
   artifactRunId: string;
   /** Trusted execution route (§2.7): never in-process; byte-verified derived authority. */
   trusted?: boolean;
+  /** Broker-private execution scratch root (final closure §2); trusted callers pass this. */
+  executionScratchRoot?: string;
 }): Promise<GateComputation> {
   const { verifyWorkspaceOraclePreparation } = await import("../core/workspace.js");
   const preparation = await verifyWorkspaceOraclePreparation(workspace);
@@ -195,6 +200,7 @@ export async function computeWorkspaceGate(workspace: ResumedWorkspace, options:
     ...(options.trusted ? { trusted: true } : {}),
     ...(authorityExpectations ? { authorityExpectations } : {}),
     ...(options.backend ? { backend: options.backend } : {}),
+    ...(options.executionScratchRoot ? { executionScratchRoot: options.executionScratchRoot } : {}),
   });
   if (!isGlobal) assertPhaseSemanticScope(profile, activePhase, execution.neutralRoot);
   const executionAuthority = execution.graphAuthority.authority;

@@ -183,7 +183,12 @@ export type BuilderAction =
 
 export interface RunAuthorityStore {
   load(runId: string): Promise<RunAuthorityRecord>;
-  save(record: RunAuthorityRecord): Promise<void>;
+  /**
+   * Compare-and-swap persist (final closure §3). When expectedSequence is provided, the
+   * store MUST refuse the save if the current on-disk mirrorSequence does not equal it.
+   * Returns the saved record. Throws RUN_STATE_CHANGED_DURING_OPERATION on mismatch.
+   */
+  save(record: RunAuthorityRecord, expectedSequence?: number): Promise<void>;
   find(): Promise<Array<Pick<RunAuthorityRecord, "runId" | "workspaceRoot" | "status">>>;
 }
 
@@ -194,7 +199,13 @@ export class InMemoryRunAuthorityStore implements RunAuthorityStore {
     if (!record) throw new Error(`unknown run: ${runId}`);
     return structuredClone(record);
   }
-  async save(record: RunAuthorityRecord): Promise<void> {
+  async save(record: RunAuthorityRecord, expectedSequence?: number): Promise<void> {
+    if (expectedSequence !== undefined) {
+      const current = this.runs.get(record.runId);
+      if (current && current.mirrorSequence !== expectedSequence) {
+        throw new Error(`RUN_STATE_CHANGED_DURING_OPERATION: run ${record.runId} was modified by another operation (expected sequence ${expectedSequence}, found ${current.mirrorSequence})`);
+      }
+    }
     this.runs.set(record.runId, structuredClone(record));
   }
   async find() {
@@ -214,7 +225,18 @@ export class DirectoryRunAuthorityStore implements RunAuthorityStore {
     if (value.schemaVersion !== 1 || value.runId !== runId) throw new Error(`authority record is invalid or mismatched: ${runId}`);
     return value;
   }
-  async save(record: RunAuthorityRecord): Promise<void> {
+  async save(record: RunAuthorityRecord, expectedSequence?: number): Promise<void> {
+    if (expectedSequence !== undefined) {
+      try {
+        const current = JSON.parse(await readFile(this.path(record.runId), "utf8")) as RunAuthorityRecord;
+        if (current.mirrorSequence !== expectedSequence) {
+          throw new Error(`RUN_STATE_CHANGED_DURING_OPERATION: run ${record.runId} was modified by another operation (expected sequence ${expectedSequence}, found ${current.mirrorSequence})`);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // First save for a new run: the expected sequence must be 0 or undefined.
+      }
+    }
     await mkdir(dirname(this.path(record.runId)), { recursive: true });
     const temporary = `${this.path(record.runId)}.${process.pid}.tmp`;
     await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { flag: "wx" });
@@ -330,6 +352,7 @@ export class TrustedRunAuthority {
   async applyBuilderTransition(runId: string, action: BuilderAction, context: RunTransitionContext): Promise<RunAuthorityRecord> {
     if (context.requestedBy !== "builder" && context.requestedBy !== "human-admin") throw new Error(`unsupported capability for builder transitions: ${context.requestedBy}`);
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     if (record.status === "certified") throw new Error(`trusted run ${runId} is already certified; no further builder transitions apply`);
     const next = clone(record);
     const state = next.embedded.state;
@@ -369,7 +392,7 @@ export class TrustedRunAuthority {
       }
     }
     next.mirrorSequence += 1;
-    await this.store.save(next);
+    await this.store.save(next, expectedSequence);
     return next;
   }
 
@@ -408,6 +431,7 @@ export class TrustedRunAuthority {
     stateAfter?: TaskState;
   }): Promise<RunAuthorityRecord> {
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     let state = input.stateAfter ? clone(input.stateAfter) : next.embedded.state;
     state = bindCandidatePhases(state, input.candidateHash, input.phaseGeometryHashes, input.evaluationIdentity);
@@ -416,7 +440,7 @@ export class TrustedRunAuthority {
     next.review.candidateHash = input.candidateHash;
     next.embedded.state = state;
     if (changed || (next.review.humanApproval && next.review.humanApproval.candidateHash !== input.candidateHash)) this.invalidateReviewAndReplay(next);
-    return this.persistComputed(next);
+    return this.persistComputed(next, expectedSequence);
   }
 
   /** INTERNAL — trusted pipeline only. Records derived bindings produced by trusted derive code. */
@@ -428,6 +452,7 @@ export class TrustedRunAuthority {
     stateAfter?: TaskState;
   }): Promise<RunAuthorityRecord> {
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     let state = input.stateAfter ? clone(input.stateAfter) : next.embedded.state;
     state.derivedBindings = clone(input.bindings);
@@ -439,7 +464,7 @@ export class TrustedRunAuthority {
       if (changed) this.invalidateReviewAndReplay(next);
     }
     next.embedded.state = state;
-    return this.persistComputed(next);
+    return this.persistComputed(next, expectedSequence);
   }
 
   /** INTERNAL — trusted pipeline only. Binds an onboarded/repaired oracle preparation. */
@@ -450,6 +475,7 @@ export class TrustedRunAuthority {
   }): Promise<RunAuthorityRecord> {
     const { bindOraclePreparation, setAuthoritativeDimensionStatus } = await import("./state.js");
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     let state = next.embedded.state;
     state = bindOraclePreparation(state, input.binding, input.reason);
@@ -458,7 +484,7 @@ export class TrustedRunAuthority {
     next.embedded.state = state;
     // A new preparation invalidates any prior approval and replay (§16/§18).
     this.invalidateReviewAndReplay(next);
-    return this.persistComputed(next);
+    return this.persistComputed(next, expectedSequence);
   }
 
   /** INTERNAL — trusted pipeline only. Records registration evidence computed against the live oracle. */
@@ -471,13 +497,14 @@ export class TrustedRunAuthority {
     const { recordEvidenceArtifact, bindEvidenceConfig, bindOracle } = await import("./state.js");
     verifyEvidenceArtifact(input.artifact);
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     let state = input.stateAfter ? clone(input.stateAfter) : next.embedded.state;
     state = bindOracle(state, input.oracleHash);
     state = bindEvidenceConfig(state, "registration", input.configHash, "registration expectation changed");
     state = recordEvidenceArtifact(state, "", input.artifact);
     next.embedded.state = state;
-    return this.persistComputed(next);
+    return this.persistComputed(next, expectedSequence);
   }
 
   /**
@@ -487,13 +514,14 @@ export class TrustedRunAuthority {
    */
   async recordComputedReviewPacket(runId: string, binding: ReviewBinding): Promise<RunAuthorityRecord> {
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     next.review = {
       ...clone(binding),
       humanApproval: null,
     };
     next.status = "awaiting-human-review";
-    return this.persistComputed(next);
+    return this.persistComputed(next, expectedSequence);
   }
 
   /**
@@ -502,6 +530,7 @@ export class TrustedRunAuthority {
    */
   async recordComputedReplay(runId: string, replay: TrustedReplayRecord): Promise<RunAuthorityRecord> {
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     if (!replay.passed) throw new Error("a failing replay cannot be recorded as the trusted final replay");
     if (replay.candidateHash !== next.candidateHash) throw new Error("computed replay does not match the canonical candidate");
@@ -510,29 +539,31 @@ export class TrustedRunAuthority {
     next.finalReplay = clone(replay);
     next.review.replayHash = replay.replayHash;
     if (changed && next.review.humanApproval) this.invalidateReviewAndReplay(next);
-    return this.persistComputed(next);
+    return this.persistComputed(next, expectedSequence);
   }
 
   /** INTERNAL — trusted pipeline only. Records execution provenance established at runtime. */
   async recordExecutionAuthority(runId: string, execution: NonNullable<RunAuthorityRecord["candidateExecution"]>): Promise<RunAuthorityRecord> {
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     next.candidateExecution = clone(execution);
-    return this.persistComputed(next);
+    return this.persistComputed(next, expectedSequence);
   }
 
   private async saveComputed(runId: string, stateAfter: TaskState, validate: (next: RunAuthorityRecord) => void): Promise<RunAuthorityRecord> {
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     next.embedded.state = clone(stateAfter);
     validate(next);
-    return this.persistComputed(next);
+    return this.persistComputed(next, expectedSequence);
   }
 
-  private async persistComputed(next: RunAuthorityRecord): Promise<RunAuthorityRecord> {
+  private async persistComputed(next: RunAuthorityRecord, expectedSequence?: number): Promise<RunAuthorityRecord> {
     if (next.status === "certified") throw new Error("a certified run no longer accepts computed records");
     next.mirrorSequence += 1;
-    await this.store.save(next);
+    await this.store.save(next, expectedSequence);
     return next;
   }
 
@@ -545,6 +576,7 @@ export class TrustedRunAuthority {
   async approveReview(runId: string, input: { method: HumanApproval["method"] }, context: RunTransitionContext): Promise<RunAuthorityRecord> {
     assertCapability("record-human-approval", context.requestedBy);
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const next = clone(record);
     const replay = next.finalReplay;
     if (!replay || !replay.passed) throw new Error("human approval requires a passing trusted global replay recorded first");
@@ -564,7 +596,7 @@ export class TrustedRunAuthority {
       next.finalReplay = null;
       if (next.status === "awaiting-human-review") next.status = "active";
       next.mirrorSequence += 1;
-      await this.store.save(next);
+      await this.store.save(next, expectedSequence);
       throw new Error(`${detail}\nthe review binding is invalidated; run review-ready again for a new capture set`);
     }
     const approval: HumanApproval = {
@@ -605,7 +637,7 @@ export class TrustedRunAuthority {
     next.embedded.state = state;
     next.review.humanApproval = approval;
     next.mirrorSequence += 1;
-    await this.store.save(next);
+    await this.store.save(next, expectedSequence);
     return next;
   }
 
@@ -617,8 +649,12 @@ export class TrustedRunAuthority {
   async certify(runId: string, context: RunTransitionContext): Promise<RunAuthorityRecord> {
     assertCapability("certify", context.requestedBy);
     const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
     const state = record.embedded.state;
     const problems: string[] = [];
+    // Full trusted certification requires trusted intake (final closure §4): a builder-
+    // prepared workspace cannot silently receive the same provenance claim.
+    if (record.intake !== "trusted") problems.push("TRUSTED_INTAKE_REQUIRED: full certification requires trusted intake (create-workspace-run); builder-prepared runs cannot certify");
     const executionAuthority = record.candidateExecution?.authority;
     if (executionAuthority !== "trusted-derived-generated" && executionAuthority !== "trusted-host-sandbox") {
       problems.push(`trusted certification requires trusted-derived-generated or trusted-host-sandbox execution (current: ${executionAuthority ?? "unrecorded"})`);
@@ -659,7 +695,7 @@ export class TrustedRunAuthority {
     next.embedded.state.status = "certified";
     next.embedded.state.phaseStatus.final = "passed";
     next.mirrorSequence += 1;
-    await this.store.save(next);
+    await this.store.save(next, expectedSequence);
     return next;
   }
 }
