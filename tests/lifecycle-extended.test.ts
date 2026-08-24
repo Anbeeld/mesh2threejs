@@ -73,7 +73,7 @@ describe("extended durable CLI", () => {
     expect(await runCli(["replay-gates", replayPath], io().sink)).toBe(0);
   });
 
-  test("prepares and records a genuine external visual verdict", async () => {
+  test("a builder-created verdict JSON is diagnostic data only and never human approval", async () => {
     const root = await mkdtemp(join(tmpdir(), "mesh2threejs-review-"));
     const statePath = join(root, ".mesh2threejs", "state.json");
     await runCli(["init", "--workspace", root, "--id", "review", "--goal", "fixture", "--profile", "generic"], io().sink);
@@ -98,7 +98,10 @@ describe("extended durable CLI", () => {
     const verdictPath = join(root, "verdict.json"); await writeFile(verdictPath, JSON.stringify(verdict));
     const recording = io();
     expect(await runCli(["record-review", manualStatePath, "--packet", packetPath, "--verdict", verdictPath, "--artifact", join(root, "evidence", "visual.json")], recording.sink), recording.output.join("\n")).toBe(0);
-    expect((await loadTaskState(manualStatePath)).visualReviewStatus).toBe("passed");
+    // Fail-closed review authority (§15.3): a model/builder-produced PASS stays diagnostic.
+    const recorded = await loadTaskState(manualStatePath);
+    expect(recorded.visualReviewStatus).toBe("awaiting");
+    expect(recorded.evidence["visual-assessment-0001"]?.authority).toBe("automated-visual-diagnostic");
   });
 
   test("does not reinterpret an invalid workspace as a low-level input file", async () => {

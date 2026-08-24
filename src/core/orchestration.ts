@@ -61,7 +61,7 @@ function phaseGeometryHashes(profile: ProfileId, snapshot: ReturnType<typeof sna
     const fittingsGeometry = fingerprintSnapshot(snapshot, undefined, { includeMaterials: false });
     return {
     hull: fingerprintSnapshot(snapshot, matching((id) => id.startsWith("hull")), { includeMaterials: false }),
-    turret: fingerprintSnapshot(snapshot, matching((id) => id === "turret" || id === "turret-pivot" || id === "cupola"), { includeMaterials: false }),
+    turret: fingerprintSnapshot(snapshot, matching((id) => id === "turret" || id === "turret-pivot" || id === "cupola" || /^turret(?:[-_ ].*)?$/u.test(id)), { includeMaterials: false }),
     gun: fingerprintSnapshot(snapshot, matching((id) => id === "gun" || id === "gun-pivot"), { includeMaterials: false }),
     "running-gear": fingerprintSnapshot(snapshot, matching((id, role) => ["road-wheel", "sprocket", "idler", "return-roller"].includes(role ?? "") || /^(road-wheel|sprocket|idler|return-roller)-/u.test(id)), { includeMaterials: false }),
     tracks: fingerprintSnapshot(snapshot, matching((id, role) => role === "track-course" || id.startsWith("track-")), { includeMaterials: false }),
@@ -236,6 +236,106 @@ export async function evaluateCandidateWithPoses(input: EvaluateCandidateWithPos
  */
 export function evaluateCandidateForPhase(input: EvaluateCandidateWithPosesInput & { phase: string }): Promise<PosedEvaluationBundle> {
   return evaluateCandidateWithPoses({ ...input, phase: input.phase });
+}
+
+export interface CandidateSampleInput {
+  pose: Record<string, number>;
+  /** Trusted reconstruction of the sandboxed candidate at exactly this pose. */
+  root: THREE.Object3D;
+}
+
+export interface EvaluateCandidateFromSamplesInput extends Omit<EvaluateCandidateInput, "candidate"> {
+  /** Sample 0 must be the neutral pose; further samples carry explicit pose values. */
+  candidateSamples: ReadonlyArray<CandidateSampleInput>;
+}
+
+/**
+ * Authoritative evaluation over CandidateExecutor output (§9): every consumer receives
+ * trusted serialized scenes reconstructed by pipeline code, and no untrusted runtime
+ * object or live setPose is consulted. Pose-dependent rows are computed from the sample
+ * whose recorded pose matches the requested control value exactly.
+ */
+export async function evaluateCandidateFromSamples(input: EvaluateCandidateFromSamplesInput): Promise<PosedEvaluationBundle> {
+  if (!input.candidateSamples.length) throw new Error("candidate evaluation requires at least a neutral pose sample");
+  const neutralSample = input.candidateSamples[0]!;
+  const posedByControlValue = new Map<string, THREE.Object3D>();
+  for (const sample of input.candidateSamples.slice(1)) {
+    for (const [control, value] of Object.entries(sample.pose)) {
+      if (Math.abs(value) <= 1e-12) continue;
+      posedByControlValue.set(`${control}\u0000${value}`, sample.root);
+    }
+  }
+  const evaluationInput = {
+    ...input,
+    candidate: neutralSample.root,
+    ...(input.candidateSourceHash ? { candidateSourceHash: input.candidateSourceHash } : {}),
+  };
+  const oracleSnapshot = input.performance?.measure("oracle-snapshot-construction", () => snapshotScene(input.oracle)) ?? snapshotScene(input.oracle);
+  const candidateSnapshot = input.performance?.measure("candidate-snapshot-construction", () => snapshotScene(neutralSample.root)) ?? snapshotScene(neutralSample.root);
+  const base = evaluateSnapshots(evaluationInput, oracleSnapshot, candidateSnapshot);
+  const rows: GateRow[] = [];
+  const profileContract = getProfileContract(input.profile);
+  const controls = input.profile === "generic" ? input.subjectContract?.articulation ?? [] : profileContract.articulation;
+  const articulationPhase = profileContract.gates.find((gate) => gate.code === "articulation.poses")?.phase ?? "attachments";
+  const includeArticulation = !input.phase || input.phase === articulationPhase;
+  if (includeArticulation && controls.length) {
+    const semanticSnapshot = snapshotScene(neutralSample.root);
+    const allSemantics = Object.keys(semanticSnapshot.components);
+    const origin = captureSemanticTransforms(neutralSample.root);
+    for (const control of controls) {
+      for (const [sampleIndex, value] of control.samples.entries()) {
+        if (Math.abs(value) <= 1e-12) continue;
+        const code = `articulation.pose.${control.control}.${sampleIndex}`;
+        const posedRoot = posedByControlValue.get(`${control.control}\u0000${value}`);
+        try {
+          if (!posedRoot) throw new Error(`executor did not return a sample for ${control.control}=${value}`);
+          const moving = allSemantics.filter((id) => {
+            let current = semanticSnapshot.components[id];
+            while (current) {
+              if (control.moving.includes(current.id)) return true;
+              current = current.parentSemanticId ? semanticSnapshot.components[current.parentSemanticId] : undefined;
+            }
+            return false;
+          });
+          const stationary = [...new Set([...control.stationary, ...allSemantics.filter((id) => !moving.includes(id))])];
+          const transformResult = checkArticulation(origin, captureSemanticTransforms(posedRoot), { moving, stationary, epsilon: 1e-8 });
+          const posedSnapshot = snapshotScene(posedRoot);
+          const spatialRows = input.profile === "tank" ? evaluateTankPoseRows(oracleSnapshot, posedSnapshot) : evaluateGenericPoseRows(oracleSnapshot, posedSnapshot, input.subjectContract);
+          const passed = transformResult.passed && spatialRows.every((row) => row.passed);
+          const failures = [
+            ...transformResult.rows.filter((row) => !row.passed).map((row) => `${row.semanticId} ${row.expected}`),
+            ...spatialRows.filter((row) => !row.passed).map((row) => row.code),
+          ];
+          rows.push({ code, phase: articulationPhase, component: control.control, passed, score: passed ? 100 : 0, severity: "critical", message: passed ? `${control.control}=${value} moves only owned, seated components` : `${control.control}=${value} failed: ${failures.join(", ")}` });
+        } catch (error) {
+          rows.push({ code, phase: articulationPhase, component: control.control, passed: false, score: 0, severity: "critical", message: `pose control failed: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      }
+    }
+  }
+  const articulation: GateReport = { profile: input.profile, passed: rows.every((row) => row.passed), score: rows.length ? Math.min(...rows.map((row) => row.score)) : 100, rows, workorders: [] };
+  const contract = input.phase ? { ...profileContract, gates: profileContract.gates.filter((gate) => gate.phase === input.phase) } : profileContract;
+  const contractGates = evaluateProfileContractGates(contract, { deterministic: base.deterministic.rows, ...(includeArticulation ? { articulation: articulation.rows } : {}), style: base.style.rows });
+  const phaseGates = splitContractGatesByPhase(input.profile, contractGates);
+  if (includeArticulation && articulation.rows.length) {
+    const current = phaseGates[articulationPhase] ?? { profile: input.profile, passed: true, score: 100, rows: [], workorders: [] };
+    phaseGates[articulationPhase] = { ...current, passed: current.passed && articulation.passed, score: Math.min(current.score, articulation.score), rows: [...current.rows, ...articulation.rows] };
+  }
+  return { ...base, articulation, contractGates, phaseGates, passed: base.passed && (includeArticulation ? base.style.passed && articulation.passed : true) && contractGates.passed };
+}
+
+/** Pose list required to evaluate a profile/subject: neutral first, then each control sample. */
+export function requiredPosesForProfile(profile: ProfileId, subjectContract?: GenericSubjectContract): Array<Record<string, number>> {
+  const controls = profile === "generic" ? subjectContract?.articulation ?? [] : getProfileContract(profile).articulation;
+  const neutral = Object.fromEntries(controls.map((control) => [control.control, 0]));
+  const poses: Array<Record<string, number>> = [neutral];
+  for (const control of controls) {
+    for (const value of control.samples) {
+      if (Math.abs(value) <= 1e-12) continue;
+      poses.push({ ...neutral, [control.control]: value });
+    }
+  }
+  return poses;
 }
 
 export function neutralPoseForProfile(profile: ProfileId, subjectContract?: GenericSubjectContract): Record<string, number> {

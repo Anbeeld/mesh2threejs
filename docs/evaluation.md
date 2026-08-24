@@ -7,3 +7,20 @@ Protected tests cover physical reflection despite correct metadata, three-axis t
 Behavioral host trials and large real references remain a separate campaign. The required corpus, falsifiers, telemetry, and claim gates are recorded in [DEFERRED-VERIFICATION.md](DEFERRED-VERIFICATION.md). Until that campaign is completed, describe this repository as development-validated, not production-certified.
 
 For every later stochastic agent run, retain host/model/version/config/tools, repository commit, exact selected instructions, profile/config hashes, artifact hashes, action trace, output, grader, human label, and every trial. Never report best-of-N as reliability.
+
+## Trusted-authority regression suites
+
+The release-protected adversarial suite lives in five files (plan §22):
+
+- `tests/trusted-authority.test.ts` — toolchain tamper/launch-config/dependency attacks,
+  capability partition, policy-creation authority, mirror drift, certification preconditions
+  and approval-staleness attacks.
+- `tests/candidate-sandbox.test.ts` — candidate source-graph boundary and resource-abuse
+  fixtures (timeout/OOM/network) with bounded-failure assertions.
+- `tests/trusted-lifecycle.test.ts` — condensed §23 lifecycle: real reconstruction binds the
+  run authority; workspace edits cannot forge it; finalize/viewer/bind stay ask-first.
+- `tests/derived-lineage.test.ts` — canonical entry/registry/five-way binding attacks 36–42.
+- `tests/semantic-coverage.test.ts` — multipart assembly coverage attacks 43–46.
+
+Development runs can never certify (`finalize` exits 6); only a trusted broker run with a
+fresh passing replay, current human approval, and a trusted-isolated sandbox certifies.

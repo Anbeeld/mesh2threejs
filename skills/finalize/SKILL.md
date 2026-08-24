@@ -1,10 +1,24 @@
 ---
 name: finalize
-description: Fail-closed certification and user handoff. Use only after fresh deterministic, style, articulation, external visual-review, and turntable artifacts exist.
+description: Fail-closed certification and user handoff. Certification requires a trusted run authority; development runs refuse it.
 ---
 
 # Finalize
 
-Run `mesh2threejs finalize <workspace>`. Finalization rebuilds the live neutral candidate, re-reads artifact files, verifies content and configuration hashes, and derives their results. It requires registration, deterministic gate, style, complexity, sampled articulation when controls are declared, genuine external visual review, and turntable evidence, with no blocking unresolved item. `exact-real` certification additionally requires admitted authoritative dimensions and sources.
+Certification is a trusted-run operation (fail-closed):
 
-Deliver candidate source, optional export if produced, board, turntable, geometry/style reports, intentional simplifications and omissions, oracle attribution/redistribution requirements, and the final hash. Refresh the full capture (`review-ready`) for the final handoff so the user inspects the certified hashes, then offer the interactive viewer — it is optional, never required for finalization, and started only with explicit user approval. Any requested adjustment reopens the affected phases.
+- `mesh2threejs finalize <workspace>` on an unbound (development) workspace refuses with
+  exit 6 (`TRUSTED_CERTIFICATION_UNAVAILABLE`). Development runs produce reports but never
+  claim certification.
+- A workspace bound to a trusted run (`state.mirrorOfRun`) is finalized by the trusted
+  broker only: the broker freshly replays the whole evaluation through the candidate
+  sandbox, requires the current human approval bound to the exact packet/candidate/oracle/
+  toolchain/replay hashes, and refuses when anything drifted.
+- Historical `passed` evidence fields are provenance; they never override current truth.
+
+Finalization still verifies registration, deterministic gate, style, complexity, sampled
+articulation when controls are declared, turntable evidence, and human visual approval,
+with no blocking unresolved item. `exact-real` additionally requires admitted authoritative
+dimensions and sources.
+
+Deliver candidate source, optional export if produced, board, turntable, geometry/style reports, intentional simplifications and omissions, oracle attribution/redistribution requirements, and the final hash. Refresh the full capture (`review-ready`) for the final handoff so the user inspects the certified hashes, then offer the interactive viewer. It is optional, never required for finalization, and started only with explicit user approval. Any requested adjustment reopens the affected phases.

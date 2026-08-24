@@ -61,13 +61,30 @@ const CONTENT_TYPES: Record<string, string> = {
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
   const body = `${JSON.stringify(value, null, 2)}\n`;
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  response.writeHead(status, secureHeaders({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }));
   response.end(body);
 }
 
 function sendText(response: ServerResponse, status: number, body: string, contentType = "text/plain; charset=utf-8"): void {
-  response.writeHead(status, { "content-type": contentType, "cache-control": "no-store" });
+  response.writeHead(status, secureHeaders({ "content-type": contentType, "cache-control": "no-store" }));
   response.end(body);
+}
+
+/** CSP appropriate to a static localhost viewer: no remote fetches, no inline script execution beyond the app bundle. */
+function secureHeaders(base: Record<string, string>): Record<string, string> {
+  return {
+    ...base,
+    "content-security-policy": [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      "object-src 'none'",
+      "base-uri 'none'",
+    ].join("; "),
+    "x-content-type-options": "nosniff",
+  };
 }
 
 /** Resolves a request-relative path strictly inside `root`; rejects traversal, separators, and hidden dot segments. */
@@ -92,7 +109,7 @@ interface ViewerWorkspaceContext {
   profile: ProfileId;
   model: string;
   modelEntry: string;
-  state: { activePhase?: string; status?: string; candidateHash?: string | null };
+  state: { activePhase?: string; status?: string; candidateHash?: string | null; mirrorOfRun?: { runId?: string } | null };
   subjectContract?: GenericSubjectContract;
 }
 
@@ -129,6 +146,26 @@ interface CachedAudit {
 
 const AUDIT_TTL_MS = 300;
 
+/** Locates the newest trusted viewer-scene artifact bound to the current candidate hash. */
+async function loadTrustedSceneArtifact(workspaceRoot: string, candidateHash: string | null): Promise<{ candidateHash: string | null; sceneHash: string; serialization: unknown }> {
+  const capturesDirectory = join(workspaceRoot, ".mesh2threejs", "captures");
+  let names: string[] = [];
+  try {
+    const { readdir } = await import("node:fs/promises");
+    names = (await readdir(capturesDirectory, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse();
+  } catch { /* no captures yet */ }
+  for (const name of names.filter((entry) => entry.startsWith("render-"))) {
+    const artifactPath = join(capturesDirectory, name, "viewer-scene.json");
+    try {
+      const parsed = JSON.parse(await readFile(artifactPath, "utf8")) as { candidateHash?: string; sceneHash?: string; serialization?: unknown };
+      if (!parsed.serialization || !parsed.sceneHash) continue;
+      if (candidateHash && parsed.candidateHash !== candidateHash) continue;
+      return { candidateHash: parsed.candidateHash ?? null, sceneHash: parsed.sceneHash, serialization: parsed.serialization };
+    } catch { /* inspect the next run */ }
+  }
+  throw new Error("no trusted viewer-scene artifact is available for the current candidate; run review-ready or render first");
+}
+
 /**
  * Minimal localhost preview server for the live audited candidate graph. It serves only the
  * viewer app assets, the vendored Three.js browser modules, and the exact files the candidate
@@ -161,7 +198,7 @@ export async function createViewerServer(options: ViewerServerOptions): Promise<
     try {
       const bytes = await readFile(path);
       const extension = path.slice(path.lastIndexOf("."));
-      response.writeHead(200, { "content-type": CONTENT_TYPES[extension] ?? "application/octet-stream", "cache-control": "no-store" });
+      response.writeHead(200, secureHeaders({ "content-type": CONTENT_TYPES[extension] ?? "application/octet-stream", "cache-control": "no-store" }));
       response.end(bytes);
     } catch {
       sendText(response, 404, "not found");
@@ -191,15 +228,45 @@ export async function createViewerServer(options: ViewerServerOptions): Promise<
     }
     if (path === "/") return serveFile(response, join(assets, "index.html"));
     if (path === "/assets/viewer.js") return serveFile(response, join(assets, "viewer.js"));
+    // Trusted runs (workspace bound to a run authority) NEVER receive candidate JavaScript:
+    // the viewer displays the trusted serialized evaluated scene instead (§14).
+    const context = await loadViewerContext(workspaceRoot).catch(() => null);
+    const trusted = Boolean(context?.state.mirrorOfRun);
     if (path === "/api/model") {
       try {
-        const context = await loadViewerContext(workspaceRoot);
+        if (!context) throw new Error("workspace context is unavailable");
+        if (trusted) {
+          const controls = context.profile === "generic" ? context.subjectContract?.articulation ?? [] : getProfileContract(context.profile).articulation;
+          const neutral = neutralPoseForProfile(context.profile, context.subjectContract);
+          sendJson(response, 200, {
+            schemaVersion: 1,
+            status: "ok",
+            mode: "trusted-serialization",
+            profile: context.profile,
+            model: context.model,
+            sceneUrl: "/api/scene",
+            sourceHash: null,
+            error: null,
+            activePhase: context.state.activePhase ?? null,
+            taskStatus: context.state.status ?? null,
+            candidateHash: context.state.candidateHash ?? null,
+            articulation: controls.map((control) => ({
+              control: control.control,
+              samples: control.samples,
+              min: Math.min(...control.samples, 0),
+              max: Math.max(...control.samples, 0),
+              neutral: neutral[control.control] ?? 0,
+            })),
+          });
+          return;
+        }
         const audit = await cachedAuditNow();
         const controls = context.profile === "generic" ? context.subjectContract?.articulation ?? [] : getProfileContract(context.profile).articulation;
         const neutral = neutralPoseForProfile(context.profile, context.subjectContract);
         sendJson(response, 200, {
           schemaVersion: 1,
           status: audit.audit?.passed ? "ok" : "invalid",
+          mode: "development-candidate-module",
           profile: context.profile,
           model: context.model,
           entry: `/candidate/${basename(context.modelEntry)}`,
@@ -221,7 +288,21 @@ export async function createViewerServer(options: ViewerServerOptions): Promise<
       }
       return;
     }
+    if (path === "/api/scene") {
+      try {
+        if (!context) throw new Error("workspace context is unavailable");
+        const scene = await loadTrustedSceneArtifact(workspaceRoot, context.state.candidateHash ?? null);
+        sendJson(response, 200, { schemaVersion: 1, status: "ok", ...scene });
+      } catch (error) {
+        sendJson(response, 200, { schemaVersion: 1, status: "unavailable", error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
     if (path === "/api/version") {
+      if (trusted) {
+        sendJson(response, 200, { status: "ok", sourceHash: null, trustedScene: true, observedAt: new Date().toISOString() });
+        return;
+      }
       const audit = await cachedAuditNow();
       sendJson(response, 200, audit.audit?.passed
         ? { status: "ok", sourceHash: audit.audit.sourceHash, observedAt: new Date().toISOString() }
@@ -229,10 +310,11 @@ export async function createViewerServer(options: ViewerServerOptions): Promise<
       return;
     }
     if (path.startsWith("/candidate/")) {
+      if (trusted || !context) return sendText(response, 404, "not found");
       const rel = path.slice("/candidate/".length);
       const audit = await cachedAuditNow();
       if (!audit.audit?.passed) return sendText(response, 409, "candidate audit is currently failing; fix the candidate source");
-      const entryDir = dirname((await loadViewerContext(workspaceRoot)).modelEntry);
+      const entryDir = dirname(context.modelEntry);
       const admitted = new Set(audit.audit.candidateFiles.map((file) => file.path));
       if (!admitted.has(rel)) return sendText(response, 404, "not part of the audited candidate graph");
       const target = safeJoin(entryDir, rel);

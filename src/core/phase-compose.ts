@@ -13,7 +13,9 @@ const ADMIT_ALL: SemanticOwnershipPredicate = () => true;
 
 const TANK_PHASE_SEMANTIC_OWNERSHIP: Record<string, SemanticOwnershipPredicate> = {
   hull: (id) => id.startsWith("hull"),
-  turret: (id) => id === "turret" || id === "turret-pivot" || id === "cupola",
+  // Multipart turret assemblies: every significant turret-prefixed child (cheeks, roof
+  // plates, cupola) is owned by the turret phase through the single authoritative resolver.
+  turret: (id) => id === "turret" || id === "turret-pivot" || id === "cupola" || /^turret(?:[-_ ].*)?$/u.test(id),
   gun: (id) => id === "gun" || id === "gun-pivot",
   "running-gear": (id, role) =>
     (role !== undefined && ["road-wheel", "sprocket", "idler", "return-roller"].includes(role))

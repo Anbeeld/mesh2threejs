@@ -37,9 +37,26 @@ async function fetchJson(path) {
 async function main() {
   const model = await fetchJson("/api/model");
   if (model.status !== "ok") {
-    showOverlay("Candidate is not ready", model.error || "The candidate audit is failing. Fix the candidate source; the viewer reloads automatically once it is valid again.");
+    showOverlay("Candidate is not ready", model.error || "The model is not ready. The viewer reloads automatically once it is valid again.");
     pollForRecovery(null);
     return;
+  }
+
+  // Trusted runs consume the pipeline's serialized evaluated scene; candidate JavaScript is
+  // never fetched or executed in the browser (trusted mode, §14).
+  if (model.mode === "trusted-serialization" && model.sceneUrl) {
+    try {
+      const scene = await fetchJson(model.sceneUrl);
+      if (scene.status !== "ok") throw new Error(scene.error || "trusted scene artifact unavailable");
+      const root = buildSceneFromSerialization(scene.serialization);
+      hideOverlay();
+      startViewer({ ...model, sourceHash: null }, root, makePivotPoseApplier(root, model.articulation ?? []));
+      return;
+    } catch (error) {
+      showOverlay("Trusted scene unavailable", error instanceof Error ? error.message : String(error));
+      pollForRecovery(null);
+      return;
+    }
   }
 
   let built;
@@ -61,6 +78,81 @@ async function main() {
   }
   hideOverlay();
   startViewer(model, root, setPose);
+}
+
+/** Reconstructs the trusted serialized scene produced by the CandidateExecutor. */
+function buildSceneFromSerialization(serialization) {
+  if (!serialization || serialization.schemaVersion !== 1) throw new Error("unsupported serialized scene schema");
+  const build = (node) => {
+    let object;
+    if (node.type === "mesh" && node.geometry) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(node.geometry.attributes.position, 3));
+      if (node.geometry.attributes.normal) geometry.setAttribute("normal", new THREE.Float32BufferAttribute(node.geometry.attributes.normal, 3));
+      else geometry.computeVertexNormals();
+      if (node.geometry.index) geometry.setIndex(node.geometry.index);
+      for (const group of node.geometry.groups ?? []) geometry.addGroup(group.start, group.count, group.materialIndex);
+      const materials = (node.materials ?? []).map((material) => {
+        if (material.kind === "basic") {
+          const basic = new THREE.MeshBasicMaterial({ color: material.color, vertexColors: material.vertexColors, flatShading: Boolean(material.flatShading) });
+          return basic;
+        }
+        return new THREE.MeshStandardMaterial({
+          color: material.color,
+          roughness: material.roughness,
+          metalness: material.metalness,
+          vertexColors: material.vertexColors,
+          flatShading: Boolean(material.flatShading),
+        });
+      });
+      object = new THREE.Mesh(geometry, materials.length === 1 ? materials[0] : materials);
+    } else {
+      object = new THREE.Group();
+    }
+    object.name = node.name;
+    object.visible = node.visible !== false;
+    object.position.fromArray(node.position);
+    object.quaternion.fromArray(node.quaternion);
+    object.scale.fromArray(node.scale);
+    for (const key of ["semanticId", "semanticRole", "articulationPivot", "logicalOwner"]) {
+      if (typeof node[key] === "string") object.userData[key] = node[key];
+    }
+    for (const child of node.children ?? []) object.add(build(child));
+    return object;
+  };
+  return build(serialization.root);
+}
+
+/**
+ * Trusted-mode articulation: named pivots from the serialized hierarchy are rotated
+ * directly in-browser — no candidate source execution.
+ */
+function makePivotPoseApplier(root, articulation) {
+  const pivots = new Map();
+  root.traverse((object) => {
+    const semanticId = typeof object.userData.semanticId === "string" ? object.userData.semanticId : null;
+    const pivotName = typeof object.userData.articulationPivot === "string" ? object.userData.articulationPivot : null;
+    if (pivotName) pivots.set(pivotName, object);
+    if (semanticId && semanticId.endsWith("-pivot")) pivots.set(semanticId, object);
+  });
+  // Known tank controls bind to their canonical pivots/axes; unknown controls fall back to
+  // a "<kebab(control)>-pivot" lookup rotating around Y.
+  const bindings = new Map([
+    ["turretYaw", ["turret-pivot", "y"]],
+    ["gunElevation", ["gun-pivot", "x"]],
+  ]);
+  return (pose) => {
+    for (const control of articulation.map((entry) => entry.control)) {
+      if (!(control in pose)) continue;
+      const value = pose[control];
+      if (typeof value !== "number") continue;
+      const binding = bindings.get(control);
+      const pivotName = binding ? binding[0] : `${control.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}-pivot`;
+      const axis = binding ? binding[1] : "y";
+      const pivot = pivots.get(pivotName);
+      if (pivot) pivot.rotation[axis] = value;
+    }
+  };
 }
 
 function startViewer(model, root, setPose) {
@@ -235,12 +327,11 @@ function pollForRecovery(loadedSourceHash) {
       const version = await fetchJson("/api/version");
       if (version.status === "ok") {
         hideBanner();
-        if (loadedSourceHash !== null && version.sourceHash !== loadedSourceHash) {
-          window.location.reload();
-        } else if (loadedSourceHash === null) {
+        // Trusted scenes have no candidate source hash to watch: stay on the stable scene.
+        if (loadedSourceHash !== null && version.sourceHash !== null && version.sourceHash !== loadedSourceHash) {
           window.location.reload();
         }
-      } else {
+      } else if (loadedSourceHash !== null) {
         showBanner("Candidate audit is failing; fix the source. The viewer reloads automatically once valid.");
       }
     } catch {

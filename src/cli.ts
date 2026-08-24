@@ -2,13 +2,13 @@
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { auditCandidateModule, inspectCandidateIdentity } from "./core/candidate.js";
+import { auditCandidateModule } from "./core/candidate.js";
 import { replayDeterministicRows, type DeterministicReplayPacket } from "./core/replay.js";
-import { evaluateCandidateWithPoses, neutralPoseForProfile, type PosedEvaluationBundle } from "./core/orchestration.js";
+import { neutralPoseForProfile, requiredPosesForProfile, type PosedEvaluationBundle } from "./core/orchestration.js";
 import { loadPreparedOracle, onboardOracle, oraclePreparationIdentity, probeGlb, repairPreparedOracle, verifyOracleRegistration, oraclePreparationBinding, type OnboardOracleInput, type OracleManifest, type RegistrationExpectation, type RepairPreparedOracleInput } from "./core/oracle.js";
 import { routeSubject } from "./core/routing.js";
-import { acceptPhase, bindCandidate, bindCandidatePhases, bindEvidenceConfig, bindOracle, bindOraclePreparation, certifyStateFromArtifacts, createRenderEvidenceArtifact, createRuntimeEvaluationEvidenceArtifact, createRuntimeGateEvidenceArtifact, createWorkflowGateEvidenceArtifact, determineNextAction, isAuthoritativeEvidence, loadTaskState, recordAttempt, recordEvidenceArtifact, reopenPhase, saveTaskState, setAuthoritativeDimensionStatus, verifyEvidenceArtifact, type EvidenceArtifact, type EvidenceRecord } from "./core/state.js";
-import { createWorkspaceResolver, initializeWorkspace, migrateWorkspace, rebindWorkspace, resolveStateTarget, resumeWorkspace, verifyWorkspaceCandidateIdentity, verifyWorkspaceOraclePreparation } from "./core/workspace.js";
+import { acceptPhase, bindCandidate, bindCandidatePhases, bindEvidenceConfig, bindOracle, bindOraclePreparation, certifyStateFromArtifacts, createAutomatedVisualAssessmentArtifact, createRenderEvidenceArtifact, createRuntimeEvaluationEvidenceArtifact, createRuntimeGateEvidenceArtifact, createWorkflowGateEvidenceArtifact, determineNextAction, isAuthoritativeEvidence, loadTaskState, recordAttempt, recordEvidenceArtifact, reopenPhase, saveTaskState, setAuthoritativeDimensionStatus, verifyEvidenceArtifact, type EvidenceArtifact, type EvidenceRecord } from "./core/state.js";
+import { createWorkspaceResolver, initializeWorkspace, migrateWorkspace, rebindWorkspace, resolveStateTarget, resumeWorkspace, verifyWorkspaceOraclePreparation } from "./core/workspace.js";
 import type { ProfileId } from "./types.js";
 import { validateOracleManifest } from "./core/schema.js";
 import { canonicalJson, fingerprintScene, sha256 } from "./core/hashing.js";
@@ -24,6 +24,10 @@ import { loadStyleContract } from "./styles/low-poly.js";
 import { derivePhaseSeed, trustedGeneratedAuditOptions } from "./core/derive.js";
 import { phaseSemanticScope } from "./core/phase-compose.js";
 import { snapshotScene } from "./core/geometry.js";
+import { assertAssemblyCoverage, evaluateAssemblyCoverage } from "./core/assembly.js";
+import { serializeScene, serializedSceneHash } from "./core/scene-serialization.js";
+import type { SandboxBackend } from "./core/candidate-sandbox.js";
+import { developmentInProcessBackend } from "./core/dev-sandbox.js";
 import type { TaskState } from "./core/state.js";
 
 interface CliIo {
@@ -129,6 +133,70 @@ async function optionalWorkspace(input: string): Promise<Awaited<ReturnType<type
   const canonicalState = basename(absolute) === "state.json" && basename(dirname(absolute)) === ".mesh2threejs";
   if (info.isDirectory() || basename(absolute) === "project.json" || canonicalState) return resumeWorkspace(absolute);
   return undefined;
+}
+
+/** In-process sandbox used by DEVELOPMENT runs only; it can never certify. */
+export function developmentSandboxBackend(): SandboxBackend {
+  return developmentInProcessBackend();
+}
+
+interface WorkspaceExecutionInspection {
+  candidateHash: string;
+  sourceHash: string;
+  neutralSceneHash: string;
+  candidateFiles: Array<{ path: string; sha256: string }>;
+  neutralRoot: import("three").Object3D;
+  posedRoots: Array<{ pose: Record<string, number>; root: import("three").Object3D }>;
+  serialization: ReturnType<typeof serializeScene>;
+  sceneHash: string;
+  isolation: string;
+  deterministic: boolean;
+}
+
+/**
+ * The one authoritative workspace-candidate inspection path: audit -> sandbox execution ->
+ * trusted reconstruction. No live untrusted runtime object is produced.
+ */
+async function inspectWorkspaceCandidateViaExecutor(input: {
+  workspaceRoot?: string;
+  modelEntryPath: string;
+  boundaryRoot?: string;
+  poses: Array<Record<string, number>>;
+  auditOptions?: Parameters<typeof auditCandidateModule>[1];
+  backend?: SandboxBackend;
+}): Promise<WorkspaceExecutionInspection> {
+  const { executeWorkspaceModel, deserializeExecutionSamples } = await import("./core/composition-exec.js");
+  const { composeCandidateHash } = await import("./core/candidate.js");
+  const result = await executeWorkspaceModel({
+    ...(input.workspaceRoot !== undefined ? { workspaceRoot: input.workspaceRoot } : {}),
+    modelEntryPath: input.modelEntryPath,
+    boundaryRoot: input.boundaryRoot ?? dirname(input.modelEntryPath),
+    poses: input.poses,
+    auditOptions: input.auditOptions,
+    backend: input.backend ?? developmentSandboxBackend(),
+  });
+  const samples = deserializeExecutionSamples(result);
+  const neutralSerialization = result.samples[0]!.serialization;
+  const neutralSceneHash = fingerprintScene(samples.neutralRoot);
+  return {
+    candidateHash: composeCandidateHash(neutralSceneHash, result.sourceHash),
+    sourceHash: result.sourceHash,
+    neutralSceneHash,
+    candidateFiles: result.audit.candidateFiles.map((file) => ({ ...file })),
+    neutralRoot: samples.neutralRoot,
+    posedRoots: samples.posedRoots,
+    serialization: neutralSerialization,
+    sceneHash: serializedSceneHash(neutralSerialization),
+    isolation: result.isolation,
+    deterministic: result.deterministic,
+  };
+}
+
+/** Refuses builder mutations against a workspace bound to a trusted run. */
+function assertDevelopmentWorkspace(workspace: Awaited<ReturnType<typeof resumeWorkspace>>): void {
+  if (workspace.state.mirrorOfRun) {
+    throw new Error(`workspace is bound to trusted run ${workspace.state.mirrorOfRun.mirrorOfRun}; this low-level operation cannot mutate it (development-only interface)`);
+  }
 }
 
 async function createRunDirectory(parent: string, prefix: string): Promise<{ id: string; path: string }> {
@@ -291,7 +359,11 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "bind-candidate": {
         const path = parsed.positional[0];
         if (!path) throw new Error(`${command} requires a state path`);
-        const { statePath } = await resolveStateTarget(path);
+        const { statePath, workspaceRoot } = await resolveStateTarget(path);
+        if (workspaceRoot) {
+          const bound = await loadTaskState(createWorkspaceResolver(workspaceRoot).layout.internal.state);
+          if (bound.mirrorOfRun) throw new Error(`workspace is bound to trusted run ${bound.mirrorOfRun.mirrorOfRun}; bind operations are development-only and cannot mutate it`);
+        }
         const hash = required(parsed.options, "hash");
         const state = command === "bind-oracle" ? bindOracle(await loadTaskState(statePath), hash) : bindCandidate(await loadTaskState(statePath), hash);
         await saveTaskState(statePath, state);
@@ -304,7 +376,11 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const kinds: EvidenceRecord["kind"][] = ["registration", "deterministic-gate", "style", "complexity", "articulation", "visual-review", "turntable"];
         const kind = required(parsed.options, "kind") as EvidenceRecord["kind"];
         if (!kinds.includes(kind)) throw new Error(`unsupported evidence kind: ${kind}`);
-        const { statePath } = await resolveStateTarget(path);
+        const { statePath, workspaceRoot } = await resolveStateTarget(path);
+        if (workspaceRoot) {
+          const bound = await loadTaskState(createWorkspaceResolver(workspaceRoot).layout.internal.state);
+          if (bound.mirrorOfRun) throw new Error(`workspace is bound to trusted run ${bound.mirrorOfRun.mirrorOfRun}; config binding is development-only and cannot mutate it`);
+        }
         const state = bindEvidenceConfig(await loadTaskState(statePath), kind, required(parsed.options, "hash"), required(parsed.options, "reason"));
         await saveTaskState(statePath, state);
         io.stdout(json({ status: "config-bound", kind, configHash: state.evidenceConfigHashes[kind] }));
@@ -314,6 +390,10 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const path = parsed.positional[0];
         if (!path) throw new Error("record-evidence requires a state path");
         const target = await resolveStateTarget(path);
+        if (target.workspaceRoot) {
+          const bound = await loadTaskState(createWorkspaceResolver(target.workspaceRoot).layout.internal.state);
+          if (bound.mirrorOfRun) throw new Error(`workspace is bound to trusted run ${bound.mirrorOfRun.mirrorOfRun}; caller-supplied evidence recording cannot mutate a trusted run`);
+        }
         const statePath = target.statePath;
         const artifactPath = workspacePath(required(parsed.options, "artifact"), target.workspaceRoot);
         const artifact = JSON.parse(await readFile(artifactPath, "utf8")) as EvidenceArtifact;
@@ -330,6 +410,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         let livePreparation: Awaited<ReturnType<typeof verifyWorkspaceOraclePreparation>> | undefined;
         if (target.workspaceRoot) {
           const workspace = await resumeWorkspace(target.workspaceRoot);
+          assertDevelopmentWorkspace(workspace);
           if (workspace.project.oracle) livePreparation = await verifyWorkspaceOraclePreparation(workspace);
         }
         const current = await loadTaskState(statePath);
@@ -351,7 +432,8 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "reopen": {
         const path = parsed.positional[0];
         if (!path) throw new Error("reopen requires a state path");
-        const { statePath } = await resolveStateTarget(path);
+        const { statePath, workspaceRoot } = await resolveStateTarget(path);
+        if (workspaceRoot) assertDevelopmentWorkspace(await resumeWorkspace(workspaceRoot));
         const state = reopenPhase(await loadTaskState(statePath), required(parsed.options, "phase"), required(parsed.options, "reason"));
         await saveTaskState(statePath, state);
         io.stdout(json({ status: "reopened", activePhase: state.activePhase }));
@@ -380,7 +462,13 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           const renderManifestPath = await latestRunFile(workspace.layout.internal.captures, "render", "render-manifest.json");
           const renderManifest = JSON.parse(await readFile(renderManifestPath, "utf8")) as { oracleHash: string; candidateHash: string; styleContractHash: string; evaluationIdentityHash: string; captures: Array<{ path: string; sha256: string; pass: string; cameraId: string }>; comparisonBoards: Array<{ path: string; sha256: string }>; turntable: Array<{ path: string; sha256: string }>; regionDiagnostics?: { path: string; sha256: string } };
           const state = await loadTaskState(workspace.layout.internal.state);
-          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
+          const liveCandidate = await inspectWorkspaceCandidateViaExecutor({
+            workspaceRoot: workspace.root,
+            modelEntryPath: workspace.resolved.model,
+            boundaryRoot: resolve(workspace.root, "model"),
+            poses: [neutralPoseForProfile(workspace.project.profile)],
+            auditOptions: await trustedGeneratedAuditOptions(workspace),
+          });
           if (liveCandidate.candidateHash !== state.candidateHash || liveCandidate.candidateHash !== renderManifest.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
           if (state.oracleHash !== renderManifest.oracleHash || state.candidateHash !== renderManifest.candidateHash || state.styleContractHash !== renderManifest.styleContractHash || state.evaluationIdentityHash !== renderManifest.evaluationIdentityHash) throw new Error("latest render manifest is stale for the workspace state or evaluation configuration");
           const currentEvidence = Object.values(state.evidence).filter((item) => item.valid && item.verified && item.passed && isAuthoritativeEvidence(item) && (item.kind === "registration" || item.candidateHash === state.candidateHash));
@@ -463,14 +551,24 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         await verifyVisualReviewPacketFiles(packet, target.workspaceRoot ?? dirname(packetPath));
         let state = await loadTaskState(statePath);
         if (target.workspaceRoot) {
+          assertDevelopmentWorkspace(await resumeWorkspace(target.workspaceRoot));
           const workspace = await resumeWorkspace(target.workspaceRoot);
           if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
-          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
+          const liveCandidate = await inspectWorkspaceCandidateViaExecutor({
+            workspaceRoot: workspace.root,
+            modelEntryPath: workspace.resolved.model,
+            boundaryRoot: resolve(workspace.root, "model"),
+            poses: [neutralPoseForProfile(workspace.project.profile)],
+            auditOptions: await trustedGeneratedAuditOptions(workspace),
+          });
           if (liveCandidate.candidateHash !== state.candidateHash || liveCandidate.candidateHash !== packet.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
         }
         if (state.oracleHash !== packet.oracleHash || state.candidateHash !== packet.candidateHash || state.profileContractHash !== packet.profileContractHash || state.styleContractHash !== packet.styleContractHash || state.evaluationIdentityHash !== packet.evaluationIdentityHash) throw new Error("visual review is bound to stale state or evaluation configuration");
+        // A builder/model-created verdict file is DATA, never human authority (§15.3): it is
+        // recorded as an automated visual diagnostic that can inform workorders/reopens but
+        // can never satisfy the visual.review gate or certification.
         const reviewSequence = Object.values(state.evidence).filter((item) => item.kind === "visual-review").length + 1;
-        const artifact = createWorkflowGateEvidenceArtifact({ id: `visual-review-${String(reviewSequence).padStart(4, "0")}`, kind: "visual-review", phase: "visual-review", oracleHash: packet.oracleHash, candidateHash: packet.candidateHash, profileContractHash: packet.profileContractHash, styleContractHash: packet.styleContractHash, evaluationIdentityHash: packet.evaluationIdentityHash, configHash: packet.packetHash, gateCode: "visual.review", passed: verdict.verdict === "PASS", summary: `external visual review ${verdict.verdict}`, details: { packet, verdict } });
+        const artifact = createAutomatedVisualAssessmentArtifact({ id: `visual-assessment-${String(reviewSequence).padStart(4, "0")}`, phase: "visual-review", oracleHash: packet.oracleHash, candidateHash: packet.candidateHash, profileContractHash: packet.profileContractHash, styleContractHash: packet.styleContractHash, evaluationIdentityHash: packet.evaluationIdentityHash, configHash: packet.packetHash, verdict: { verdict: verdict.verdict, findings: verdict.findings }, packetHash: packet.packetHash });
         state = bindEvidenceConfig(state, "visual-review", packet.packetHash, "recording a new explicitly reviewed capture packet");
         const defaultReviewRun = !parsed.options.artifact && target.workspaceRoot ? await createRunDirectory(createWorkspaceResolver(target.workspaceRoot).layout.internal.evidence, "review") : undefined;
         const artifactPath = parsed.options.artifact ? workspacePath(parsed.options.artifact, target.workspaceRoot) : defaultReviewRun ? join(defaultReviewRun.path, "visual-review.json") : undefined;
@@ -479,7 +577,12 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         await writeFile(artifactPath, `${json(artifact)}\n`, { flag: "wx" });
         state = recordEvidenceArtifact(state, storedArtifactPath(artifactPath, target.workspaceRoot), artifact);
         await saveTaskState(statePath, state);
-        io.stdout(json({ status: state.visualReviewStatus, evidenceId: artifact.id }));
+        io.stdout(json({
+          status: "automated-visual-diagnostic-recorded",
+          diagnosticVerdict: verdict.verdict,
+          evidenceId: artifact.id,
+          note: "automated/model verdicts are diagnostic only; trusted certification requires human approval through the run authority channel",
+        }));
         return verdict.verdict === "PASS" ? 0 : 5;
       }
       case "probe": {
@@ -493,7 +596,10 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const config = JSON.parse(await readFile(resolve(configPath), "utf8")) as OnboardOracleInput;
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
-        if (workspace && !workspace.project.oracle) throw new Error("workspace has no oracle reference to onboard");
+        if (workspace) {
+          assertDevelopmentWorkspace(workspace);
+          if (!workspace.project.oracle) throw new Error("workspace has no oracle reference to onboard");
+        }
         const oracleRecord = workspace?.references.records.find((record) => record.kind === "oracle" && record.operationalPath === workspace.project.oracle);
         if (workspace && !oracleRecord) throw new Error("workspace oracle is absent from the reference index");
         const outputPath = workspace?.layout.internal.oracleManifest ?? resolve(required(parsed.options, "out"));
@@ -522,6 +628,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "repair-oracle": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
+        if (workspace) assertDevelopmentWorkspace(workspace);
         let manifest: OracleManifest;
         if (workspace) {
           // Repair operates on the admitted preparation of this workspace, never on whatever
@@ -564,7 +671,11 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         if (registrationProfile !== undefined && registrationProfile !== "tank" && registrationProfile !== "generic") throw new Error("--profile must be tank or generic");
         const oracle = await loadPreparedOracle(manifest, workspace?.root);
         const evidence = verifyOracleRegistration(oracle, expectation, { ...(registrationProfile ? { profile: registrationProfile } : {}), ...(manifest.scaleAuthority ? { scaleAuthority: manifest.scaleAuthority } : {}) });
-        const rendered = `${json(evidence)}\n`;
+        // Source assembly coverage is part of registration (§11.4): unresolved significant
+        // geometry under mapped critical assemblies fails the registration gate outright.
+        const assemblyCoverage = registrationProfile === "tank" ? evaluateAssemblyCoverage(oracle, "tank") : undefined;
+        const registrationPassed = evidence.passed && (assemblyCoverage?.passed ?? true);
+        const rendered = `${json({ ...evidence, ...(assemblyCoverage ? { assemblyCoverage } : {}), passed: registrationPassed })}\n`;
         const registrationRun = workspace ? await createRunDirectory(workspace.layout.internal.evidence, "registration") : undefined;
         const reportPath = registrationRun ? join(workspace!.layout.internal.reports, `${registrationRun.id}.json`) : (parsed.options.out ? resolve(parsed.options.out) : undefined);
         if (reportPath) { await mkdir(dirname(reportPath), { recursive: true }); await writeFile(reportPath, rendered, { flag: "wx" }); }
@@ -576,7 +687,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           let state = bindOracle(await loadTaskState(statePath), fingerprintScene(oracle));
           const registrationConfigHash = sha256(canonicalJson({ expectation, oraclePreparation: preparationIdentity }));
           state = bindEvidenceConfig(state, "registration", registrationConfigHash, "registration expectation changed");
-          const artifact = createWorkflowGateEvidenceArtifact({ id: registrationRun?.id ?? "registration", kind: "registration", phase: "oracle-registration", oracleHash: state.oracleHash!, candidateHash: null, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: null, configHash: registrationConfigHash, gateCode: "registration.complete", passed: evidence.passed, summary: evidence.passed ? "reference registration passed" : "reference registration failed", details: evidence });
+          const artifact = createWorkflowGateEvidenceArtifact({ id: registrationRun?.id ?? "registration", kind: "registration", phase: "oracle-registration", oracleHash: state.oracleHash!, candidateHash: null, profileContractHash: state.profileContractHash, styleContractHash: state.styleContractHash, evaluationIdentityHash: null, configHash: registrationConfigHash, gateCode: "registration.complete", passed: registrationPassed, summary: registrationPassed ? "reference registration passed" : `reference registration failed${assemblyCoverage && !assemblyCoverage.passed ? `: ${assemblyCoverage.unresolved.length} significant source mesh(es) lack phase ownership` : ""}`, details: { registration: evidence, ...(assemblyCoverage ? { assemblyCoverage } : {}) } });
           const artifactPath = resolve(artifactOption);
           await mkdir(dirname(artifactPath), { recursive: true });
           await writeFile(artifactPath, `${json(artifact)}\n`, { flag: "wx" });
@@ -584,7 +695,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           await saveTaskState(statePath, state);
         }
         io.stdout(rendered.trimEnd());
-        return evidence.passed ? 0 : 4;
+        return registrationPassed ? 0 : 4;
       }
       case "oracle-sanity": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
@@ -612,6 +723,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "derive": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         if (!workspaceInput) throw new Error("derive requires a workspace path");
+        assertDevelopmentWorkspace(await resumeWorkspace(workspaceInput));
         const quality = parsed.options.quality;
         if (quality !== undefined && !["aggressive", "balanced", "conservative"].includes(quality)) throw new Error("--quality must be aggressive, balanced, or conservative");
         const result = await derivePhaseSeed(workspaceInput, { ...(quality ? { quality: quality as "aggressive" | "balanced" | "conservative" } : {}) });
@@ -621,6 +733,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
       case "gate": {
         const workspaceInput = parsed.positional[0] ?? parsed.options.workspace;
         const workspace = workspaceInput ? await resumeWorkspace(workspaceInput) : undefined;
+        if (workspace) assertDevelopmentWorkspace(workspace);
         let manifest: OracleManifest;
         let preparationIdentity: string;
         if (workspace) {
@@ -643,10 +756,23 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         // Phase isolation at identity time: a partial candidate without physical controls is
         // inspected without applying articulation controls unless this gate actually evaluates
         // the phase that owns them.
-        const needsNeutralPose = !activePhase || isGlobal || profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === activePhase);
+        const needsArticulation = !activePhase || isGlobal || profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === activePhase);
         const candidateAuditOptions = workspace ? await trustedGeneratedAuditOptions(workspace, preparationIdentity) : undefined;
-        const candidateIdentity = await inspectCandidateIdentity(candidatePath, needsNeutralPose ? neutralPoseForProfile(profile, subjectContract) : {}, candidateAuditOptions);
-        if (workspace && !isGlobal) assertPhaseSemanticScope(profile, activePhase, candidateIdentity.runtime.root);
+        // One trusted execution path: audit -> sandbox -> serialized scene samples.
+        const poses = needsArticulation ? requiredPosesForProfile(profile, subjectContract) : [neutralPoseForProfile(profile, subjectContract)];
+        const execution = await inspectWorkspaceCandidateViaExecutor({
+          ...(workspace ? { workspaceRoot: workspace.root, boundaryRoot: resolve(workspace.root, "model") } : {}),
+          modelEntryPath: candidatePath,
+          poses,
+          auditOptions: { ...candidateAuditOptions },
+        });
+        if (workspace && !isGlobal) assertPhaseSemanticScope(profile, activePhase, execution.neutralRoot);
+        const candidateIdentity = {
+          candidateHash: execution.candidateHash,
+          sourceHash: execution.sourceHash,
+          neutralSceneHash: execution.neutralSceneHash,
+          candidateFiles: execution.candidateFiles,
+        };
         const candidateFiles = candidateIdentity.candidateFiles;
         const certification = workspace?.state.certification ?? (manifest.authoritativeDimensions ? "exact-real" : "oracle-relative");
         const selectedStyle = workspace ? { contract: workspace.styleContract, hash: workspace.styleContractHash } : await loadStyleContract(parsed.options.style ?? "low-poly-faithful");
@@ -663,6 +789,9 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           authoritativeDimensionsHash: optionalContractHash(manifest.authoritativeDimensions),
           candidateSourceHash: candidateIdentity.sourceHash,
           candidateNeutralHash: candidateIdentity.neutralSceneHash,
+          toolchainId: null,
+          projectPolicyHash: null,
+          candidateIsolation: execution.isolation === "trusted-isolated" ? "trusted-isolated" : "development-process",
         });
         const currentEvaluationHash = evaluationIdentityHash(evaluationIdentity);
         const cachePath = workspace && isGlobal ? join(workspace.layout.internal.reports, "gate-cache.json") : undefined;
@@ -675,13 +804,17 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           } catch { /* cache miss or incomplete cache */ }
         }
         if (!evaluation) {
-          const candidate = candidateIdentity.runtime;
           const oracle = await loadPreparedOracle(manifest, workspace?.root);
-          evaluation = await evaluateCandidateWithPoses({
+          const { evaluateCandidateFromSamples } = await import("./core/orchestration.js");
+          evaluation = await evaluateCandidateFromSamples({
             oracle,
-            candidate,
+            candidateSamples: [
+              { pose: poses[0]!, root: execution.neutralRoot },
+              ...execution.posedRoots.map((sample) => ({ pose: sample.pose, root: sample.root })),
+            ],
             profile,
             candidateNeutralHash: candidateIdentity.neutralSceneHash,
+            candidateSourceHash: candidateIdentity.sourceHash,
             style: selectedStyle.contract,
             certification,
             ...(subjectContract ? { subjectContract } : {}),
@@ -781,9 +914,15 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
           if (requestedPhase && requestedPhase !== "active") throw new Error("--phase must be \"active\" for quick diagnostics");
           const manifestQuick = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
           const oracleQuick = await loadPreparedOracle(manifestQuick, workspace.root);
-          const candidateIdentityQuick = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
+          const candidateIdentityQuick = await inspectWorkspaceCandidateViaExecutor({
+            workspaceRoot: workspace.root,
+            modelEntryPath: workspace.resolved.model,
+            boundaryRoot: resolve(workspace.root, "model"),
+            poses: [neutralPoseForProfile(workspace.project.profile)],
+            auditOptions: await trustedGeneratedAuditOptions(workspace),
+          });
           if (candidateIdentityQuick.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before rendering");
-          const resultQuick = await performQuickDiagnosticRun(workspace, manifestQuick, oracleQuick, candidateIdentityQuick, candidateIdentityQuick.runtime.root);
+          const resultQuick = await performQuickDiagnosticRun(workspace, manifestQuick, oracleQuick, candidateIdentityQuick, candidateIdentityQuick.neutralRoot);
           io.stdout(json({
             status: "quick-diagnostic-captured",
             directory: storedArtifactPath(resultQuick.directory, workspace.root),
@@ -796,28 +935,37 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         }
         let manifest: OracleManifest;
         if (workspace) {
+          assertDevelopmentWorkspace(workspace);
           manifest = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
         } else {
           manifest = JSON.parse(await readFile(resolve(required(parsed.options, "oracle")), "utf8")) as OracleManifest;
           if (!validateOracleManifest(manifest).valid) throw new Error("oracle manifest schema is invalid");
         }
         const oracle = await loadPreparedOracle(manifest, workspace?.root);
-        const candidateIdentity = workspace ? await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace)) : await inspectCandidateIdentity(resolve(required(parsed.options, "candidate")));
-        if (workspace && candidateIdentity.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before rendering");
+        const execution = await inspectWorkspaceCandidateViaExecutor({
+          ...(workspace ? { workspaceRoot: workspace.root, boundaryRoot: resolve(workspace.root, "model"), auditOptions: await trustedGeneratedAuditOptions(workspace) } : {}),
+          modelEntryPath: workspace?.resolved.model ?? resolve(required(parsed.options, "candidate")),
+          poses: [neutralPoseForProfile(workspace?.project.profile ?? "generic")],
+        });
+        if (workspace && execution.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before rendering");
         const renderRun = workspace ? await createRunDirectory(workspace.layout.internal.captures, "render") : undefined;
         const directory = renderRun?.path ?? resolve(required(parsed.options, "out-dir"));
+        // Trusted viewer artifact: the serialized evaluated scene travels with the render run
+        // so the interactive viewer can display exactly what was inspected (§14).
+        const sceneArtifactPath = join(directory, "viewer-scene.json");
+        await writeFile(sceneArtifactPath, `${json({ schemaVersion: 1, candidateHash: execution.candidateHash, sceneHash: execution.sceneHash, serialization: execution.serialization })}\n`, { flag: "wx" });
         const result = await performRenderRun({
           ...(workspace ? { workspace } : {}),
           manifest,
-          candidateIdentity,
-          candidate: candidateIdentity.runtime.root,
+          candidateIdentity: { candidateHash: execution.candidateHash },
+          candidate: execution.neutralRoot,
           oracle,
           directory,
           ...(renderRun ? { runId: renderRun.id } : {}),
           ...(parsed.options.renderer ? { backend: parsed.options.renderer } : {}),
           ...(parsed.options.precision ? { precision: Number(parsed.options.precision) } : {}),
         });
-        io.stdout(json({ status: `rendered-${result.backend}`, manifest: result.manifestPath, captures: result.captureCount, turntable: result.turntable.length }));
+        io.stdout(json({ status: `rendered-${result.backend}`, manifest: result.manifestPath, captures: result.captureCount, turntable: result.turntable.length, sceneArtifact: storedArtifactPath(sceneArtifactPath, workspace?.root) }));
         return 0;
       }
       case "review-ready": {
@@ -827,16 +975,31 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         // the full capture set through the same render implementation as `render`. This command
         // never starts the interactive viewer; it only reports capture paths and viewer status.
         const workspace = await resumeWorkspace(workspaceInput);
+        assertDevelopmentWorkspace(workspace);
         const manifest = (await verifyWorkspaceOraclePreparation(workspace)).manifest;
         const oracle = await loadPreparedOracle(manifest, workspace.root);
-        const candidateIdentity = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
+        const execution = await inspectWorkspaceCandidateViaExecutor({
+          workspaceRoot: workspace.root,
+          modelEntryPath: workspace.resolved.model,
+          boundaryRoot: resolve(workspace.root, "model"),
+          poses: [neutralPoseForProfile(workspace.project.profile)],
+          auditOptions: await trustedGeneratedAuditOptions(workspace),
+        });
+        const candidateIdentity = {
+          candidateHash: execution.candidateHash,
+          sourceHash: execution.sourceHash,
+          neutralSceneHash: execution.neutralSceneHash,
+          candidateFiles: execution.candidateFiles,
+        };
         if (candidateIdentity.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated candidate; rerun gate before handing off user-review captures");
         const renderRun = await createRunDirectory(workspace.layout.internal.captures, "render");
+        const sceneArtifactPath = join(renderRun.path, "viewer-scene.json");
+        await writeFile(sceneArtifactPath, `${json({ schemaVersion: 1, candidateHash: execution.candidateHash, sceneHash: execution.sceneHash, serialization: execution.serialization })}\n`, { flag: "wx" });
         const result = await performRenderRun({
           workspace,
           manifest,
-          candidateIdentity,
-          candidate: candidateIdentity.runtime.root,
+          candidateIdentity: { candidateHash: candidateIdentity.candidateHash },
+          candidate: execution.neutralRoot,
           oracle,
           directory: renderRun.path,
           runId: renderRun.id,
@@ -852,10 +1015,12 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
             manifest: storedArtifactPath(result.manifestPath, workspace.root),
             boards: result.comparisonBoards.map((board) => board.path),
             turntable: `${storedArtifactPath(renderRun.path, workspace.root)}/turntable/`,
+            viewerScene: storedArtifactPath(sceneArtifactPath, workspace.root),
           },
           viewer: viewer.status === "running"
             ? { status: "running", url: viewer.record.url }
             : { status: viewer.status, startCommand: "mesh2threejs viewer start <workspace>" },
+          note: "viewer start is not builder-autonomous in trusted mode and always requires explicit user approval",
         }));
         return 0;
       }
@@ -866,6 +1031,11 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         const root = resolve(workspaceInput);
         if (action === "start") {
           const workspace = await resumeWorkspace(root);
+          if (workspace.state.mirrorOfRun) {
+            // Mechanical ask-first boundary (§19): a trusted-run viewer start is a user
+            // approval, never a builder-autonomous operation.
+            throw new Error(`viewer start for trusted run ${workspace.state.mirrorOfRun.mirrorOfRun} requires explicit user approval through the run authority; the builder cannot start it`);
+          }
           const portOption = parsed.options.port ? (parsed.options.port === "auto" ? "auto" as const : Number(parsed.options.port)) : undefined;
           if (portOption !== undefined && portOption !== "auto" && !Number.isInteger(portOption)) throw new Error("--port must be an integer or auto");
           const result = await startViewer(root, { ...(portOption !== undefined ? { port: portOption } : {}) });
@@ -913,19 +1083,40 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         return verdict.passed ? 0 : 5;
       }
       case "finalize": {
+        // Trusted finalization is fail-closed (§17): certification requires a trusted run
+        // authority record, a fresh trusted global replay, current human approval, and a
+        // trusted-isolated candidate sandbox. Bare STATE.json and ordinary development
+        // workspaces can never certify — historical passed fields are provenance only.
         const path = parsed.positional[0];
         if (!path) throw new Error("finalize requires a workspace or state path");
         const target = await resolveStateTarget(path);
-        if (target.workspaceRoot) {
-          const workspace = await resumeWorkspace(target.workspaceRoot);
-          if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
-          const liveCandidate = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace));
-          if (liveCandidate.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
+        if (!target.workspaceRoot) {
+          io.stderr("TRUSTED_CERTIFICATION_UNAVAILABLE: bare-state finalize is development-only and cannot certify; trusted certification requires a trusted run authority");
+          return 6;
         }
-        const certified = await certifyStateFromArtifacts(await loadTaskState(target.statePath), target.workspaceRoot);
-        await saveTaskState(target.statePath, certified);
-        io.stdout(json({ status: certified.status, candidateHash: certified.candidateHash }));
-        return 0;
+        const workspace = await resumeWorkspace(target.workspaceRoot);
+        if (workspace.state.mirrorOfRun) {
+          io.stderr(`workspace is bound to trusted run ${workspace.state.mirrorOfRun.mirrorOfRun}; certification is executed by the trusted broker (human/admin capability), not this builder-invoked CLI`);
+          return 7;
+        }
+        if (workspace.project.oracle) await verifyWorkspaceOraclePreparation(workspace);
+        const execution = await inspectWorkspaceCandidateViaExecutor({
+          workspaceRoot: workspace.root,
+          modelEntryPath: workspace.resolved.model,
+          boundaryRoot: resolve(workspace.root, "model"),
+          poses: [neutralPoseForProfile(workspace.project.profile)],
+          auditOptions: await trustedGeneratedAuditOptions(workspace),
+        });
+        if (execution.candidateHash !== workspace.state.candidateHash) throw new Error("current workspace candidate differs from gated/reviewed candidate; rerun gate and review");
+        try {
+          const certified = await certifyStateFromArtifacts(await loadTaskState(target.statePath), target.workspaceRoot);
+          void certified;
+        } catch (error) {
+          io.stderr(`certification checks failed: ${error instanceof Error ? error.message : String(error)}`);
+          return 2;
+        }
+        io.stderr("TRUSTED_CERTIFICATION_UNAVAILABLE: development/untrusted reconstruction cannot claim certification; create a trusted run through the broker with human approval to certify");
+        return 6;
       }
       default:
         io.stderr(`unknown command: ${command}\n${HELP}`);

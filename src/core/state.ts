@@ -41,7 +41,13 @@ export interface EvidenceRecord {
   evaluationIdentityHash?: string | null;
 }
 
-export type EvidenceAuthority = "declared" | "runtime-gate-evaluation" | "runtime-render-capture" | "oracle-registration" | "external-visual-review";
+/**
+ * Evidence authority labels reflect real provenance. A builder-created verdict JSON is data
+ * only ("automated-visual-diagnostic"): final approval authority arrives exclusively through
+ * the trusted run authority's human capability ("human-visual-approval"). The legacy
+ * "external-visual-review" label is no longer issued; loading it invalidates the chain.
+ */
+export type EvidenceAuthority = "declared" | "runtime-gate-evaluation" | "runtime-render-capture" | "oracle-registration" | "automated-visual-diagnostic" | "human-visual-approval" | "trusted-final-replay";
 
 export interface GateEvidenceResult {
   code: string;
@@ -138,6 +144,12 @@ export interface TaskState {
   authorshipMode: AuthorshipMode;
   /** Trusted generated modules recorded by the derive pipeline, keyed by generated module path. */
   derivedBindings: Record<string, DerivedBinding>;
+  /**
+   * Mirror metadata for trusted runs. The workspace copy of state is a cache of the
+   * canonical run authority record; when present it must match the authority or the run
+   * fails closed with WORKSPACE_STATE_DRIFT.
+   */
+  mirrorOfRun?: { schemaVersion: 1; mirrorOfRun: string; sequence: number; hash: string };
 }
 
 function lifecycle(profile: ProfileId): { phases: string[]; dependencies: Record<string, string[]> } {
@@ -150,13 +162,13 @@ function lifecycle(profile: ProfileId): { phases: string[]; dependencies: Record
 
 function gateAuthority(owner: "oracle" | "builder" | "reviewer" | "finalizer"): EvidenceAuthority {
   if (owner === "oracle") return "oracle-registration";
-  if (owner === "reviewer") return "external-visual-review";
+  if (owner === "reviewer") return "human-visual-approval";
   return "runtime-gate-evaluation";
 }
 
 function evidenceAuthority(kind: EvidenceRecord["kind"]): EvidenceAuthority {
   if (kind === "registration") return "oracle-registration";
-  if (kind === "visual-review") return "external-visual-review";
+  if (kind === "visual-review") return "human-visual-approval";
   if (kind === "turntable") return "runtime-render-capture";
   return "runtime-gate-evaluation";
 }
@@ -386,13 +398,36 @@ export function createWorkflowGateEvidenceArtifact(input: Omit<UnsealedEvidenceI
   const { gateCode, passed, summary, details, ...artifact } = input;
   const expectedKind = gateCode === "registration.complete" ? "registration" : "visual-review";
   if (artifact.kind !== expectedKind) throw new Error(`${gateCode} evidence must use kind ${expectedKind}`);
-  return sealEvidenceArtifact({ ...artifact, gateResults: [{ code: gateCode, passed, score: passed ? 100 : 0 }], result: { passed, summary, ...(details === undefined ? {} : { details }) } }, gateCode === "registration.complete" ? "oracle-registration" : "external-visual-review");
+  return sealEvidenceArtifact({ ...artifact, gateResults: [{ code: gateCode, passed, score: passed ? 100 : 0 }], result: { passed, summary, ...(details === undefined ? {} : { details }) } }, gateCode === "registration.complete" ? "oracle-registration" : "human-visual-approval");
+}
+
+/**
+ * Records a builder/model-produced visual verdict as diagnostic data only. It can create
+ * workorders and reopen recommendations but never satisfies the visual.review gate.
+ */
+export function createAutomatedVisualAssessmentArtifact(input: { id: string; phase: string; oracleHash: string; candidateHash: string; profileContractHash: string; styleContractHash?: string; evaluationIdentityHash?: string | null; configHash: string } & { verdict: { verdict: "PASS" | "FAIL"; findings?: unknown[] }; packetHash: string }): EvidenceArtifact {
+  const { styleContractHash, evaluationIdentityHash, verdict, packetHash, ...artifact } = input;
+  const kind = "visual-review" as const;
+  void kind;
+  const passed = verdict.verdict === "PASS";
+  return sealEvidenceArtifact({
+    ...artifact,
+    ...(styleContractHash !== undefined ? { styleContractHash } : {}),
+    ...(evaluationIdentityHash !== undefined ? { evaluationIdentityHash } : {}),
+    kind,
+    gateResults: [{ code: "visual.review", passed, score: passed ? 100 : 0 }],
+    result: { passed, summary: `automated visual diagnostic ${verdict.verdict} (never final approval)`, details: { verdict, packetHash, authorityNote: "diagnostic-only" } },
+  }, "automated-visual-diagnostic");
+}
+
+export function isHumanVisualApprovalEvidence(artifactOrAuthority: Pick<EvidenceArtifact, "authority">): boolean {
+  return artifactOrAuthority.authority === "human-visual-approval";
 }
 
 export function verifyEvidenceArtifact(artifact: EvidenceArtifact): void {
   const { artifactHash, ...payload } = artifact;
   if (artifact.schemaVersion !== 3 || artifact.generator?.name !== "mesh2threejs" || artifact.generator.version !== EVIDENCE_GENERATOR_VERSION) throw new Error("evidence artifact schema/generator is invalid or unsupported");
-  if (!["declared", "runtime-gate-evaluation", "runtime-render-capture", "oracle-registration", "external-visual-review"].includes(artifact.authority)) throw new Error("evidence artifact authority is invalid");
+  if (!["declared", "runtime-gate-evaluation", "runtime-render-capture", "oracle-registration", "automated-visual-diagnostic", "human-visual-approval", "trusted-final-replay"].includes(artifact.authority)) throw new Error("evidence artifact authority is invalid");
   if (!artifact.styleContractHash) throw new Error("evidence artifact style contract hash is missing");
   if (artifact.kind !== "registration" && !artifact.evaluationIdentityHash) throw new Error("candidate-bound evidence lacks an evaluation identity");
   if (sha256(canonicalJson(payload)) !== artifactHash) throw new Error(`evidence artifact hash is invalid: ${artifact.id}`);
@@ -434,7 +469,9 @@ export function recordEvidenceArtifact(state: TaskState, artifactPath: string, a
     evaluationIdentityHash: artifact.evaluationIdentityHash,
     ...(artifact.gateResults ? { gateResults: artifact.gateResults.map((gate) => ({ ...gate })) } : {}),
   };
-  if (artifact.kind === "visual-review") next.visualReviewStatus = artifact.result.passed ? "passed" : "failed";
+  // Only genuine human approval authority may advance the review status; automated
+  // diagnostics are recorded as data and keep the run awaiting review.
+  if (artifact.kind === "visual-review" && artifact.authority === "human-visual-approval") next.visualReviewStatus = artifact.result.passed ? "passed" : "failed";
   next.verificationResults.push({ id: `verification-${next.verificationResults.length + 1}`, passed: artifact.result.passed, evidenceId: artifact.id });
   return next;
 }
@@ -686,7 +723,8 @@ export async function loadTaskState(path: string): Promise<TaskState> {
   // independent behavior until the project is explicitly rebound with a declared mode.
   state.authorshipMode ??= "independent";
   state.derivedBindings ??= {};
-  const lacksEvidenceAuthority = Object.values(state.evidence).some((evidence) => evidence.valid && evidence.verified && (!evidence.authority || !evidence.generatorVersion));
+  const lacksEvidenceAuthority = Object.values(state.evidence).some((evidence) => evidence.valid && evidence.verified && (!evidence.authority || !evidence.generatorVersion
+    || (evidence.authority as unknown as string) === "external-visual-review"));
   if (lacksEvidenceAuthority) {
     const contract = getProfileContract(state.profile);
     const phases = contract.phases.map((phase) => phase.id);
@@ -699,7 +737,7 @@ export async function loadTaskState(path: string): Promise<TaskState> {
     state.activePhase = phases[0]!;
     state.visualReviewStatus = "awaiting";
     state.status = "active";
-    state.systemDecisions.push({ id: "state-evidence-authority-migration", value: EVIDENCE_GENERATOR_VERSION, reason: "invalidated legacy evidence and locks because their evaluation authority cannot be established" });
+    state.systemDecisions.push({ id: "state-evidence-authority-migration", value: EVIDENCE_GENERATOR_VERSION, reason: "invalidated legacy evidence and locks because their evaluation authority cannot be established or relied on self-asserted external review" });
   }
   const lockedEvidenceIds = new Set(Object.values(state.locks).flatMap((lock) => lock.evidence.map((binding) => binding.id)));
   for (const evidence of Object.values(state.evidence)) {

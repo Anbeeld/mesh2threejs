@@ -5,7 +5,7 @@ import type { AuthorshipMode, CertificationLevel, ProfileId } from "../types.js"
 import { determineNextAction, loadTaskState, saveTaskState, createTaskState, type TaskState } from "./state.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { validateOracleManifest, validateProjectManifest, validateReferenceIndex } from "./schema.js";
-import { emptyGeneratedRegistry } from "./derivation.js";
+import { emptyGeneratedRegistry, MODEL_DERIVED_SCAFFOLD, MODEL_SCAFFOLD } from "./derivation.js";
 import { verifyOraclePreparation, type OracleManifest, type OraclePreparationBinding } from "./oracle.js";
 import { loadStyleContract, type StyleContract } from "../styles/low-poly.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
@@ -54,6 +54,9 @@ export interface ProjectConfigurationIdentity {
   style: string;
   certification: CertificationLevel;
   model: string;
+  /** Authorship mode participates in the configuration identity: switching mode forces rebind. */
+  authorshipMode: AuthorshipMode;
+  goal: string;
   oracle: { path: string; sha256: string; mode: ReferenceMode } | null;
   subjectContract: { path: string; sha256: string; mode: ReferenceMode } | null;
 }
@@ -71,6 +74,8 @@ export function projectConfigurationIdentity(project: ProjectManifest, reference
     style: project.style,
     certification: project.certification,
     model: project.model,
+    authorshipMode: project.authorshipMode ?? "independent",
+    goal: project.goal,
     oracle: selected(project.oracle, "oracle"),
     subjectContract: selected(project.subjectContract, "document"),
   };
@@ -255,24 +260,8 @@ async function planCopiedReference(
   return { kind, mode: "copy", operationalPath: resolver.toProjectPath(destination), originalPath: absolute, sha256: hash, source: absolute, destination };
 }
 
-export const MODEL_SCAFFOLD = `import * as THREE from "three";
-
-export function createCandidate() {
-  return new THREE.Group();
-}
-`;
-
-/**
- * Stable authored entry for DERIVED-mode projects: it never changes after initialization.
- * The pipeline composes phases by regenerating `.generated/registry.mjs`, which this entry
- * imports exactly once, so later derivations stay automatic without touching agent files.
- */
-export const MODEL_DERIVED_SCAFFOLD = `import { createGeneratedCandidate } from "./.generated/registry.mjs";
-
-export function createCandidate() {
-  return createGeneratedCandidate();
-}
-`;
+// Scaffolds live with the derivation composition layer; re-exported for API compatibility.
+export { MODEL_SCAFFOLD, MODEL_DERIVED_SCAFFOLD } from "./derivation.js";
 
 export async function initializeWorkspace(directory: string, input: InitializeWorkspaceInput): Promise<{ root: string; layout: WorkspaceLayout; project: ProjectManifest; references: ReferenceIndex; directories: string[] }> {
   const resolver = createWorkspaceResolver(directory);
@@ -534,6 +523,10 @@ export async function rebindWorkspace(input: string): Promise<ResumedWorkspace> 
   const root = await locateWorkspaceRoot(input);
   const resolver = createWorkspaceResolver(root);
   const project = await readProject(resolver.layout.project);
+  // Rebind is an administrative/new-run operation, never a builder repair route. A
+  // workspace bound to a trusted run cannot be rebound through builder capability.
+  const currentState = await loadTaskState(resolver.layout.internal.state);
+  if (currentState.mirrorOfRun) throw new Error(`workspace is bound to trusted run ${currentState.mirrorOfRun.mirrorOfRun}; rebinding requires the trusted authority (migrate-rebase), not a builder operation`);
   const referenceValue: unknown = JSON.parse(await readFile(resolver.layout.internal.references, "utf8"));
   const validation = validateReferenceIndex(referenceValue);
   if (!validation.valid) throw new Error(`reference index is invalid: ${JSON.stringify(validation.errors)}`);

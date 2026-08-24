@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, extname, join, parse, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as THREE from "three";
 import type { CandidateModule, CandidateRuntime } from "../types.js";
@@ -14,6 +14,9 @@ export interface CandidateAudit {
 /** Findings that a verified pipeline-generated module is allowed to carry: density itself is expected tool output. */
 const GENERATED_WAIVABLE_FINDINGS = new Set(["dense-binary-payload", "topology-dump", "opaque-topology-payload"]);
 
+/** Bare specifiers a candidate may import; everything else is refused at audit time. */
+const ALLOWED_BARE_SPECIFIERS = new Set(["three", "mesh2threejs"]);
+
 export interface CandidateAuditOptions {
   /**
    * Verified derivation manifests keyed by ABSOLUTE generated-module path, produced by the
@@ -22,6 +25,12 @@ export interface CandidateAuditOptions {
    * the ordinary hand-authored topology restrictions.
    */
   trustedGeneratedModules?: ReadonlyMap<string, unknown>;
+  /**
+   * Workspace-aware confinement root (the workspace `model/` directory). When present the
+   * audited graph must resolve strictly inside it via realpath/lstat — string checks alone
+   * never establish the boundary.
+   */
+  boundaryRoot?: string;
 }
 
 export interface CandidateSourceFile {
@@ -77,16 +86,131 @@ export function auditCandidateSource(source: string): CandidateAudit {
   return { passed: findings.length === 0, findings };
 }
 
+/**
+ * Comment/string/template-aware module lexer. Produces the source with comments blanked so
+ * specifier extraction cannot be hidden inside comments, while string literals survive for
+ * exact matching. This is defense-in-depth for the audit layer; the sandbox remains the
+ * mandatory execution boundary for trusted runs.
+ */
+export function stripJavascriptComments(source: string): string {
+  let output = "";
+  let index = 0;
+  const length = source.length;
+  type Frame = "single" | "double" | "template" | "interp";
+  const stack: Frame[] = [];
+  const mode = (): Frame | "code" => stack.length ? stack[stack.length - 1]! : "code";
+  while (index < length) {
+    const char = source[index];
+    const next = index + 1 < length ? source[index + 1]! : "";
+    const current = mode();
+    if (current === "single" || current === "double") {
+      output += char;
+      if (char === "\\") { output += next ?? ""; index += 2; continue; }
+      if ((current === "single" && char === "'") || (current === "double" && char === '"')) stack.pop();
+      index += 1;
+      continue;
+    }
+    if (current === "template") {
+      output += char;
+      if (char === "\\") { output += next ?? ""; index += 2; continue; }
+      if (char === "`") stack.pop();
+      else if (char === "$" && next === "{") { output += "{"; stack.push("interp"); index += 2; continue; }
+      index += 1;
+      continue;
+    }
+    if (current === "interp" && char === "}") {
+      output += "}";
+      stack.pop();
+      index += 1;
+      continue;
+    }
+    // Code context (stack empty or interp body).
+    if (char === "/" && next === "/") {
+      output += "  ";
+      index += 2;
+      for (; index < length && source[index] !== "\n"; index += 1) output += " ";
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      output += "  ";
+      index += 2;
+      for (;;) {
+        if (index >= length) break;
+        if (source[index] === "*" && source[index + 1] === "/") { output += "  "; index += 2; break; }
+        output += source[index] === "\n" ? "\n" : " ";
+        index += 1;
+      }
+      continue;
+    }
+    if (char === "'") { output += char; stack.push("single"); index += 1; continue; }
+    if (char === '"') { output += char; stack.push("double"); index += 1; continue; }
+    if (char === "`") { output += char; stack.push("template"); index += 1; continue; }
+    output += char;
+    index += 1;
+  }
+  return output;
+}
+
+export interface ScannedImports {
+  /** Static import/export-from specifiers in declaration order. */
+  static: string[];
+  /** Dynamic import() specifiers that are plain string literals. */
+  dynamic: string[];
+}
+
+export function scanModuleSpecifiers(source: string): ScannedImports {
+  const code = stripJavascriptComments(source);
+  const staticSpecifiers: string[] = [];
+  for (const match of code.matchAll(/(?:^|[;{}\s)])import\s*(?:[\w$*{}\s,]*?\bfrom\s*)?["']([^"'\n]+)["']/gu)) {
+    staticSpecifiers.push(match[1]!);
+  }
+  for (const match of code.matchAll(/\bexport\s+(?:[\w$*{}\s,]*?\bfrom\s*)["']([^"'\n]+)["']/gu)) {
+    staticSpecifiers.push(match[1]!);
+  }
+  const dynamic: string[] = [];
+  for (const match of code.matchAll(/\bimport\s*\(\s*["']([^"'\n]+)["']\s*\)/gu)) {
+    dynamic.push(match[1]!);
+  }
+  return { static: staticSpecifiers, dynamic };
+}
+
+async function assertRealpathInside(root: string, target: string, label: string): Promise<void> {
+  const info = await lstat(target);
+  if (info.isSymbolicLink()) throw new Error(`${label} escapes the candidate boundary through a symlink/reparse point: ${target}`);
+  const realTarget = await realpath(target);
+  const realRoot = await realpath(root);
+  const relation = relative(realRoot, realTarget);
+  if (!relation || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || relation === ".." || isAbsolute(relation)) {
+    throw new Error(`${label} escapes the candidate boundary root: ${target}`);
+  }
+}
+
+function classifySpecifier(specifier: string): "local" | "absolute" | "url" | "bare" {
+  if (/^(?:https?:|file:|data:)/iu.test(specifier)) return "url";
+  if (specifier.startsWith(".") || specifier.startsWith("#")) return "local";
+  if (isAbsolute(specifier) || /^[a-zA-Z]:[/\\]/u.test(specifier)) return "absolute";
+  return "bare";
+}
+
 export async function auditCandidateModule(entryPath: string, options: CandidateAuditOptions = {}): Promise<CandidateModuleAudit> {
   const visited = new Set<string>();
   const sources = new Map<string, string>();
   const findings: CandidateAudit["findings"] = [];
   const trusted = options.trustedGeneratedModules ?? new Map<string, unknown>();
   const trustedGeneratedModules: string[] = [];
+  const boundaryRoot = options.boundaryRoot ? await realpath(resolve(options.boundaryRoot)) : undefined;
   const visit = async (path: string): Promise<void> => {
     const absolute = resolve(path);
     if (visited.has(absolute)) return;
     visited.add(absolute);
+    if (boundaryRoot) {
+      try {
+        await assertRealpathInside(boundaryRoot, absolute, "candidate file");
+      } catch (error) {
+        findings.push({ code: "boundary-escape", message: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+    }
     const source = await readFile(absolute, "utf8");
     sources.set(absolute, source);
     const fileFindings = auditCandidateSource(source).findings;
@@ -98,15 +222,27 @@ export async function auditCandidateModule(entryPath: string, options: Candidate
     } else {
       findings.push(...fileFindings.map((finding) => ({ ...finding, message: `${absolute}: ${finding.message}` })));
     }
-    // Candidate-local imports must be static. The staged source graph is removed once the module is instantiated,
-    // so a dynamic import inside createCandidate()/setPose() would resolve into a deleted directory and produce
-    // runtime behavior that the audited bytes do not determine.
-    for (const match of source.matchAll(/import\s*\(\s*["'](\.[^"']+)["']\s*\)/gu)) {
-      findings.push({ code: "dynamic-local-import", message: `${absolute}: dynamic local import ${match[1]} escapes the staged source graph; use a static import` });
+    const scanned = scanModuleSpecifiers(source);
+    for (const specifier of scanned.dynamic) {
+      findings.push({ code: "dynamic-local-import", message: `${absolute}: dynamic import ${specifier} escapes the staged source graph; use a static import` });
     }
-    const imports = [...source.matchAll(/(?:from\s*|import\s*)["'](\.[^"']+)["']/gu)].map((match) => match[1]).filter((value): value is string => Boolean(value));
-    for (const specifier of imports) {
-      const base = resolve(dirname(absolute), specifier);
+    for (const specifier of scanned.static) {
+      const kind = classifySpecifier(specifier);
+      if (kind === "url") {
+        findings.push({ code: "url-module-import", message: `${absolute}: URL/data module import is forbidden: ${specifier}` });
+        continue;
+      }
+      if (kind === "absolute") {
+        findings.push({ code: "absolute-import", message: `${absolute}: absolute-path import is forbidden: ${specifier}` });
+        continue;
+      }
+      if (kind === "bare") {
+        if (!ALLOWED_BARE_SPECIFIERS.has(specifier)) {
+          findings.push({ code: "disallowed-bare-import", message: `${absolute}: bare import ${specifier} is not an allowed trusted dependency` });
+        }
+        continue;
+      }
+      const base = resolve(dirname(absolute), specifier.split("?")[0]!);
       const candidates = extname(base) ? [base] : [`${base}.js`, `${base}.mjs`, `${base}.ts`, resolve(base, "index.js")];
       let imported: string | undefined;
       for (const candidate of candidates) {
@@ -117,6 +253,7 @@ export async function auditCandidateModule(entryPath: string, options: Candidate
     }
   };
   const entry = resolve(entryPath);
+  if (boundaryRoot) await assertRealpathInside(boundaryRoot, entry, "candidate entry");
   await visit(entry);
   const files = [...visited].sort();
   const base = dirname(entry);
@@ -172,17 +309,15 @@ async function exposePipelineThree(stageRoot: string): Promise<void> {
 }
 
 /**
- * Stages the exact audited transitive source graph in a fresh location and imports it from there.
- * A bare entry-module cache-buster is insufficient because Node's ESM cache keys transitive local
- * imports by URL; a long-lived process could report source B while executing cached helper A.
- * Staging under the graph's common ancestor keeps package.json module-type semantics identical to
- * the original location — bare "three" resolution is provided by the stage-root junction in
- * exposePipelineThree() — while every load sees the
- * bytes that produced the source hash. Execution from the staged copy is short-lived: the directory
- * is removed as soon as the module graph has been instantiated, which is why the audit requires
- * candidate-local imports to be static.
+ * Stages the exact audited transitive source graph in a fresh location and returns it for
+ * sandboxed execution. A bare entry-module cache-buster is insufficient because Node's ESM
+ * cache keys transitive local imports by URL; a long-lived process could report source B
+ * while executing cached helper A. Staging under the graph's common ancestor keeps
+ * package.json module-type semantics identical to the original location — bare "three"
+ * resolution is provided by the stage-root junction in exposePipelineThree() — while every
+ * load sees the bytes that produced the source hash.
  */
-async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudit): Promise<{ root: string; entry: string }> {
+export async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudit): Promise<{ root: string; entry: string }> {
   const entry = resolve(entryPath);
   const hashByAbsolute = new Map(audit.candidateFiles.map((file) => [resolve(dirname(entry), file.path), file.sha256]));
   const files = audit.files.map((file) => resolve(file));
@@ -205,6 +340,10 @@ async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudi
   }
 }
 
+/**
+ * Development-only in-process loader. Trusted runs execute candidates exclusively through
+ * the CandidateExecutor sandbox boundary instead of this direct import.
+ */
 export async function loadCandidateRuntime(path: string, suppliedAudit?: CandidateModuleAudit): Promise<CandidateRuntime> {
   const audit = suppliedAudit ?? await auditCandidateModule(path);
   if (!audit.passed) throw new Error(`candidate source audit failed: ${audit.findings.map((finding) => finding.code).join(", ")}`);

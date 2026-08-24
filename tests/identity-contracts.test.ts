@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+﻿import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as THREE from "three";
@@ -149,8 +149,11 @@ describe("canonical candidate and evaluation identity", () => {
       oraclePreparationHash: "preparation-a",
       preparedOracleHash: "prepared-a",
       authoritativeDimensionsHash: null,
-      candidateSourceHash: "source-a",
+      candidateSourceHash: "x",
       candidateNeutralHash: "neutral-a",
+      toolchainId: null,
+      projectPolicyHash: null,
+      candidateIsolation: "development-process",
     });
     const changes = [
       { evaluatorVersion: "5" },

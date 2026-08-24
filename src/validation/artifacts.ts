@@ -75,10 +75,27 @@ export async function validateRepositoryArtifacts(root: string): Promise<Artifac
   }
   for (const host of ["codex", "claude-code", "opencode"]) {
     try {
-      const adapter = await jsonFile(join(base, "adapters", host, "adapter.json")) as { host?: unknown; status?: unknown; capabilities?: { actualVisualReview?: unknown } };
+      const adapter = await jsonFile(join(base, "adapters", host, "adapter.json")) as {
+        host?: unknown;
+        status?: unknown;
+        cli?: unknown;
+        trustedReconstruction?: unknown;
+        builderToolIsolation?: unknown;
+        toolchainWriteIsolation?: unknown;
+        humanApprovalSeparation?: unknown;
+        candidateSandboxBackend?: unknown;
+        capabilities?: { actualVisualReview?: unknown };
+      };
       if (typeof adapter.host !== "string" || typeof adapter.status !== "string" || typeof adapter.capabilities?.actualVisualReview !== "boolean") {
         errors.push(`${host} adapter has an invalid capability contract`);
       }
+      // Verified-facts truth fields (plan §20/§26): hosts that have not proven every trusted
+      // boundary must declare trustedReconstruction=false and unverified isolation facts.
+      if (adapter.trustedReconstruction !== false) errors.push(`${host} adapter must declare trustedReconstruction=false until a host trial proves every trusted boundary`);
+      for (const field of ["builderToolIsolation", "toolchainWriteIsolation", "humanApprovalSeparation"] as const) {
+        if (adapter[field] !== "unverified") errors.push(`${host} adapter ${field} must be "unverified" until a host trial proves it`);
+      }
+      if (adapter.candidateSandboxBackend !== "none") errors.push(`${host} adapter candidateSandboxBackend must be "none" until a verified sandbox backend is demonstrated`);
       validated += 1;
     } catch (error) {
       errors.push(`${host} adapter: ${String(error)}`);

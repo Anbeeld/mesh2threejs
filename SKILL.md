@@ -28,4 +28,4 @@ Route with `mesh2threejs route <task>` and load exactly one role skill from `ski
 
 Select `profiles/tank/` only for explicit or unmistakable tanks/tracked armored vehicles; otherwise use `profiles/generic/`. Load that profile's executable `contract.json` and `styles/low-poly-faithful.json` unless the task names another validated style.
 
-Completion means `mesh2threejs finalize <workspace>` succeeds for the exact final hashes and the handoff includes source, reports, board, turntable, provenance, and intentional simplifications.
+Completion means trusted certification succeeds for the exact final hashes and the handoff includes source, reports, board, turntable, provenance, and intentional simplifications. Development/untrusted runs never claim certification: finalize refuses, record-review verdicts are diagnostic-only data, and human approval enters only through the trusted run authority.

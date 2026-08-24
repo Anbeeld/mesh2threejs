@@ -21,7 +21,7 @@ describe("canonical procedural candidate", () => {
   test("loads an independently authored Three.js factory module", async () => {
     const directory = await mkdtemp(join(tmpdir(), "mesh2threejs-candidate-"));
     const path = join(directory, "candidate.mjs");
-    await writeFile(path, `import * as THREE from ${JSON.stringify(new URL("../node_modules/three/build/three.module.js", import.meta.url).href)}; export function createCandidate(){ return new THREE.Group(); }`);
+    await writeFile(path, `import * as THREE from "three"; export function createCandidate(){ return new THREE.Group(); }`);
     const candidate = await loadCandidateModule(path);
     expect(candidate.isObject3D).toBe(true);
     const first = await loadCandidateRuntime(path);

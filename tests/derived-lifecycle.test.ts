@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+﻿import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as THREE from "three";
@@ -175,7 +175,7 @@ describe("synthetic multi-phase derived tank lifecycle", () => {
     const readState = async (): Promise<Awaited<ReturnType<typeof loadTaskState>>> => loadTaskState(statePath);
     const lockedHashes = new Map<string, string>();
 
-    // Derive → gate → lock through every supported derivation phase. Tracks passing PROVES
+    // Derive â†’ gate â†’ lock through every supported derivation phase. Tracks passing PROVES
     // contextual composition: an isolated track seed cannot clear course diagnostics that
     // measure against the locked hull envelope.
     for (const phase of ["hull", "turret", "gun", "running-gear", "tracks"] as const) {
@@ -326,7 +326,7 @@ describe("phase composition and hierarchy regressions", () => {
   });
 
   test("over-budget fallback is retained only as diagnostic material, never a lockable seed", () => {
-    const tier = (overrides: Partial<{ passed: boolean; score: number; withinComplexityBudget: boolean }>, tierName: "aggressive" | "balanced" | "conservative" | "source-cleaned" = "source-cleaned") => ({
+    const tier = (overrides: Partial<{ passed: boolean; score: number; withinComplexityBudget: boolean }>, tierName: "componentwise-aggressive" | "componentwise-balanced" | "componentwise-conservative" | "source-preserve" = "source-preserve") => ({
       tier: tierName,
       triangles: 90_000,
       passed: false,
@@ -335,24 +335,24 @@ describe("phase composition and hierarchy regressions", () => {
     });
     // Geometric pass on the fallback tier but beyond the hard ceiling: diagnostic-only.
     const overBudget = resolveSeedOutcome([
-      tier({ score: 40 }, "aggressive"),
-      tier({ score: 60 }, "conservative"),
+      tier({ score: 40 }, "componentwise-aggressive"),
+      tier({ score: 60 }, "componentwise-conservative"),
       tier({ passed: true, score: 95, withinComplexityBudget: false }),
     ]);
     expect(overBudget.status).toBe("seed-diagnostic-overbudget");
     expect(overBudget.reasonCode).toBe("derive.over-budget-fallback");
-    expect(overBudget.chosen?.tier).toBe("source-cleaned");
+    expect(overBudget.chosen?.tier).toBe("source-preserve");
 
     // A cheaper tier that passes AND fits wins outright.
     const clean = resolveSeedOutcome([
-      { tier: "aggressive", triangles: 400, passed: true, score: 96, withinComplexityBudget: true },
-      { tier: "source-cleaned", triangles: 90_000, passed: true, score: 99, withinComplexityBudget: false },
+      { tier: "componentwise-aggressive", triangles: 400, passed: true, score: 96, withinComplexityBudget: true },
+      { tier: "source-preserve", triangles: 90_000, passed: true, score: 99, withinComplexityBudget: false },
     ]);
     expect(clean.status).toBe("seed-passing");
-    expect(clean.chosen?.tier).toBe("aggressive");
+    expect(clean.chosen?.tier).toBe("componentwise-aggressive");
 
     // Nothing passes: retained failing with its reason code.
-    const failing = resolveSeedOutcome([tier({ score: 30 }, "conservative")]);
+    const failing = resolveSeedOutcome([tier({ score: 30 }, "componentwise-conservative")]);
     expect(failing.status).toBe("seed-retained-failing");
     expect(failing.reasonCode).toBe("derive.no-passing-tier");
   });

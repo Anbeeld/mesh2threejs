@@ -45,7 +45,8 @@ export interface PerformRenderRunOptions {
   /** When present, the run is bound to the live workspace state and emits turntable evidence. */
   workspace?: ResumedWorkspace;
   manifest: OracleManifest;
-  candidateIdentity: CandidateIdentity;
+  /** Only the trusted candidate hash participates in render evidence binding. */
+  candidateIdentity: Pick<CandidateIdentity, "candidateHash">;
   candidate: import("three").Object3D;
   oracle: import("three").Object3D;
   /** Absolute output directory; created when missing. */
@@ -180,7 +181,7 @@ export interface QuickDiagnosticResult {
  * surface — it never records visual-review evidence, never emits a turntable, and its run
  * directories are deliberately invisible to user-review packet assembly (`quick-*` vs `render-*`).
  */
-export async function performQuickDiagnosticRun(workspace: ResumedWorkspace, manifest: OracleManifest, oracle: import("three").Object3D, candidateIdentity: CandidateIdentity, candidate: import("three").Object3D, backend: RenderBackend = "deterministic-cpu"): Promise<QuickDiagnosticResult> {
+export async function performQuickDiagnosticRun(workspace: ResumedWorkspace, manifest: OracleManifest, oracle: import("three").Object3D, candidateIdentity: Pick<CandidateIdentity, "candidateHash">, candidate: import("three").Object3D, backend: RenderBackend = "deterministic-cpu"): Promise<QuickDiagnosticResult> {
   const directory = await createPrefixedRunDirectory(workspace.layout.internal.captures, "quick");
   const oracleSnapshot = snapshotScene(oracle);
   const candidateSnapshot = snapshotScene(candidate);

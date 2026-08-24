@@ -5,7 +5,12 @@
   "instructionFiles": ["AGENTS.md", "SKILL.md"],
   "skillRoot": "skills",
   "launch": "Start Claude Code in the repository and explicitly ask it to read AGENTS.md and SKILL.md before selecting a role skill.",
-  "cli": "node dist/cli.js",
+  "cli": "mesh2threejs-broker (trusted operations run through the broker tool server launched from the packaged installation; node dist/cli.js is development-only)",
+  "trustedReconstruction": false,
+  "builderToolIsolation": "unverified",
+  "toolchainWriteIsolation": "unverified",
+  "humanApprovalSeparation": "unverified",
+  "candidateSandboxBackend": "none",
   "capabilities": { "projectInstructionDiscovery": false, "skillDiscovery": false, "nestedReferences": false, "commandExecution": false, "browserThreeJs": false, "durableState": true, "actualVisualReview": false },
   "limitations": ["Claude Code was not installed in the validation environment; host discovery and launch are unverified."]
 }

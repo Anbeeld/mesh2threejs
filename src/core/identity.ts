@@ -4,8 +4,10 @@ import { canonicalJson, sha256 } from "./hashing.js";
 export const EVALUATOR_VERSION = "8";
 export const MEASUREMENT_VERSION = "4";
 
+export type CandidateIsolationIdentity = "development-process" | "trusted-isolated" | "unconfigured";
+
 export interface EvaluationIdentity {
-  schemaVersion: 1;
+  schemaVersion: 2;
   evaluatorVersion: string;
   measurementVersion: string;
   profile: ProfileId;
@@ -18,18 +20,29 @@ export interface EvaluationIdentity {
   authoritativeDimensionsHash: string | null;
   candidateSourceHash: string;
   candidateNeutralHash: string;
+  /** Identity of the trusted toolchain that evaluated the candidate. */
+  toolchainId: string | null;
+  /** Hash of the immutable run policy governing the evaluation. */
+  projectPolicyHash: string | null;
+  /** Isolation classification of the sandbox that executed the candidate. */
+  candidateIsolation: CandidateIsolationIdentity;
 }
 
 export function createEvaluationIdentity(input: Omit<EvaluationIdentity, "schemaVersion">): EvaluationIdentity {
   for (const [key, value] of Object.entries(input)) {
     if (value === "") throw new Error(`evaluation identity is missing ${key}`);
   }
-  return { schemaVersion: 1, ...input };
+  return { schemaVersion: 2, ...input };
 }
 
 export function evaluationIdentityHash(identity: EvaluationIdentity): string {
-  if (identity.schemaVersion !== 1) throw new Error("evaluation identity schema is unsupported");
+  if (identity.schemaVersion !== 2) throw new Error("evaluation identity schema is unsupported");
   return sha256(canonicalJson(identity));
+}
+
+/** True when the identity was produced under a trusted-isolated execution and trusted toolchain. */
+export function isTrustedEvaluationIdentity(identity: EvaluationIdentity): boolean {
+  return identity.toolchainId !== null && identity.candidateIsolation === "trusted-isolated";
 }
 
 export function optionalContractHash(value: unknown): string | null {

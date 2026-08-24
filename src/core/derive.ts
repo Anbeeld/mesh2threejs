@@ -1,27 +1,32 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+﻿import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 import { join } from "node:path";
 import * as THREE from "three";
 import { MeshoptSimplifier } from "meshoptimizer";
 import type { ResumedWorkspace } from "./workspace.js";
-import { MODEL_DERIVED_SCAFFOLD, MODEL_SCAFFOLD, verifyWorkspaceCandidateIdentity, verifyWorkspaceOraclePreparation } from "./workspace.js";
+import { MODEL_DERIVED_SCAFFOLD, MODEL_SCAFFOLD, verifyWorkspaceOraclePreparation } from "./workspace.js";
 import { loadPreparedOracle } from "./oracle.js";
 import { loadTaskState, saveTaskState } from "./state.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { snapshotScene } from "./geometry.js";
 import { measureBounds, measureWheelRadialProfile } from "./measurement.js";
-import { evaluateCandidateWithPoses } from "./orchestration.js";
+import { requiredPosesForProfile, neutralPoseForProfile } from "./orchestration.js";
 import { getProfileContract } from "./contracts.js";
 import {
   GENERATED_DIRECTORY,
   GENERATED_REGISTRY_PATH,
+  REPAIRS_DIRECTORY,
   derivedDirectory,
   derivationManifestHash,
+  discoverRepairs,
   generateRegistrySource,
   loadTrustedGeneratedModules,
+  repairBinding,
+  verifyDerivedLineage,
   type DerivationManifest,
 } from "./derivation.js";
-import { composeCandidateForPhase, type ComposedCandidateRuntime } from "./phase-compose.js";
+import { assertAssemblyCoverage } from "./assembly.js";
+import { phaseOwnedSemantics } from "./phase-compose.js";
 import type { GenericSubjectContract } from "../profiles/generic.js";
 import type { Bounds3, CandidateRuntime, Point3, ProfileId, SceneSnapshot, Workorder } from "../types.js";
 
@@ -43,7 +48,7 @@ export interface DeriveTierResult {
   simplifierError?: number;
 }
 
-export type DeriveTierResultTier = "aggressive" | "balanced" | "conservative" | "source-cleaned";
+export type DeriveTierResultTier = "componentwise-aggressive" | "componentwise-balanced" | "componentwise-conservative" | "source-preserve";
 
 export type DeriveStatus = "seed-passing" | "seed-retained-failing" | "seed-diagnostic-overbudget" | "not-supported";
 
@@ -68,27 +73,32 @@ export interface DeriveResult {
   note?: string;
 }
 
-/** Deterministic seed route per active builder phase. */
-function phaseOperator(phase: string): { operator: DerivationManifest["operator"]; semantics: (id: string) => boolean; label: string } | null {
-  if (phase === "hull") return { operator: "mesh-simplify", semantics: (id) => id.startsWith("hull"), label: "hull" };
-  if (phase === "turret") return { operator: "mesh-simplify", semantics: (id) => id === "turret" || id === "cupola", label: "turret" };
+/**
+ * Deterministic seed route per active builder phase. Source selection uses the SINGLE
+ * authoritative profile phase-ownership resolver shared with phase scope, composition, and
+ * hashing â€” never a phase-specific hard-coded predicate (Â§11.2).
+ */
+function phaseOperator(profile: ProfileId, phase: string): { operator: DerivationManifest["operator"]; semantics: (id: string, role?: string) => boolean; label: string } | null {
+  const ownership = phaseOwnedSemantics(profile, phase);
+  if (phase === "hull" || phase === "turret") return { operator: "mesh-simplify", semantics: ownership ?? (() => false), label: phase };
   if (phase === "gun") return { operator: "axis-fit", semantics: () => false, label: "gun" };
-  if (phase === "running-gear") return { operator: "radial-fit", semantics: (id) => /^(road-wheel|sprocket|idler|return-roller)/u.test(id), label: "running gear" };
-  if (phase === "tracks") return { operator: "course-regenerate", semantics: (id) => id.startsWith("track"), label: "tracks" };
+  if (phase === "running-gear") return { operator: "radial-fit", semantics: ownership ?? (() => false), label: "running gear" };
+  if (phase === "tracks") return { operator: "course-regenerate", semantics: ownership ?? (() => false), label: "tracks" };
   return null;
 }
 
 const TIERS: ReadonlyArray<{ tier: DeriveTierResultTier; ratio?: number; error?: number }> = [
-  { tier: "aggressive", ratio: 0.02, error: 0.05 },
-  { tier: "balanced", ratio: 0.05, error: 0.03 },
-  { tier: "conservative", ratio: 0.12, error: 0.01 },
-  { tier: "source-cleaned" },
+  { tier: "componentwise-aggressive", ratio: 0.02, error: 0.05 },
+  { tier: "componentwise-balanced", ratio: 0.05, error: 0.03 },
+  { tier: "componentwise-conservative", ratio: 0.12, error: 0.01 },
+  { tier: "source-preserve" },
 ];
 
 function tiersForQuality(quality: DeriveQuality | undefined, analytic: boolean): ReadonlyArray<{ tier: DeriveTierResultTier; ratio?: number; error?: number }> {
   // Analytic routes regenerate primitives deterministically; there is exactly one recipe.
   if (analytic) return TIERS.slice(-1);
-  const index = TIERS.findIndex((tier) => tier.tier === quality);
+  const requested = quality ? `componentwise-${quality}` as DeriveTierResultTier : undefined;
+  const index = requested ? TIERS.findIndex((tier) => tier.tier === requested) : -1;
   return index >= 0 ? TIERS.slice(0, index + 1) : TIERS;
 }
 
@@ -103,10 +113,10 @@ interface TriangleSoup {
  * the evaluator's own snapshot pipeline, so transforms are baked identically and the seed
  * measures exactly like the oracle surfaces it came from.
  */
-function collectSemantics(snapshot: SceneSnapshot, predicate: (id: string) => boolean): Map<string, TriangleSoup> {
+function collectSemantics(snapshot: SceneSnapshot, predicate: (id: string, role?: string) => boolean): Map<string, TriangleSoup> {
   const soups = new Map<string, TriangleSoup>();
   for (const component of Object.values(snapshot.components)) {
-    if (!predicate(component.id) || !component.triangleIndices.length) continue;
+    if (!predicate(component.id, component.role) || !component.triangleIndices.length) continue;
     const soup: TriangleSoup = { positions: [], indices: [], triangleCount: component.triangleIndices.length };
     const baseByPosition = new Map<string, number>();
     for (const localIndex of component.triangleIndices) {
@@ -240,7 +250,7 @@ function triangleArea(a: Point3, b: Point3, c: Point3): number {
 /**
  * Conservative insignificant-component pruning for SEED GENERATION ONLY: a component is
  * removed when it is clearly negligible in BOTH relative surface area AND relative bounds.
- * When uncertain, the component is kept — the simplifier can shed complexity later.
+ * When uncertain, the component is kept â€” the simplifier can shed complexity later.
  */
 function pruneInsignificant(mesh: CleanedMesh): CleanedMesh {
   if (mesh.components.length <= 1) return mesh;
@@ -353,7 +363,7 @@ function emitGeneratedModule(name: string, nodes: SeedNode[]): string {
   const lines: string[] = [];
   lines.push(`import * as THREE from "three";`);
   lines.push(``);
-  lines.push(`// Generated by mesh2threejs derive — trusted pipeline tool output.`);
+  lines.push(`// Generated by mesh2threejs derive â€” trusted pipeline tool output.`);
   lines.push(`// Provenance: .mesh2threejs/derived/${name}.json (do not edit by hand).`);
   const meshes = nodes.filter((node): node is SeedNode & { kind: "mesh"; positions: Float32Array; indices: Uint32Array } => node.kind === "mesh");
   for (const mesh of meshes) {
@@ -499,7 +509,7 @@ function buildTrackSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTria
       };
       const points: Array<[number, number]> = [];
       // Twelve steps per quarter-arc: the wrap-normal diagnostic bins face normals at
-      // 7.5° granularity and demands near-source diversity, so the arc must place at
+      // 7.5Â° granularity and demands near-source diversity, so the arc must place at
       // least one facet in every angular bin the source's curved wrap covers.
       const arcSteps = 12;
       points.push([left + radius, bottom]);
@@ -646,8 +656,71 @@ interface PhaseSeed {
   simplify: (ratio: number | undefined, error: number | undefined) => Promise<{ nodes: SeedNode[]; error?: number }>;
 }
 
-async function buildMeshSimplifySeed(snapshot: SceneSnapshot, phase: string): Promise<PhaseSeed> {
-  const route = phaseOperator(phase)!;
+/**
+ * Extracts one connected island into a standalone indexed mesh so it can be simplified
+ * INDEPENDENTLY of every other island (Â§12). Islands never share welded vertex indices, so
+ * the remap is exact.
+ */
+function extractIsland(positions: Float32Array, indices: Uint32Array): { positions: Float32Array; indices: Uint32Array } {
+  const remap = new Map<number, number>();
+  const outPositions: number[] = [];
+  const outIndices = new Uint32Array(indices.length);
+  for (let slot = 0; slot < indices.length; slot += 1) {
+    const original = indices[slot]!;
+    let mapped = remap.get(original);
+    if (mapped === undefined) {
+      mapped = outPositions.length / 3;
+      remap.set(original, mapped);
+      outPositions.push(positions[original * 3]!, positions[original * 3 + 1]!, positions[original * 3 + 2]!);
+    }
+    outIndices[slot] = mapped;
+  }
+  return { positions: Float32Array.from(outPositions), indices: outIndices };
+}
+
+const MIN_ISLAND_TRIANGLES = 24;
+
+/**
+ * Multipart source-preserving simplification (Â§12): each significant connected component is
+ * simplified independently under a deterministic per-component budget derived from its
+ * surface-area share (square-root weighted, with a minimum floor), so one dominant shell
+ * can never erase smaller silhouette-defining islands. Borders stay locked; the source
+ * tier keeps everything untouched.
+ */
+async function simplifyComponentwise(mesh: CleanedMesh, ratio: number | undefined, error: number | undefined): Promise<{ positions: Float32Array; indices: Uint32Array; error?: number }> {
+  if (ratio === undefined || mesh.components.length <= 1) return simplifyMesh(mesh.positions, mesh.indices, ratio, error);
+  const totalArea = mesh.components.reduce((sum, component) => sum + component.area, 0) || 1e-9;
+  const maxDiagonal = Math.max(...mesh.components.map((component) => Math.hypot(component.bounds.size[0], component.bounds.size[1], component.bounds.size[2])), 1e-9);
+  // Significance mirrors the seed-pruning thresholds; insignificant islands were already
+  // pruned before this point for the seed route.
+  const significant = mesh.components.filter((component) => {
+    const diagonal = Math.hypot(component.bounds.size[0], component.bounds.size[1], component.bounds.size[2]);
+    return component.area >= totalArea * 0.005 || diagonal >= maxDiagonal * 0.05;
+  });
+  const weights = significant.map((component) => Math.sqrt(Math.max(component.area, 1e-9)));
+  const weightSum = weights.reduce((sum, weight) => sum + weight, 0) || 1e-9;
+  const totalTargetIndices = mesh.indices.length * ratio;
+  const outPositions: number[] = [];
+  const outIndices: number[] = [];
+  let simplifierError: number | undefined;
+  for (const [slot, component] of significant.entries()) {
+    const island = extractIsland(mesh.positions, component.indices);
+    const share = weights[slot]! / weightSum;
+    const proportional = Math.floor((totalTargetIndices * share) / 3) * 3;
+    const islandRatio = island.indices.length > MIN_ISLAND_TRIANGLES
+      ? Math.min(1, Math.max(proportional, MIN_ISLAND_TRIANGLES * 3) / island.indices.length)
+      : undefined; // small-but-significant islands keep their full shape
+    const simplified = await simplifyMesh(island.positions, island.indices, islandRatio ?? undefined, error);
+    if (simplified.error !== undefined) simplifierError = Math.max(simplifierError ?? 0, simplified.error);
+    const baseVertex = outPositions.length / 3;
+    for (let index = 0; index < simplified.positions.length; index += 1) outPositions.push(simplified.positions[index]!);
+    for (let index = 0; index < simplified.indices.length; index += 1) outIndices.push(baseVertex + simplified.indices[index]!);
+  }
+  return { positions: Float32Array.from(outPositions), indices: Uint32Array.from(outIndices), ...(simplifierError !== undefined ? { error: simplifierError } : {}) };
+}
+
+async function buildMeshSimplifySeed(snapshot: SceneSnapshot, profile: ProfileId, phase: string): Promise<PhaseSeed> {
+  const route = phaseOperator(profile, phase)!;
   const soups = collectSemantics(snapshot, route.semantics);
   if (!soups.size) throw new Error(`prepared oracle carries no ${route.label} geometry to derive from`);
   const inputTriangles = [...soups.values()].reduce((sum, soup) => sum + soup.triangleCount, 0);
@@ -679,7 +752,7 @@ async function buildMeshSimplifySeed(snapshot: SceneSnapshot, phase: string): Pr
       if (pivotOrigin) nodes.push({ semanticId: "turret-pivot", kind: "group", position: pivotOrigin });
       for (const id of orderedIds) {
         const cleaned = cleanedPerSemantic.get(id)!;
-        const result = await simplifyMesh(cleaned.positions, cleaned.indices, ratio, error);
+        const result = await simplifyComponentwise(cleaned, ratio, error);
         if (result.error !== undefined) simplifierError = Math.max(simplifierError ?? 0, result.error);
         const parentSemanticId = pivotOrigin && id !== "turret-pivot" ? "turret-pivot" : undefined;
         const positions = parentSemanticId ? localPositions(result.positions, pivotOrigin!) : result.positions;
@@ -690,13 +763,18 @@ async function buildMeshSimplifySeed(snapshot: SceneSnapshot, phase: string): Pr
   };
 }
 
-/** Evaluates one composed candidate through the real active-phase deterministic gate path. */
-async function evaluateComposedCandidate(
+/**
+ * Evaluates one trial derived composition through the trusted sandbox path (Â§9): the trial
+ * registry/seeds/repairs are staged into isolated scratch and executed exactly like an
+ * ordinary candidate â€” tier selection can never use an easier bypass than normal gates.
+ */
+async function evaluateTrialComposition(
   workspace: ResumedWorkspace,
   phase: string,
   oracle: THREE.Object3D,
   authoritativeDimensions: Record<string, number> | undefined,
-  composed: CandidateRuntime,
+  auditOptions: { trustedGeneratedModules: Map<string, unknown> },
+  backend?: import("./candidate-sandbox.js").SandboxBackend,
 ): Promise<{
   passed: boolean;
   score: number;
@@ -704,33 +782,59 @@ async function evaluateComposedCandidate(
   meshes: number;
   failingGates: Array<{ code: string; score: number; message: string }>;
 }> {
+  const { executeComposedDerivedTrial, deserializeExecutionSamples } = await import("./composition-exec.js");
+  const { evaluateCandidateFromSamples } = await import("./orchestration.js");
   const subjectContract = workspace.resolved.subjectContract
     ? JSON.parse(await readFile(workspace.resolved.subjectContract, "utf8")) as GenericSubjectContract
     : undefined;
-  const evaluation = await evaluateCandidateWithPoses({
-    oracle,
-    candidate: composed,
+  const profileContract = getProfileContract(workspace.project.profile);
+  const phaseOwnsArticulation = profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === phase);
+  const poses = phaseOwnsArticulation ? requiredPosesForProfile(workspace.project.profile, subjectContract) : [neutralPoseForProfile(workspace.project.profile, subjectContract)];
+  const scratchRoot = join(workspace.layout.internal.root, "tmp");
+  await mkdir(scratchRoot, { recursive: true });
+  const trial = await executeComposedDerivedTrial({
+    workspaceRoot: workspace.root,
+    scratchRoot,
     profile: workspace.project.profile,
-    style: workspace.styleContract,
-    certification: workspace.state.certification,
-    ...(authoritativeDimensions ? { authoritativeDimensions: authoritativeDimensions as { hullLength: number; overallLength: number; width: number; height: number } } : {}),
-    ...(subjectContract ? { subjectContract } : {}),
-    phase,
+    poses,
+    auditOptions,
+    ...(backend ? { backend } : {}),
   });
-  const phaseReport = evaluation.phaseGates[phase];
-  // Early complexity admissibility over the COMPOSED totals: geometrically acceptable is not
-  // yet lockable when the workspace hard style ceiling is already exceeded.
-  const composedSnapshot = snapshotScene(composed.root);
-  return {
-    passed: evaluation.passed && Boolean(phaseReport?.passed),
-    score: phaseReport?.score ?? evaluation.contractGates.score,
-    triangles: composedSnapshot.triangleCount,
-    meshes: composedSnapshot.meshCount,
-    failingGates: [
-      ...evaluation.deterministic.rows.filter((row) => !row.passed).map((row) => ({ code: row.code, score: row.score, message: row.message })),
-      ...Object.values(evaluation.phaseGates).flatMap((report) => report.rows.filter((row) => !row.passed).map((row) => ({ code: row.code, score: row.score, message: row.message }))),
-    ],
-  };
+  try {
+    if (!trial.result.audit.passed) throw new Error(`trial composition audit failed: ${trial.result.audit.findings.map((finding) => finding.code).join(", ")}`);
+    const samples = deserializeExecutionSamples(trial.result);
+    const evaluation = await evaluateCandidateFromSamples({
+      oracle,
+      candidateSamples: [
+        { pose: poses[0]!, root: samples.neutralRoot },
+        ...samples.posedRoots.map((sample) => ({ pose: sample.pose, root: sample.root })),
+      ],
+      profile: workspace.project.profile,
+      style: workspace.styleContract,
+      certification: workspace.state.certification,
+      candidateSourceHash: trial.result.sourceHash,
+      ...(authoritativeDimensions ? { authoritativeDimensions: authoritativeDimensions as { hullLength: number; overallLength: number; width: number; height: number } } : {}),
+      ...(subjectContract ? { subjectContract } : {}),
+      phase,
+    });
+    void evaluation.candidateHash;
+    const phaseReport = evaluation.phaseGates[phase];
+    // Early complexity admissibility over the COMPOSED totals: geometrically acceptable is
+    // not yet lockable when the workspace hard style ceiling is already exceeded.
+    const composedSnapshot = snapshotScene(samples.neutralRoot);
+    return {
+      passed: evaluation.passed && Boolean(phaseReport?.passed),
+      score: phaseReport?.score ?? evaluation.contractGates.score,
+      triangles: composedSnapshot.triangleCount,
+      meshes: composedSnapshot.meshCount,
+      failingGates: [
+        ...evaluation.deterministic.rows.filter((row) => !row.passed).map((row) => ({ code: row.code, score: row.score, message: row.message })),
+        ...Object.values(evaluation.phaseGates).flatMap((report) => report.rows.filter((row) => !row.passed).map((row) => ({ code: row.code, score: row.score, message: row.message }))),
+      ],
+    };
+  } finally {
+    await trial.cleanup();
+  }
 }
 
 async function writeDerivedArtifacts(workspace: ResumedWorkspace, manifest: DerivationManifest, moduleSource: string): Promise<{ modulePath: string; manifestPath: string }> {
@@ -840,22 +944,41 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   const state = await loadTaskState(workspace.layout.internal.state);
   if (state.authorshipMode !== "derived") throw new Error("derive requires authorshipMode \"derived\"; independent workspaces must not consume source topology");
   const phase = state.activePhase;
-  const route = phaseOperator(phase);
+  const route = phaseOperator(workspace.project.profile, phase);
   if (!route) {
     return { status: "not-supported", phase, operator: "none", tiers: [], note: `derive supports hull, turret, gun, running-gear, and tracks; active phase is ${phase}` };
   }
   const preparation = await verifyWorkspaceOraclePreparation(workspace);
   const oracle = await loadPreparedOracle(preparation.manifest, workspace.root);
+  // Source assembly coverage must be complete BEFORE derivation (Â§11): unresolved
+  // significant geometry blocks the derive instead of silently disappearing.
+  if (workspace.project.profile === "tank") assertAssemblyCoverage(oracle, "tank");
   const snapshot = snapshotScene(oracle);
   const authoritativeDimensions = preparation.manifest.authoritativeDimensions ?? undefined;
 
-  // Live candidate context for composition: audited under CURRENT trust authority.
-  const liveCandidateIdentity = await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace, preparation.binding.identity));
+  // Trial-local binding ledger: updated per tier so trial audits see the CURRENT five-way
+  // authority without persisting anything until a tier is finally selected.
+  const localBindings: Record<string, import("./state.js").DerivedBinding> = { ...(state.derivedBindings ?? {}) };
+  for (const repair of await discoverRepairs(workspace.root)) {
+    try {
+      const bytes = await readFile(resolve(workspace.root, repair.path));
+      localBindings[repair.path.replaceAll("\\", "/")] = repairBinding(repair, sha256(bytes), preparation.binding.identity);
+    } catch { /* missing repair file surfaces through lineage verification */ }
+  }
+  const trialAuditOptions = async (): Promise<{ trustedGeneratedModules: Map<string, unknown> }> => ({
+    trustedGeneratedModules: await loadTrustedGeneratedModules({
+      directory: derivedDirectory(workspace.layout.internal.root),
+      workspaceRoot: workspace.root,
+      preparationIdentity: preparation.binding.identity,
+      bindings: localBindings,
+      allowedPhases: new Set(getProfileContract(workspace.project.profile).phases.filter((item) => item.owner === "builder").map((item) => item.id)),
+    }),
+  });
 
   let seed: PhaseSeed;
   const analytic = route.operator !== "mesh-simplify";
   if (route.operator === "mesh-simplify") {
-    seed = await buildMeshSimplifySeed(snapshot, phase);
+    seed = await buildMeshSimplifySeed(snapshot, workspace.project.profile, phase);
   } else if (route.operator === "radial-fit") {
     const built = buildRadialSeed(snapshot);
     if (!built.nodes.length) throw new Error("prepared oracle carries no running-gear instances to derive from");
@@ -893,24 +1016,54 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     const built = await seed.simplify(tier.ratio, tier.error);
     const outputTriangles = built.nodes.reduce((sum, node) => sum + (node.indices?.length ?? 0) / 3, 0);
     if (!outputTriangles) continue;
-    const replacement = buildSeedGroup(seed.name, built.nodes);
-    const composed: ComposedCandidateRuntime = composeCandidateForPhase({
-      profile: workspace.project.profile,
+    // Materialize THIS tier as the pipeline-owned composition (seed module + registry), then
+    // execute the staged composition through the trusted sandbox exactly like a candidate.
+    const moduleSource = emitGeneratedModule(seed.name, built.nodes);
+    const generatedModuleHash = sha256(Buffer.from(moduleSource, "utf8"));
+    await mkdir(resolve(workspace.root, GENERATED_DIRECTORY), { recursive: true });
+    await writeFile(resolve(workspace.root, GENERATED_DIRECTORY, `${seed.name}.mjs`), moduleSource);
+    localBindings[`${GENERATED_DIRECTORY}/${seed.name}.mjs`] = {
+      manifestHash: sha256(canonicalJson({ pending: true, phase, hash: generatedModuleHash })),
+      generatedModuleHash,
+      oraclePreparationIdentity: preparation.binding.identity,
+    };
+    // The manifest on disk must match the binding for five-way authority; write it now.
+    const inputGeometryHashPlaceholder = seed.inputGeometryHash;
+    const trialManifestSeed: DerivationManifest = {
+      schemaVersion: 1,
+      kind: "mesh2threejs-derived-seed",
       phase,
-      liveCandidate: liveCandidateIdentity.runtime,
-      replacement,
-    });
-    let verdict: Awaited<ReturnType<typeof evaluateComposedCandidate>>;
+      oraclePreparationIdentity: preparation.binding.identity,
+      preparedOracleHash: preparation.binding.preparedHash,
+      operator: route.operator,
+      recipe: { tier: tier.tier },
+      inputGeometryHash: inputGeometryHashPlaceholder,
+      outputGeometryHash: sha256(canonicalJson(built.nodes.filter((node) => node.kind === "mesh").map((node) => ({ id: node.semanticId, geometryHash: geometryBytesHash(node.positions!, node.indices!) })))),
+      generatedModulePath: `${GENERATED_DIRECTORY}/${seed.name}.mjs`,
+      generatedModuleHash,
+      inputTriangles: seed.inputTriangles,
+      outputTriangles: Math.round(outputTriangles),
+    };
+    const manifestDirectory = derivedDirectory(workspace.layout.internal.root);
+    await mkdir(manifestDirectory, { recursive: true });
+    await writeFile(join(manifestDirectory, `${phase}.json`), `${JSON.stringify(trialManifestSeed, null, 2)}\n`);
+    const trialBinding = localBindings[`${GENERATED_DIRECTORY}/${seed.name}.mjs`];
+    if (!trialBinding) throw new Error("derive lost its trial binding ledger entry");
+    trialBinding.manifestHash = derivationManifestHash(trialManifestSeed);
+    await wireGeneratedComposition(workspace, orderedDerivedPhases(workspace.project.profile, [trialManifestSeed, ...(await readAllManifests(workspace)).filter((manifest) => manifest.phase !== phase)]));
+    let verdict: Awaited<ReturnType<typeof evaluateTrialComposition>>;
     try {
-      verdict = await evaluateComposedCandidate(workspace, phase, oracle, authoritativeDimensions, composed);
-    } finally {
-      composed.dispose();
+      verdict = await evaluateTrialComposition(workspace, phase, oracle, authoritativeDimensions, await trialAuditOptions());
+    } catch (error) {
+      // A trial that cannot even execute (e.g. audit failure) is a failing tier, not a crash:
+      // the derive ladder must remain bounded and informative.
+      verdict = { passed: false, score: 0, triangles: Math.round(outputTriangles), meshes: built.nodes.filter((node) => node.kind === "mesh").length, failingGates: [{ code: "derive.trial-execution", score: 0, message: error instanceof Error ? error.message : String(error) }] };
     }
     evaluatedNodes.set(tier.tier, built.nodes);
     const withinBudget = verdict.triangles <= triangleMax && verdict.meshes <= meshMax;
     tierResults.push({
       tier: tier.tier,
-      triangles: outputTriangles,
+      triangles: Math.round(outputTriangles),
       passed: verdict.passed,
       score: verdict.score,
       failingGates: verdict.failingGates,
@@ -950,27 +1103,13 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   let workorders: Workorder[] | undefined;
   if (status !== "seed-passing") {
     try {
-      const subjectContract = workspace.resolved.subjectContract
-        ? JSON.parse(await readFile(workspace.resolved.subjectContract, "utf8")) as GenericSubjectContract
-        : undefined;
-      const replacement = buildSeedGroup(seed.name, builtNodes);
-      const composed = composeCandidateForPhase({ profile: workspace.project.profile, phase, liveCandidate: liveCandidateIdentity.runtime, replacement });
-      let evaluation;
-      try {
-        evaluation = await evaluateCandidateWithPoses({
-          oracle,
-          candidate: composed,
-          profile: workspace.project.profile,
-          style: workspace.styleContract,
-          certification: workspace.state.certification,
-          ...(authoritativeDimensions ? { authoritativeDimensions: authoritativeDimensions as { hullLength: number; overallLength: number; width: number; height: number } } : {}),
-          ...(subjectContract ? { subjectContract } : {}),
-          phase,
-        });
-      } finally {
-        composed.dispose();
-      }
-      workorders = evaluation.phaseGates[phase]?.workorders ?? [];
+      workorders = (tierResults.find((tier) => tier.tier === chosen.tier)?.failingGates ?? []).map((gate) => ({
+        component: gate.code,
+        errorKind: gate.code,
+        priority: "critical" as const,
+        correction: gate.message,
+        phase,
+      }));
       if (status === "seed-diagnostic-overbudget") {
         workorders = [{
           component: "style-complexity",
@@ -992,15 +1131,33 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     generatedModuleHash: manifest.generatedModuleHash,
     oraclePreparationIdentity: manifest.oraclePreparationIdentity,
   };
+  for (const repair of await discoverRepairs(workspace.root)) {
+    try {
+      nextState.derivedBindings[repair.path.replaceAll("\\", "/")] = repairBinding(repair, sha256(await readFile(resolve(workspace.root, repair.path))), preparation.binding.identity);
+    } catch { /* missing repair surfaces through lineage verification */ }
+  }
   nextState.systemDecisions.push({
     id: `derived-seed-${nextState.systemDecisions.length + 1}`,
     value: manifest.generatedModulePath,
     reason: `derive produced a ${chosen.tier} ${route.operator} seed for phase ${phase} (${seed.inputTriangles} -> ${chosen.triangles} triangles, status ${status})`,
   });
   await saveTaskState(workspace.layout.internal.state, nextState);
-  // The live candidate changed (new generated module bytes plus regenerated registry);
-  // prove it audits and loads cleanly under the CURRENT trust authority before reporting.
-  await verifyWorkspaceCandidateIdentity(workspace, await trustedGeneratedAuditOptions(workspace, preparation.binding.identity));
+  // Derived lineage preconditions (§10.6): canonical entry, pipeline registry, five-way
+  // generated authority, and repair bindings must all verify BEFORE any fidelity gate runs.
+  await verifyDerivedLineage({
+    modelEntryPath: resolve(workspace.root, workspace.project.model),
+    workspaceRoot: workspace.root,
+    profile: workspace.project.profile,
+    authorshipMode: "derived",
+    derivedBindings: nextState.derivedBindings,
+    trustedModules: await loadTrustedGeneratedModules({
+      directory: derivedDirectory(workspace.layout.internal.root),
+      workspaceRoot: workspace.root,
+      preparationIdentity: preparation.binding.identity,
+      bindings: nextState.derivedBindings,
+      allowedPhases: new Set(getProfileContract(workspace.project.profile).phases.filter((item) => item.owner === "builder").map((item) => item.id)),
+    }),
+  });
 
   const note = status === "seed-passing"
     ? undefined
