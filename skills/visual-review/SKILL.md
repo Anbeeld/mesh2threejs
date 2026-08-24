@@ -16,5 +16,5 @@ Do not edit any artifact. Do not pass a packet from deterministic rows alone. If
 Automated or model-produced verdicts are **diagnostic data only** (`record-review` stores
 them as `automated-visual-diagnostic`; the review status stays `awaiting`). Final approval
 authority arrives exclusively through the trusted run authority's human capability, bound
-to the exact packet/candidate/oracle/toolchain/replay hashes at approval time. A builder-
+to the exact packet/candidate/oracle/toolchain/replay hashes at approval time; every bound artifact is re-hashed at approval and again at finalization, so the approval always means those exact bytes exist. A builder-
 created JSON file can never become human approval.

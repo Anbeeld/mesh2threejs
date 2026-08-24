@@ -1,6 +1,7 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { canonicalJson, sha256 } from "./hashing.js";
+import { getProfileContract } from "./contracts.js";
 import type { DerivedBinding } from "./state.js";
 import type { ProfileId } from "../types.js";
 
@@ -324,6 +325,28 @@ function repairBindingManifestHash(repair: RepairModuleReference): string {
  * 5. every present declarative repair spec is hash-bound and byte-current.
  * A forged userData marker can never substitute for any of these structural checks.
  */
+/**
+ * Profile dependency order of the currently bound derived phases — the exact ordering
+ * trusted derive uses to regenerate the registry, and therefore the ordering any registry
+ * byte-verification must reproduce.
+ */
+/**
+ * Profile dependency order of the currently bound derived phases — the exact ordering
+ * trusted derive uses to regenerate the registry, and therefore the ordering any registry
+ * byte-verification must reproduce. Mirrors derive's manifest-based ordering: profile
+ * contract phase order first, then any extra bound phases in stable sort order.
+ */
+export function orderedDerivedPhasesFromBindings(profile: ProfileId, derivedBindings: Record<string, DerivedBinding>): string[] {
+  const bound = new Set(
+    Object.keys(derivedBindings)
+      .filter((key) => key.startsWith(`${GENERATED_DIRECTORY}/`) && key.endsWith(".mjs"))
+      .map((key) => key.slice(GENERATED_DIRECTORY.length + 1, -".mjs".length)),
+  );
+  const contractOrder = getProfileContract(profile).phases.map((phase) => phase.id).filter((id) => bound.has(id));
+  for (const phase of [...bound].sort()) if (!contractOrder.includes(phase)) contractOrder.push(phase);
+  return contractOrder;
+}
+
 export async function verifyDerivedLineage(input: {
   modelEntryPath: string;
   workspaceRoot: string;
@@ -339,12 +362,7 @@ export async function verifyDerivedLineage(input: {
   if (entryBytes !== MODEL_DERIVED_SCAFFOLD) {
     throw new Error("derived lineage violation: the canonical derived model entry was replaced or edited; restore the pipeline-owned scaffold");
   }
-  const boundPhases = Object.keys(input.derivedBindings)
-    .filter((key) => key.startsWith(`${GENERATED_DIRECTORY}/`) && key.endsWith(".mjs"))
-    .map((key) => key.slice(GENERATED_DIRECTORY.length + 1, -".mjs".length));
-  const orderedBound = input.profile === "tank"
-    ? ["hull", "turret", "gun", "running-gear", "tracks"].filter((phase) => boundPhases.includes(phase))
-    : [...boundPhases].sort();
+  const orderedBound = orderedDerivedPhasesFromBindings(input.profile, input.derivedBindings);
   const repairs = await discoverRepairs(input.workspaceRoot);
   const expectedRegistry = generateRegistrySource(input.profile, orderedBound);
   const registryPath = input.registryPath ?? resolve(input.workspaceRoot, GENERATED_REGISTRY_PATH);

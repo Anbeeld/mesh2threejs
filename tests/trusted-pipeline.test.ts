@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, afterAll } from "vitest";
@@ -7,6 +7,9 @@ import { BrokerClient } from "../src/broker/client.js";
 import { runCli } from "../src/cli.js";
 import { validateRepairSpec, applyRepairSpec, repairSpecHash, REPAIR_VERTEX_CEILING, REPAIR_TRIANGLE_CEILING } from "../src/core/repair-spec.js";
 import type { SeedNode } from "../src/core/derive.js";
+import { auditCandidateModule, stageCandidateGraph } from "../src/core/candidate.js";
+import { developmentInProcessBackend } from "../src/core/dev-sandbox.js";
+import { MODEL_DERIVED_SCAFFOLD } from "../src/core/derivation.js";
 import { createSlopedTank, stableSemanticIdentityMap, sceneToGlb } from "./helpers/tank-fixtures.js";
 
 /**
@@ -24,7 +27,7 @@ const io = () => {
 };
 
 const toolchainOverride = {
-  manifest: { schemaVersion: 1 as const, packageName: "mesh2threejs", packageVersion: "1.0.0", runtimeHash: "r", controlHash: "c", dependencyIdentity: "d", runtimeFiles: {}, controlFiles: {} },
+  manifest: { schemaVersion: 2 as const, dependencies: [] as never, packageName: "mesh2threejs", packageVersion: "1.0.0", runtimeHash: "r", controlHash: "c", dependencyIdentity: "d", runtimeFiles: {}, controlFiles: {} },
   provenance: { nodeVersion: process.version, platform: process.platform, arch: process.arch, packageRoot: ".", threeRoot: null, threeVersion: null, meshoptimizerRoot: null, meshoptimizerVersion: null },
   toolchainId: "tc-pipeline-attacks",
   trustedToolchain: true,
@@ -179,4 +182,233 @@ describe("declarative repair specs (I6)", () => {
       await broker.close();
     }
   }, 120_000);
+});
+
+/** Drives a run to hull-derived state through the real broker (attacks mutate from here). */
+async function beginRunToDerivedHull() {
+  const setup = await beginRunOnFixture();
+  const { builder, runId } = setup;
+  await builder.onboardOracle(runId, {
+    id: "pipeline-attacks", sourcePath: "ignored", preparedPath: "ignored", source: "fixture", author: "fixture", license: "MIT", redistribution: "allowed",
+    coordinateFrame: "right-handed", upAxis: "+y", forwardAxis: "+z", grounding: "min-y=0", scale: 1,
+    semanticMap: stableSemanticIdentityMap(createSlopedTank()),
+    articulationMap: { gun: "gun-pivot", turret: "turret-pivot" },
+    normalization: { translation: [0, 0, 0], rotationEuler: [0, 0, 0], scale: 1 },
+    authoritativeDimensions: null, dimensionSources: [],
+  });
+  await builder.oracleSanity(runId);
+  const registered = await builder.register(runId, { forwardAxis: "+z", upAxis: "+y", expectedScale: 1, groundY: 0, tolerance: 0.02, requiredSemantics: ["hull", "turret", "gun"], requiredPivots: ["turret-pivot", "gun-pivot"] });
+  expect(registered.passed).toBe(true);
+  await builder.lock(runId);
+  const derived = await builder.derive(runId) as { status: string };
+  expect(["seed-passing", "seed-retained-failing", "seed-diagnostic-overbudget"]).toContain(derived.status);
+  return setup;
+}
+
+/** Drives a run all the way to an awaiting-human-review binding through the real broker. */
+async function beginRunToReviewReady() {
+  const setup = await beginRunToDerivedHull();
+  const { builder, runId } = setup;
+  for (let cycle = 0; cycle < 8; cycle += 1) {
+    const next = await builder.next(runId) as { route?: string; activePhase?: string };
+    if (next.route === "diagnose") break;
+    const derived = await builder.derive(runId) as { status: string };
+    void derived;
+    const gate = await builder.gate(runId) as { passed: boolean };
+    if (!gate.passed) break; // visual-review phase gates fail by design before review-ready
+    await builder.lock(runId);
+    const status = await builder.status(runId) as { status: string };
+    if (status.status === "awaiting-human-review") break;
+  }
+  const ready = await builder.reviewReady(runId) as { status: string; capture: { directory: string } };
+  expect(ready.status).toBe("ready-for-user-review");
+  return { ...setup, initialCaptureDirectory: /^([a-zA-Z]:)?[/\\]/u.test(ready.capture.directory) ? ready.capture.directory : join(setup.root, ready.capture.directory) };
+}
+
+describe("review artifact integrity at approval and finalization (remaining closure §12.2)", () => {
+  test("mutating any human-visible review artifact blocks approval/finalization with REVIEW_ARTIFACT_DRIFT", async () => {
+    const { broker, builder, admin, runId, root, initialCaptureDirectory } = await beginRunToReviewReady();
+    let currentCaptureDirectory = initialCaptureDirectory;
+    try {
+      const noteCaptureDir = (ready: { capture: { directory: string } }): void => {
+        currentCaptureDirectory = /^([a-zA-Z]:)?[/\\]/u.test(ready.capture.directory) ? ready.capture.directory : join(root, ready.capture.directory);
+      };
+      // Attack: packet.json tamper -> approval refuses and invalidates the review.
+      await writeFile(join(currentCaptureDirectory, "packet.json"), `${await readFile(join(currentCaptureDirectory, "packet.json"), "utf8")}// tampered\n`);
+      await expect(admin.approveReview(runId)).rejects.toThrow(/REVIEW_ARTIFACT_DRIFT/);
+      expect(((await builder.status(runId)) as { status: string }).status).toBe("active");
+
+      // Regenerate; then a comparison-board tamper must also refuse approval.
+      noteCaptureDir(await builder.reviewReady(runId) as { capture: { directory: string } });
+      const manifestJson = JSON.parse(await readFile(join(currentCaptureDirectory, "render-manifest.json"), "utf8")) as { comparisonBoards: Array<{ path: string }> };
+      const boardAbsolutePath = /^([a-zA-Z]:)?[/\\]/u.test(manifestJson.comparisonBoards[0]!.path) ? manifestJson.comparisonBoards[0]!.path : join(root, manifestJson.comparisonBoards[0]!.path);
+      await appendFile(boardAbsolutePath, "x");
+      await expect(admin.approveReview(runId)).rejects.toThrow(/REVIEW_ARTIFACT_DRIFT|comparison-board/);
+      expect(((await builder.status(runId)) as { status: string }).status).toBe("active");
+
+      // Regenerate; clean approval succeeds...
+      noteCaptureDir(await builder.reviewReady(runId) as { capture: { directory: string } });
+      await admin.approveReview(runId);
+
+      // ...but a viewer-scene tamper before finalization still refuses certification.
+      await appendFile(join(currentCaptureDirectory, "viewer-scene.json"), " ");
+      await expect(admin.trustedFinalize(runId)).rejects.toThrow(/REVIEW_ARTIFACT_DRIFT/);
+    } finally {
+      await broker.close();
+    }
+  }, 600_000);
+});
+
+describe("broker operation surface parity (remaining closure §7.4/§12.5)", () => {
+  const kebab = (method: string): string => method.replaceAll(/([A-Z])/gu, "-$1").toLowerCase();
+
+  test("registry, server routes, typed client, and capability classes agree", async () => {
+    const { BROKER_OPERATIONS, IMPLEMENTED_BUILDER_ROUTES } = await import("../src/broker/operations.js");
+    const { BUILDER_OPERATIONS, HUMAN_ADMIN_OPERATIONS } = await import("../src/core/capabilities.js");
+    const clientMethods = Object.getOwnPropertyNames(BrokerClient.prototype).filter((name) => name !== "constructor" && name !== "call");
+    const clientOperations = new Set(clientMethods.map((method) => method.replaceAll(/([A-Z])/gu, "-$1").toLowerCase()));
+
+    // Every implemented builder route is classified builder-safe...
+    for (const route of IMPLEMENTED_BUILDER_ROUTES) {
+      expect(BUILDER_OPERATIONS.has(route), `capability set lacks ${route}`).toBe(true);
+      // ...and has a matching typed client method.
+      expect(clientOperations.has(route), `client lacks a method for ${route}`).toBe(true);
+    }
+    // Every implemented admin operation is classified human-admin and has a client method.
+    for (const op of BROKER_OPERATIONS.filter((item) => item.capability === "human-admin" && item.status === "implemented")) {
+      expect(HUMAN_ADMIN_OPERATIONS.has(op.name)).toBe(true);
+      expect(clientOperations.has(op.name), `client lacks a method for ${op.name}`).toBe(true);
+    }
+    // No client method escapes the advertised registry.
+    for (const method of clientMethods) {
+      expect(BROKER_OPERATIONS.some((op) => op.name === kebab(method)), `client method ${method} has no registry operation`).toBe(true);
+    }
+  }, 30_000);
+
+  test("every advertised builder route exists end to end; generic routes remain nonexistent", async () => {
+    const { broker, runId } = await beginRunOnFixture();
+    try {
+      const probeResult = await post(broker.url, broker.builderToken, { operation: "probe", runId });
+      expect(probeResult).toBe(200);
+      const workorderResult = await post(broker.url, broker.builderToken, { operation: "workorders", runId });
+      expect(workorderResult).toBe(200);
+      // Generic authority routes remain nonexistent.
+      await expect(post(broker.url, broker.builderToken, { operation: "runtime-record", runId })).resolves.toBe(400);
+      await expect(post(broker.url, broker.builderToken, { operation: "transition", runId })).resolves.toBe(400);
+    } finally {
+      await broker.close();
+    }
+  }, 60_000);
+});
+
+describe("trusted intake and initial intent (remaining closure §6/§12.4)", () => {
+  test("builder cannot invoke trusted intake; post-creation policy edits block with POLICY_INPUT_DRIFT", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-intake-"));
+    roots.push(parent);
+    const root = join(parent, "workspace");
+    const source = join(parent, "tank.glb");
+    await writeFile(source, sceneToGlb(createSlopedTank()));
+    const broker = await startBroker({ toolchainOverride });
+    try {
+      const builder = new BrokerClient({ url: broker.url, token: broker.builderToken });
+      const admin = new BrokerClient({ url: broker.url, token: broker.adminToken });
+
+      // The builder token cannot create a trusted run (admin channel only).
+      const attempt = await fetch(broker.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ operation: "create-workspace-run", token: broker.builderToken, payload: { workspaceRoot: root, goal: "synthetic tank reconstruction", oraclePath: source } }) });
+      expect(attempt.status).toBe(403);
+
+      // Trusted intake pins goal + oracle BEFORE any builder mutation.
+      const created = await admin.createWorkspaceRun({ workspaceRoot: root, goal: "synthetic tank reconstruction", oraclePath: source });
+      expect(created.runId).toMatch(/^run-/);
+      const record = await builder.readRun(created.runId);
+      expect(record.record.intake).toBe("trusted");
+      expect(record.record.policy.authorshipMode).toBe("derived");
+      expect(record.record.policy.profile).toBe("tank");
+
+      // After binding, builder edits to goal/profile/authorship/oracle are DRIFT, not rebinds.
+      const projectPath = join(root, "project.json");
+      const edits: Array<Record<string, unknown>> = [
+        { goal: "a completely different subject" },
+        { profile: "generic" },
+        { authorshipMode: "independent" },
+        { oracle: "refs/oracle/other.glb" },
+      ];
+      for (const edit of edits) {
+        const project = JSON.parse(await readFile(projectPath, "utf8")) as Record<string, unknown>;
+        await writeFile(projectPath, JSON.stringify({ ...project, ...edit }, null, 2));
+        await expect(builder.gate(created.runId)).rejects.toThrow(/POLICY_INPUT_DRIFT|differs from state|absent from the reference index/i);
+        // The canonical intent remains unchanged.
+        const fresh = await builder.readRun(created.runId);
+        expect(fresh.record.intake).toBe("trusted");
+      }
+    } finally {
+      await broker.close();
+    }
+  }, 120_000);
+});
+
+describe("pre-execution graph authority (remaining closure §12.1)", () => {
+  test("attack A: tampered derived entry refuses with DERIVED_ENTRY_DRIFT before execution", async () => {
+    const { broker, builder, runId, root } = await beginRunToDerivedHull();
+    try {
+      // An infinite loop proves refusal happened BEFORE any import/execution.
+      await writeFile(join(root, "model", "model.mjs"), `export function createCandidate() { for (;;) {} }\n`);
+      const started = Date.now();
+      await expect(builder.gate(runId)).rejects.toThrow(/DERIVED_ENTRY_DRIFT/);
+      expect(Date.now() - started).toBeLessThan(30_000);
+    } finally {
+      await broker.close();
+    }
+  }, 180_000);
+
+  test("attack B: tampered generated registry refuses with DERIVED_REGISTRY_DRIFT before execution", async () => {
+    const { broker, builder, runId, root } = await beginRunToDerivedHull();
+    try {
+      const registryPath = join(root, "model", ".generated", "registry.mjs");
+      const legitimate = await readFile(registryPath, "utf8");
+      await writeFile(registryPath, `${legitimate}\n// arbitrary injected code\nexport const stolen = 1;\n`);
+      await writeFile(join(root, "model", "model.mjs"), MODEL_DERIVED_SCAFFOLD);
+      await expect(builder.gate(runId)).rejects.toThrow(/DERIVED_REGISTRY_DRIFT/);
+    } finally {
+      await broker.close();
+    }
+  }, 180_000);
+
+  test("attack C: extra non-generated executable module refuses with DERIVED_EXECUTABLE_GRAPH_UNTRUSTED", async () => {
+    const { broker, builder, runId, root } = await beginRunToDerivedHull();
+    try {
+      // A generated module that no longer matches its five-way binding pulls an extra
+      // executable helper into the graph; both must refuse before execution.
+      await writeFile(join(root, "model", ".generated", "hull.mjs"), `import { createSeed as helperSeed } from "../helper.mjs";\nexport function createSeed() { return helperSeed(); }\n`);
+      await writeFile(join(root, "model", "helper.mjs"), `import * as THREE from "three";\nexport function createSeed() { return new THREE.Group(); }\n`);
+      await expect(builder.gate(runId)).rejects.toThrow(/DERIVED_EXECUTABLE_GRAPH_UNTRUSTED/);
+    } finally {
+      await broker.close();
+    }
+  }, 180_000);
+
+  test("attack D: bytes changed between audit and staging fail with CANDIDATE_CHANGED_DURING_AUTHORIZATION", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-stage-race-"));
+    roots.push(parent);
+    const entry = join(parent, "model.mjs");
+    await writeFile(entry, `export function createCandidate() { return {}; }\n`);
+    const audit = await auditCandidateModule(entry);
+    // Mutate AFTER the audit produced the hash ledger; staging must refuse the copy.
+    await writeFile(entry, `export function createCandidate() { return { tampered: true }; }\n`);
+    await expect(stageCandidateGraph(entry, audit)).rejects.toThrow(/CANDIDATE_CHANGED_DURING_AUTHORIZATION/);
+  });
+
+  test("attack E: trusted operations refuse the development in-process backend", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "mesh2threejs-inprocess-refusal-"));
+    roots.push(parent);
+    const entry = join(parent, "model.mjs");
+    await writeFile(entry, MODEL_DERIVED_SCAFFOLD);
+    const { inspectWorkspaceCandidateViaExecutor } = await import("../src/operations/workspace-gate.js");
+    await expect(inspectWorkspaceCandidateViaExecutor({
+      modelEntryPath: entry,
+      poses: [{}],
+      backend: developmentInProcessBackend(),
+      trusted: true,
+    })).rejects.toThrow(/TRUSTED_IN_PROCESS_EXECUTION_REFUSED/);
+  });
 });

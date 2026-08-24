@@ -51,3 +51,31 @@ trusted operations:
 Regression coverage lives in `tests/trusted-lifecycle.test.ts` (real broker lifecycle),
 `tests/trusted-pipeline.test.ts` (injection/tamper/repair-spec attacks), plus the earlier
 authority/sandbox/lineage/coverage suites.
+## Remaining closure (v1 hardening, round 2)
+
+- **Pre-execution graph authority (§2):** the CandidateExecutor establishes an
+  `ExecutableGraphAuthority` ledger from audited bytes BEFORE staging/importing: the derived
+  entry must hash to `MODEL_DERIVED_SCAFFOLD` (`DERIVED_ENTRY_DRIFT`), the registry to the
+  canonical regenerated source (`DERIVED_REGISTRY_DRIFT`), and every other executable file
+  must be a five-way-verified generated module (`DERIVED_EXECUTABLE_GRAPH_UNTRUSTED`).
+  Staging re-hashes each byte against the ledger (`CANDIDATE_CHANGED_DURING_AUTHORIZATION`),
+  and trusted operations refuse the in-process backend outright
+  (`TRUSTED_IN_PROCESS_EXECUTION_REFUSED`) — they execute through the bounded child.
+- **Single reviewed execution (§3):** `trustedReplay()` returns a live `TrustedReplayBundle`
+  (serialized scenes included); review-ready renders captures and emits the viewer scene from
+  that ONE execution. Finalize compares its fresh replay hash to the approved binding.
+- **Install-stable toolchain identity (§4):** dependency identity derives ONLY from facts
+  available after install (resolved versions + package/runtime-file hashes per dependency,
+  manifest schema v2). `npm run test:installed-package` proves: pack → clean tgz install →
+  broker startup reports trustedToolchain=true → tampered runtime/dependency bytes fail
+  startup. Manifest generation is idempotent (atomic replace).
+- **Review byte integrity (§5):** the canonical binding stores packet file + scene + every
+  capture/board/turntable/deterministic-index/style/articulation artifact hash; approval
+  re-verifies all of them (`REVIEW_ARTIFACT_DRIFT` invalidates the packet), and finalize
+  re-verifies again before the fresh replay.
+- **Trusted intake (§6):** admin-channel `create-workspace-run` pins goal+oracle under host
+  authority before any builder mutation; builder-prepared `begin-run` is marked as weaker
+  provenance (`intake` field).
+- **Builder information loop (§7):** broker implements read-only `probe`, authoritative
+  `workorders`, and active-phase `render-quick`; one canonical operation registry drives the
+  server routes, typed client, capability classes, with parity enforced by test.

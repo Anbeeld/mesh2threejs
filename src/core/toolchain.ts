@@ -10,16 +10,33 @@ import { canonicalJson, sha256 } from "./hashing.js";
  * on their own.
  */
 
+export interface RuntimeDependencyIdentity {
+  name: string;
+  /** Declared semver range from this package's package.json. */
+  declared: string;
+  /** Installed/resolved dependency version the bytes were hashed from. */
+  resolvedVersion: string;
+  /** Hash over the dependency package.json identity fields. */
+  packageIdentityHash: string;
+  /** Hash over the dependency's runtime JS/WASM asset bytes. */
+  runtimeFilesHash: string;
+}
+
 export interface ToolchainManifest {
-  schemaVersion: 1;
+  schemaVersion: 2;
   packageName: string;
   packageVersion: string;
   /** Hash over all shipped executable runtime/evaluator/review/viewer-server bytes. */
   runtimeHash: string;
   /** Hash over control text (SKILL.md, skills/**, PROFILE docs, AGENTS/CLAUDE, adapters). */
   controlHash: string;
-  /** Canonical dependency identity from package.json + lock integrity where available. */
+  /**
+   * Canonical hash over the runtime dependency ledger below (remaining closure §4). Derived
+   * ONLY from facts available both at prepack and inside a clean installed package — never
+   * from a parent lockfile.
+   */
   dependencyIdentity: string;
+  dependencies: Array<RuntimeDependencyIdentity>;
   runtimeFiles: Record<string, string>;
   controlFiles: Record<string, string>;
 }
@@ -100,25 +117,53 @@ async function resolvePackageRoot(packageName: string): Promise<{ root: string; 
   }
 }
 
-export async function computeDependencyIdentity(packageRoot: string): Promise<string> {
-  const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { name: string; version: string; dependencies?: Record<string, string> };
-  const dependencies = Object.entries(pkg.dependencies ?? {}).sort(([a], [b]) => a.localeCompare(b));
-  const lockPath = join(packageRoot, "package-lock.json");
-  let integrities: Record<string, string> = {};
+async function resolveDependencyRoot(packageRoot: string, packageName: string): Promise<{ root: string; version: string } | null> {
   try {
-    const lock = JSON.parse(await readFile(lockPath, "utf8")) as { packages?: Record<string, { integrity?: string }> };
-    for (const [specifier, entry] of Object.entries(lock.packages ?? {})) {
-      if (!specifier.startsWith("node_modules/") || !entry.integrity) continue;
-      integrities[specifier.slice("node_modules/".length)] = entry.integrity;
+    const require = createRequire(join(packageRoot, "package.json"));
+    let directory = require.resolve(packageName);
+    for (;;) {
+      try {
+        const json = JSON.parse(await readFile(join(directory, "package.json"), "utf8")) as { name?: string; version?: string };
+        if (json.name === packageName && typeof json.version === "string") return { root: directory, version: json.version };
+      } catch { /* keep ascending */ }
+      const parent = resolve(directory, "..");
+      if (parent === directory) return null;
+      directory = parent;
     }
-  } catch { /* no lockfile available; declared ranges still participate */ }
-  const identity = {
-    name: pkg.name,
-    version: pkg.version,
-    dependencies,
-    integrities: Object.fromEntries(Object.entries(integrities).sort(([a], [b]) => a.localeCompare(b))),
-  };
-  return sha256(canonicalJson(identity));
+  } catch {
+    return null;
+  }
+}
+
+const DEPENDENCY_ASSET_PATTERN = /\.(?:js|mjs|cjs|wasm)$/u;
+
+/**
+ * Runtime dependency ledger (remaining closure §4.1/§4.2): resolved version + identity
+ * hashes computed from the ACTUAL installed dependency bytes. Every input is available both
+ * during prepack and after a clean `npm install <tgz>`, so the manifest generated at pack
+ * time matches what an installation recomputes. The parent project's lockfile is never read.
+ */
+export async function computeRuntimeDependencies(packageRoot: string): Promise<Array<RuntimeDependencyIdentity>> {
+  const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
+  const names = Object.keys(pkg.dependencies ?? {}).sort((a, b) => a.localeCompare(b));
+  const ledger: Array<RuntimeDependencyIdentity> = [];
+  for (const name of names) {
+    const declared = pkg.dependencies![name]!;
+    const resolved = await resolveDependencyRoot(packageRoot, name);
+    if (!resolved) throw new Error(`runtime dependency ${name} is not installed; cannot compute toolchain identity`);
+    const depPkg = JSON.parse(await readFile(join(resolved.root, "package.json"), "utf8")) as { name: string; version: string };
+    const packageIdentityHash = sha256(canonicalJson({ name: depPkg.name, version: depPkg.version }));
+    const files = (await listFilesRecursive(resolved.root)).filter((file) => DEPENDENCY_ASSET_PATTERN.test(file));
+    const fileHashes: Record<string, string> = {};
+    for (const file of files) fileHashes[relative(resolved.root, file).replaceAll("\\", "/")] = sha256(await readFile(file));
+    const runtimeFilesHash = sha256(canonicalJson(fileHashes));
+    ledger.push({ name, declared, resolvedVersion: resolved.version, packageIdentityHash, runtimeFilesHash });
+  }
+  return ledger;
+}
+
+export function combineDependencyIdentity(dependencies: ReadonlyArray<RuntimeDependencyIdentity>): string {
+  return sha256(canonicalJson(dependencies));
 }
 
 /** Generates the toolchain manifest from the actual bytes under `packageRoot`. */
@@ -137,13 +182,15 @@ export async function generateToolchainManifest(packageRoot: string): Promise<To
   const controlHashes = await hashFiles(controlPaths);
   const runtime = relativeMap(packageRoot, [...runtimeHashes.keys()].sort(), runtimeHashes);
   const control = relativeMap(packageRoot, [...controlHashes.keys()].sort(), controlHashes);
+  const dependencies = await computeRuntimeDependencies(packageRoot);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     packageName: pkg.name,
     packageVersion: pkg.version,
     runtimeHash: combineRuntimeHash(runtime),
     controlHash: combineControlHash(control),
-    dependencyIdentity: await computeDependencyIdentity(packageRoot),
+    dependencyIdentity: combineDependencyIdentity(dependencies),
+    dependencies,
     runtimeFiles: runtime,
     controlFiles: control,
   };
@@ -165,7 +212,18 @@ export async function verifyToolchainManifest(manifest: ToolchainManifest, packa
       return "runtime file set changed";
     }
     if (current.controlHash !== manifest.controlHash) return "control text changed";
-    if (current.dependencyIdentity !== manifest.dependencyIdentity) return "dependency identity changed";
+    if (current.dependencyIdentity !== manifest.dependencyIdentity) {
+      const expectedDeps = new Map(manifest.dependencies.map((dep) => [dep.name, dep]));
+      for (const dep of current.dependencies) {
+        const was = expectedDeps.get(dep.name);
+        if (!was) return `unexpected runtime dependency ${dep.name}`;
+        if (was.resolvedVersion !== dep.resolvedVersion) return `runtime dependency ${dep.name} version ${dep.resolvedVersion} differs from admitted ${was.resolvedVersion}`;
+        if (was.packageIdentityHash !== dep.packageIdentityHash) return `runtime dependency ${dep.name} package identity changed`;
+        if (was.runtimeFilesHash !== dep.runtimeFilesHash) return `runtime dependency ${dep.name} bytes changed`;
+      }
+      for (const dep of manifest.dependencies) if (!current.dependencies.some((item) => item.name === dep.name)) return `runtime dependency ${dep.name} is missing`;
+      return "dependency identity changed";
+    }
     return null;
   };
   const problem = mismatch();
@@ -191,16 +249,17 @@ export function computeToolchainId(manifest: ToolchainManifest): string {
 
 export async function establishToolchain(packageRoot: string, expected?: ToolchainManifest): Promise<VerifiedToolchain> {
   const manifest = await generateToolchainManifest(packageRoot);
-  // Shipped-manifest anchoring (closure plan §10.G2): an installed package carries
-  // toolchain/manifest.v1.json generated by release tooling; installed bytes are recomputed
-  // and compared exactly. A development checkout has no shipped manifest, generates only
-  // ephemeral identity, and is marked untrusted for certification purposes.
+  // Shipped-manifest anchoring (closure plan §10.G2, remaining closure §4.4): an installed
+  // package carries toolchain/manifest.v2.json generated by release tooling; installed
+  // bytes AND installed dependency bytes are recomputed and compared exactly. A development
+  // checkout has no shipped manifest, generates only ephemeral identity, and is marked
+  // untrusted for certification purposes.
   let shipped: ToolchainManifest | null = null;
   try {
-    shipped = JSON.parse(await readFile(join(packageRoot, 'toolchain', 'manifest.v1.json'), 'utf8')) as ToolchainManifest;
+    shipped = JSON.parse(await readFile(join(packageRoot, 'toolchain', 'manifest.v2.json'), 'utf8')) as ToolchainManifest;
   } catch { shipped = null; }
   if (shipped) {
-    if (shipped.schemaVersion !== 1) throw new Error('shipped toolchain manifest schema is unsupported');
+    if (shipped.schemaVersion !== 2) throw new Error('shipped toolchain manifest schema is unsupported; regenerate with the release tooling');
     await verifyToolchainManifest(shipped, packageRoot);
     const provenance = await captureRuntimeProvenance(packageRoot);
     return { manifest: shipped, provenance, toolchainId: computeToolchainId(shipped), trustedToolchain: true };

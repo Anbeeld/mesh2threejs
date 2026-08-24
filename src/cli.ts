@@ -655,7 +655,7 @@ export async function runCli(argv: string[], io: CliIo = { stdout: console.log, 
         assertDevelopmentWorkspace(await resumeWorkspace(workspaceInput));
         const quality = parsed.options.quality;
         if (quality !== undefined && !["aggressive", "balanced", "conservative"].includes(quality)) throw new Error("--quality must be aggressive, balanced, or conservative");
-        const result = await derivePhaseSeed(workspaceInput, { ...(quality ? { quality: quality as "aggressive" | "balanced" | "conservative" } : {}) });
+        const result = await derivePhaseSeed(workspaceInput, { ...(quality ? { quality: quality as "aggressive" | "balanced" | "conservative" } : {}), backend: developmentSandboxBackend() });
         io.stdout(json({ status: result.status, phase: result.phase, operator: result.operator, tiers: result.tiers, ...(result.generatedModule ? { generatedModule: result.generatedModule } : {}), ...(result.manifest ? { manifest: result.manifest } : {}), ...(result.selected ? { selected: result.selected } : {}), wiring: result.wiring ?? undefined, ...(result.note ? { note: result.note } : {}) }));
         return result.status === "seed-passing" ? 0 : 4;
       }

@@ -1,12 +1,13 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import * as THREE from "three";
-import { resumeWorkspace, createWorkspaceResolver, verifyWorkspaceOraclePreparation, type ResumedWorkspace } from "../core/workspace.js";
+import { resumeWorkspace, initializeWorkspace, createWorkspaceResolver, verifyWorkspaceOraclePreparation, type ResumedWorkspace } from "../core/workspace.js";
 import { recordEvidenceArtifact, isAuthoritativeEvidence, createWorkflowGateEvidenceArtifact, type EvidenceArtifact, type TaskState } from "../core/state.js";
 import { TrustedRunAuthority, mirroredTaskState, stateMirrorFor, detectWorkspaceStateDrift, type RunAuthorityRecord, type ReviewBinding, type RunTransitionContext } from "../core/run-authority.js";
 import { computeSafeDefaultPolicy, projectPolicyIdentity, type PolicyDecision } from "../core/policy.js";
 import { assertCapability, type Capability } from "../core/capabilities.js";
 import { establishToolchain, type VerifiedToolchain } from "../core/toolchain.js";
+import type { CandidateExecutionAuthority } from "../core/exec-authority.js";
 import { routeSubject } from "../core/routing.js";
 import { canonicalJson, fingerprintScene, sha256 } from "../core/hashing.js";
 import { getProfileContract } from "../core/contracts.js";
@@ -24,10 +25,10 @@ import {
 import { evaluateAssemblyCoverage } from "../core/assembly.js";
 import { derivePhaseSeed } from "../core/derive.js";
 import { verifyDerivedLineage, derivedDirectory, loadTrustedGeneratedModules } from "../core/derivation.js";
-import { performRenderRun, performOracleSanityRun, performQuickDiagnosticRun, verifyLatestOracleSanity } from "../core/workspace-render.js";
-import { createVisualReviewPacket, verifyVisualReviewPacketFiles, type ReviewFileReference } from "../core/review.js";
+import { performRenderRun, performOracleSanityRun, performQuickDiagnosticRun, verifyLatestOracleSanity } from "../core/workspace-render.js";import { createVisualReviewPacket, verifyVisualReviewPacketFiles, type ReviewFileReference } from "../core/review.js";
 import { serializeScene } from "../core/scene-serialization.js";
-import { inspectWorkspaceCandidateViaExecutor, classifyInspectionAuthority, computeWorkspaceGate, applyGateEvidence, workspaceGateOutcome } from "../operations/workspace-gate.js";
+import { trustedDerivedBackend } from "../core/candidate-sandbox.js";
+import { inspectWorkspaceCandidateViaExecutor, computeWorkspaceGate, applyGateEvidence, workspaceGateOutcome } from "../operations/workspace-gate.js";
 
 /**
  * THE trusted reconstruction pipeline (closure plan §3/F1). One internal operation layer
@@ -43,6 +44,22 @@ export class PipelineError extends Error {
     super(message);
     this.name = "PipelineError";
   }
+}
+
+/**
+ * Reusable trusted replay execution bundle (remaining closure §3): ONE authorized candidate
+ * execution whose serialized scenes feed gates, renders, viewer artifacts and review
+ * packets without any second candidate import.
+ */
+export interface TrustedReplayBundle {
+  replayHash: string;
+  candidateHash: string;
+  evaluationIdentityHash: string;
+  executionAuthority: CandidateExecutionAuthority;
+  neutralSceneHash: string;
+  neutralSerialization: ReturnType<typeof serializeScene>;
+  neutralRoot: THREE.Object3D;
+  posedRoots: Array<{ pose: Record<string, number>; root: THREE.Object3D }>;
 }
 
 export interface TrustedPipelineOptions {
@@ -153,15 +170,52 @@ export class TrustedPipeline {
   // ---------------------------------------------------------------- begin-run (A3)
 
   /**
-   * Safe-default autonomous run creation (§4.A3): the request identifies the workspace
-   * only. Policy is computed by trusted code from immutable reference bytes, the router,
-   * and package defaults. Non-default project configuration yields a structured block.
+   * Safe-default autonomous run creation over an EXISTING workspace (§4.A3). The request
+   * identifies the workspace only; policy is computed by trusted code from immutable
+   * reference bytes, the router, and package defaults. NOTE (remaining closure §6.3): this
+   * path trusts whatever goal/oracle the builder already placed in the workspace — it
+   * carries `builder-prepared` intake provenance and cannot claim end-to-end trusted input
+   * authority unless the initial goal/oracle were pinned by host/user authority.
    */
   async beginRun(input: { workspaceRoot: string; runId?: string }, capability: Capability): Promise<{ runId: string }> {
     const workspace = await resumeWorkspace(input.workspaceRoot);
     if (workspace.state.mirrorOfRun) {
       throw new PipelineError("WORKSPACE_ALREADY_BOUND", `workspace is already bound to trusted run ${workspace.state.mirrorOfRun.mirrorOfRun}`);
     }
+    return this.bindSafeDefaultRun(workspace, "builder-prepared", capability, input.runId);
+  }
+
+  /**
+   * TRUSTED INTAKE (remaining closure §6.1): a host/user-facing operation that pins the
+   * original goal and oracle bytes BEFORE any builder-controlled mutation can redefine the
+   * workspace. Trusted code routes the profile and computes every policy field — the
+   * builder never supplies profile, authorship mode, certification, style, or thresholds.
+   */
+  async createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string }, capability: Capability): Promise<{ runId: string }> {
+    assertCapability("create-workspace-run", capability);
+    const routedProfile = routeSubject(input.goal);
+    if (!/^[\w.-]+$/u.test(basename(input.oraclePath)) && !/\.glb$/iu.test(input.oraclePath)) {
+      throw new PipelineError("INVALID_ORACLE", "oraclePath must point at a .glb source model");
+    }
+    const initialized = await initializeWorkspace(resolve(input.workspaceRoot), {
+      id: input.workspaceId ?? basename(resolve(input.workspaceRoot)),
+      goal: input.goal,
+      profile: routedProfile,
+      style: "low-poly-faithful",
+      certification: "oracle-relative",
+      oracle: input.oraclePath,
+      referenceMode: "copy",
+      authorshipMode: "derived",
+    });
+    const workspace = await resumeWorkspace(initialized.root);
+    if (workspace.state.mirrorOfRun) {
+      throw new PipelineError("WORKSPACE_ALREADY_BOUND", `workspace is already bound to trusted run ${workspace.state.mirrorOfRun.mirrorOfRun}`);
+    }
+    return this.bindSafeDefaultRun(workspace, "trusted", capability);
+  }
+
+  /** Shared safe-default binding: route + policy computation + canonical run creation. */
+  private async bindSafeDefaultRun(workspace: ResumedWorkspace, intake: "trusted" | "builder-prepared", capability: Capability, runIdInput?: string): Promise<{ runId: string }> {
     const routedProfile = routeSubject(workspace.project.goal);
     const computed = computeSafeDefaultPolicy({
       project: workspace.project,
@@ -174,7 +228,7 @@ export class TrustedPipeline {
       throw new PipelineError(computed.blocked, `the project requests non-default policy; administrative approval is required (${computed.conflicts.join("; ")})`, computed.conflicts);
     }
     const toolchain = await this.toolchain();
-    const runId = input.runId ?? `run-${sha256(canonicalJson({ root: resolve(workspace.root), at: Date.now(), random: Math.random().toString(36) })).slice(0, 12)}`;
+    const runId = runIdInput ?? `run-${sha256(canonicalJson({ root: resolve(workspace.root), at: Date.now(), random: Math.random().toString(36) })).slice(0, 12)}`;
     await this.authority.createRun({
       runId,
       workspaceRoot: workspace.root,
@@ -188,6 +242,7 @@ export class TrustedPipeline {
         packageVersion: toolchain.manifest.packageVersion,
         toolchainId: toolchain.toolchainId,
       },
+      intake,
       defaults: { hasOracle: Boolean(workspace.project.oracle), routedProfile },
       requestedBy: capability,
     });
@@ -327,6 +382,88 @@ export class TrustedPipeline {
     return { status: "oracle-sanity-captured", views: result.views, note: "builder/onboarding sanity evidence; not external visual certification" };
   }
 
+  // ---------------------------------------------------------------- builder information loop (remaining closure §7)
+
+  /** Read-only oracle facts for autonomous onboarding (§7.1); never mutates anything. */
+  async probe(runId: string): Promise<Record<string, unknown>> {
+    const record = await this.authority.readRun(runId);
+    if (!record) throw new PipelineError("RUN_NOT_FOUND", `no trusted run ${runId} exists`);
+    const workspace = await resumeWorkspace(record.workspaceRoot);
+    if (!workspace.project.oracle) throw new PipelineError("NO_ORACLE", "workspace has no oracle reference to probe");
+    const oracleRecord = workspace.references.records.find((entry) => entry.kind === "oracle" && entry.operationalPath === workspace.project.oracle);
+    if (!oracleRecord) throw new PipelineError("ORACLE_NOT_INDEXED", "workspace oracle is absent from the reference index");
+    const { probeGlb } = await import("../core/oracle.js");
+    const bytes = await readFile(this.resolveWorkspace(oracleRecord.operationalPath, workspace));
+    return {
+      status: "probed",
+      oraclePath: oracleRecord.operationalPath,
+      sha256: oracleRecord.sha256,
+      facts: probeGlb(bytes),
+      note: "read-only oracle facts for semantic onboarding; use onboard-oracle to bind them",
+    };
+  }
+
+  /** Current authoritative failing workorders from canonical trusted evidence (§7.2). */
+  async workorders(runId: string): Promise<Record<string, unknown>> {
+    const record = await this.loadRecord(runId);
+    void record;
+    const state = (await this.authority.readRun(runId)).embedded.state;
+    const activePhase = state.activePhase;
+    const latest = Object.values(state.evidence)
+      .filter((item) => item.kind === "deterministic-gate" && item.phase === activePhase && item.valid && item.artifact)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    let latestGate: Record<string, unknown> | null = null;
+    let workorders: Array<Record<string, unknown>> = [];
+    if (latest?.artifact) {
+      try {
+        const report = JSON.parse(await readFile(this.resolveWorkspace(latest.artifact, await this.loadRunWorkspace(record)), "utf8")) as { report?: { passed?: boolean; score?: number; workorders?: Array<Record<string, unknown>>, rows?: Array<{ passed: boolean; code: string }> } };
+        const inner = report.report ?? report as never;
+        latestGate = { evidenceId: latest.id, phase: latest.phase, createdAt: latest.createdAt, ...(inner.passed !== undefined ? { passed: inner.passed } : {}), ...(inner.score !== undefined ? { score: inner.score } : {}), failingCodes: (inner.rows ?? []).filter((row) => !row.passed).map((row) => row.code) };
+        workorders = inner.workorders ?? [];
+      } catch { /* unreadable artifact falls through to empty workorders */ }
+    }
+    const { determineNextAction } = await import("../core/state.js");
+    const nextAction = determineNextAction(state);
+    return {
+      runId,
+      activePhase,
+      workorders,
+      latestGate,
+      stagnation: { attempts: state.attempts.length, route: state.route },
+      nextAction,
+    };
+  }
+
+  /**
+   * Trusted builder diagnostic render of the ACTIVE phase through the SAME authorized
+   * candidate execution graph (bounded child, byte-verified authority). Quick captures are
+   * never review or certification evidence and never start a viewer.
+   */
+  async renderQuick(runId: string): Promise<Record<string, unknown>> {
+    const record = await this.loadRecord(runId);
+    const workspace = await this.loadRunWorkspace(record);
+    await this.assertBindingsCurrent(record, workspace);
+    const manifest = await verifyWorkspaceOraclePreparation(workspace);
+    const oracle = await loadPreparedOracle(manifest.manifest, workspace.root);
+    const execution = await inspectWorkspaceCandidateViaExecutor({
+      workspaceRoot: workspace.root,
+      modelEntryPath: workspace.resolved.model,
+      boundaryRoot: resolve(workspace.root, "model"),
+      poses: [neutralPoseForProfile(workspace.project.profile)],
+      auditOptions: await (await import("../core/derive.js")).trustedGeneratedAuditOptions(workspace, manifest.binding.identity),
+      trusted: true,
+    });
+    const result = await performQuickDiagnosticRun(workspace, manifest.manifest, oracle, { candidateHash: execution.candidateHash }, execution.neutralRoot);
+    return {
+      status: "quick-render-captured",
+      activePhase: workspace.state.activePhase,
+      directory: this.toProjectPath(result.directory, workspace),
+      boards: result.boards.map((board) => this.toProjectPath(board.path, workspace)),
+      captures: result.captures,
+      note: "builder diagnostic only; not review or certification evidence",
+    };
+  }
+
   // ---------------------------------------------------------------- derive/gate/lock/reopen
 
   async derive(runId: string, options: { quality?: "aggressive" | "balanced" | "conservative" } = {}, capability: Capability): Promise<Record<string, unknown>> {
@@ -350,6 +487,9 @@ export class TrustedPipeline {
     const result = await derivePhaseSeed(workspace.root, {
       ...(options.quality ? { quality: options.quality } : {}),
       persistState,
+      // Tier trials execute the pipeline-owned composition in the bounded child process —
+      // never inside the broker (remaining closure §2.6/§2.7).
+      backend: trustedDerivedBackend(),
     });
     // Lineage re-verification against canonical bindings (defense in depth).
     const fresh = await this.authority.readRun(runId);
@@ -382,6 +522,7 @@ export class TrustedPipeline {
       toolchainId: record.toolchain.toolchainId,
       projectPolicyHash: record.projectPolicyHash,
       artifactRunId: runTag,
+      trusted: true,
     });
     // Persist evidence artifacts into the workspace reports tree (provenance paths).
     const evidenceDirectory = join(workspace.layout.internal.evidence, runTag);
@@ -477,9 +618,10 @@ export class TrustedPipeline {
   /**
    * Internal trusted GLOBAL replay (closure plan §8.E1): recomputes the CURRENT candidate
    * with the installed evaluator under the CURRENT oracle preparation, requires every
-   * builder phase to pass, computes its own identities, and records the replay internally.
+   * builder phase to pass, computes its own identities, records the compact replay record
+   * internally, and returns the LIVE execution bundle to its immediate caller.
    */
-  async trustedReplay(runId: string): Promise<{ replayHash: string; passed: boolean }> {
+  async trustedReplay(runId: string): Promise<TrustedReplayBundle> {
     const record = await this.loadRecord(runId);
     const workspace = await this.loadRunWorkspace(record);
     await this.assertBindingsCurrent(record, workspace);
@@ -511,6 +653,7 @@ export class TrustedPipeline {
       toolchainId: record.toolchain.toolchainId,
       projectPolicyHash: record.projectPolicyHash,
       artifactRunId: `replay-${record.runId}-${record.mirrorSequence + 1}`,
+      trusted: true,
     });
     if (!computation.evaluation.passed) {
       throw new PipelineError("REPLAY_FAILED", "fresh global replay failed; certification refuses until every gate passes");
@@ -558,13 +701,24 @@ export class TrustedPipeline {
       evaluatedAt: new Date().toISOString(),
     });
     await this.commitCanonicalAndMirror(next);
-    return { replayHash, passed: true };
+    return {
+      replayHash,
+      candidateHash: computation.evaluation.candidateHash,
+      evaluationIdentityHash: computation.evaluationIdentityHash,
+      executionAuthority: computation.executionAuthority,
+      neutralSceneHash: computation.execution.neutralSceneHash,
+      neutralSerialization: computation.execution.serialization,
+      neutralRoot: computation.execution.neutralRoot,
+      posedRoots: computation.execution.posedRoots.map((sample) => ({ pose: sample.pose, root: sample.root })),
+    };
   }
 
   /**
-   * Trusted review-ready (closure plan §9.F1): fresh replay -> full capture set -> exact
-   * viewer scene -> complete canonical review binding. Reports user-facing paths; NEVER
-   * starts the viewer (F5).
+   * Trusted review-ready (closure plan §9.F1, remaining closure §3): fresh replay -> full
+   * capture set rendered from the SAME replay execution -> exact viewer scene emitted from
+   * the same neutral serialization -> complete canonical review binding. No second
+   * candidate execution exists in this flow. Reports user-facing paths; NEVER starts the
+   * viewer (F5).
    */
   async reviewReady(runId: string): Promise<Record<string, unknown>> {
     const record = await this.loadRecord(runId);
@@ -574,25 +728,17 @@ export class TrustedPipeline {
     const fresh = await this.authority.readRun(runId);
     const manifest = await verifyWorkspaceOraclePreparation(workspace);
     const oracle = await loadPreparedOracle(manifest.manifest, workspace.root);
-    const execution = await inspectWorkspaceCandidateViaExecutor({
-      workspaceRoot: workspace.root,
-      modelEntryPath: workspace.resolved.model,
-      boundaryRoot: resolve(workspace.root, "model"),
-      poses: [neutralPoseForProfile(workspace.project.profile)],
-      auditOptions: await (await import("../core/derive.js")).trustedGeneratedAuditOptions(workspace, manifest.binding.identity),
-    });
-    if (execution.candidateHash !== fresh.candidateHash) throw new PipelineError("CANDIDATE_DRIFT", "candidate changed during review capture; rerun review-ready");
     const renderRunDirectory = join(workspace.layout.internal.captures, `render-review-${record.mirrorSequence + 1}`);
     await mkdir(renderRunDirectory, { recursive: true });
     const sceneArtifactPath = join(renderRunDirectory, "viewer-scene.json");
-    const sceneBytes = `${JSON.stringify({ schemaVersion: 1, candidateHash: execution.candidateHash, sceneHash: execution.sceneHash, serialization: execution.serialization }, null, 2)}\n`;
+    const sceneBytes = `${JSON.stringify({ schemaVersion: 1, candidateHash: replay.candidateHash, sceneHash: replay.neutralSceneHash, serialization: replay.neutralSerialization }, null, 2)}\n`;
     await writeFile(sceneArtifactPath, sceneBytes, { flag: "wx" });
     const sceneSha = sha256(Buffer.from(sceneBytes, "utf8"));
     const result = await performRenderRun({
       workspace,
       manifest: manifest.manifest,
-      candidateIdentity: { candidateHash: execution.candidateHash },
-      candidate: execution.neutralRoot,
+      candidateIdentity: { candidateHash: replay.candidateHash },
+      candidate: replay.neutralRoot,
       oracle,
       directory: renderRunDirectory,
       runId: basename(renderRunDirectory),
@@ -627,7 +773,7 @@ export class TrustedPipeline {
     const regionFile = renderManifest.regionDiagnostics ? { ...renderManifest.regionDiagnostics, role: "region" as const } : undefined;
     const packet = createVisualReviewPacket({
       oracleHash: manifest.binding.identity,
-      candidateHash: execution.candidateHash,
+      candidateHash: replay.candidateHash,
       profile: workspace.project.profile,
       profileContractHash: state.profileContractHash,
       styleContractHash: state.styleContractHash,
@@ -646,16 +792,23 @@ export class TrustedPipeline {
     await verifyVisualReviewPacketFiles(packet, workspace.root);
     const binding: ReviewBinding = {
       packetHash: packet.packetHash,
+      packetFile: { path: this.toProjectPath(packetPath, workspace), sha256: sha256(Buffer.from(`${JSON.stringify(packet, null, 2)}\n`, "utf8")) },
       replayHash: replay.replayHash,
-      candidateHash: execution.candidateHash,
+      candidateHash: replay.candidateHash,
       oraclePreparationIdentity: manifest.binding.identity,
       evaluationIdentityHash: state.evaluationIdentityHash,
       toolchainId: record.toolchain.toolchainId,
-      scene: { path: this.toProjectPath(sceneArtifactPath, workspace), sha256: sceneSha, sceneHash: execution.sceneHash },
+      scene: { path: this.toProjectPath(sceneArtifactPath, workspace), sha256: sceneSha, sceneHash: replay.neutralSceneHash },
       captures: [
         ...captureFiles.map((item) => ({ path: item.path, sha256: item.sha256, role: "capture" })),
         ...boardFiles.map((item) => ({ path: item.path, sha256: item.sha256, role: "comparison-board" })),
         ...turntableFiles.map((item) => ({ path: item.path, sha256: item.sha256, role: "turntable" })),
+        // Deterministic index, style/articulation artifacts and region diagnostics join the
+        // exact-bytes review binding so approval re-verifies everything the human can see.
+        { path: deterministicFile.path, sha256: deterministicFile.sha256, role: "deterministic-index" },
+        { path: styleFile.path, sha256: styleFile.sha256, role: "style-artifact" },
+        ...(articulationFile ? [{ path: articulationFile.path, sha256: articulationFile.sha256, role: "articulation-artifact" }] : []),
+        ...(regionFile ? [{ path: regionFile.path, sha256: regionFile.sha256, role: "region-diagnostic" }] : []),
       ],
       humanApproval: null,
     };
@@ -669,7 +822,7 @@ export class TrustedPipeline {
       id: `${basename(renderRunDirectory)}-turntable`,
       phase: "visual-review",
       oracleHash: manifest.binding.identity ? fingerprintScene(oracle) : fingerprintScene(oracle),
-      candidateHash: execution.candidateHash,
+      candidateHash: replay.candidateHash,
       profileContractHash: state.profileContractHash,
       styleContractHash: state.styleContractHash,
       evaluationIdentityHash: state.evaluationIdentityHash!,
@@ -689,7 +842,7 @@ export class TrustedPipeline {
     await this.commitCanonicalAndMirror(withTurntable);
     return {
       status: "ready-for-user-review",
-      candidateHash: execution.candidateHash,
+      candidateHash: replay.candidateHash,
       packet: { hash: packet.packetHash, path: this.toProjectPath(packetPath, workspace) },
       capture: {
         directory: this.toProjectPath(renderRunDirectory, workspace),
@@ -735,6 +888,15 @@ export class TrustedPipeline {
     const toolchain = await this.toolchain();
     if (!toolchain.trustedToolchain) {
       throw new PipelineError("TRUSTED_TOOLCHAIN_UNAVAILABLE", "this installation cannot anchor trusted toolchain identity (development checkout); certification refuses");
+    }
+    // Finalization precondition (remaining closure §5.3): the files the human approved must
+    // still be byte-identical before any fresh replay/certification.
+    const preReplay = await this.authority.readRun(runId);
+    try {
+      const { verifyBoundReviewArtifacts } = await import("../core/run-authority.js");
+      await verifyBoundReviewArtifacts(preReplay);
+    } catch (error) {
+      throw new PipelineError("REVIEW_ARTIFACT_DRIFT", error instanceof Error ? error.message : String(error));
     }
     const freshReplay = await this.trustedReplay(runId);
     const record = await this.authority.readRun(runId);

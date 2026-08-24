@@ -7,12 +7,15 @@ import { MODEL_DERIVED_SCAFFOLD } from "./derivation.js";
 import { deserializeScene } from "./scene-serialization.js";
 import type { CandidateExecutionResult } from "./candidate-executor.js";
 import type { SandboxBackend } from "./candidate-sandbox.js";
+import type { DerivedGraphExpectations } from "./exec-authority.js";
 
 /**
  * Executes the WORKSPACE candidate (or a trial derived composition) through the one trusted
  * sandbox path. Derived-mode tier evaluation stages the exact composition the pipeline
  * owns — canonical scaffold entry, generated registry, generated seeds, audited repairs —
  * so tier selection can never bypass the boundary normal candidate gates use (§9).
+ * Backends are ALWAYS explicit here: development callers pass the in-process backend,
+ * trusted callers pass the bounded child (remaining closure §2.7).
  */
 
 export interface WorkspaceExecutionRequest {
@@ -25,20 +28,22 @@ export interface WorkspaceExecutionRequest {
   poses: Array<Record<string, number>>;
   auditOptions?: Parameters<typeof auditCandidateModule>[1];
   backend: SandboxBackend;
+  /** Derived byte expectations enforced before execution by the executor boundary. */
+  authorityExpectations?: DerivedGraphExpectations;
 }
 
 export async function executeWorkspaceModel(request: WorkspaceExecutionRequest): Promise<CandidateExecutionResult> {
   const { executeCandidate } = await import("./candidate-executor.js");
-  const { developmentInProcessBackend } = await import("./dev-sandbox.js");
   return executeCandidate({
     entryPath: request.modelEntryPath,
     poses: request.poses,
   }, {
-    backend: request.backend ?? developmentInProcessBackend(),
+    backend: request.backend,
     auditOptions: {
       ...(request.auditOptions ?? {}),
       ...(request.boundaryRoot !== undefined ? { boundaryRoot: request.boundaryRoot } : {}),
     },
+    ...(request.authorityExpectations ? { authorityExpectations: request.authorityExpectations } : {}),
   });
 }
 
@@ -84,12 +89,11 @@ export async function executeComposedDerivedTrial(request: ComposedTrialRequest)
       remappedTrusted.set(resolve(join(modelDirectory, relation)), value);
     }
     const { executeCandidate } = await import("./candidate-executor.js");
-    const { developmentInProcessBackend } = await import("./dev-sandbox.js");
     const result = await executeCandidate({
       entryPath,
       poses: request.poses,
     }, {
-      backend: request.backend ?? developmentInProcessBackend(),
+      backend: request.backend ?? (await import("./dev-sandbox.js")).developmentInProcessBackend(),
       auditOptions: {
         trustedGeneratedModules: remappedTrusted,
         boundaryRoot: modelDirectory,

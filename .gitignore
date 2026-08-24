@@ -5,4 +5,5 @@ coverage/
 .mesh2threejs/
 /workspaces/
 
-toolchain/manifest.v1.json
+toolchain/manifest.v2.json
+

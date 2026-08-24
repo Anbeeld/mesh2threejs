@@ -454,8 +454,8 @@ describe("derived seed end-to-end", () => {
     const quick = JSON.parse(quickStdout.at(-1)!) as { status: string; directory: string };
     expect(quick.status).toBe("quick-diagnostic-captured");
     const quickFiles = await readdir(resolve(root, quick.directory));
-    expect(quickFiles.length).toBe(10); // 3 views × (oracle+ candidate + comparison) + quick-manifest
-    expect(quickFiles.filter((name) => name.includes("comparison"))).toHaveLength(3);
+    expect(quickFiles.length).toBe(13); // 4 views × (oracle+ candidate + comparison) + quick-manifest
+    expect(quickFiles.filter((name) => name.includes("comparison"))).toHaveLength(4);
     const fullRenderRunsAfter = (await readdir(capturesDirectory)).filter((name) => name.startsWith("render-")).length;
     expect(fullRenderRunsAfter).toBe(fullRenderRunsBefore);
     expect(Object.keys((await loadTaskState(createWorkspaceResolver(root).layout.internal.state)).evidence).length).toBe(evidenceBefore);

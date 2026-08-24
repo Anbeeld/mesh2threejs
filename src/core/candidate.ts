@@ -331,6 +331,13 @@ async function exposePipelineThree(stageRoot: string): Promise<void> {
   } catch { /* best-effort staging aid; import failures surface from the real import below */ }
 }
 
+export interface StagedCandidateGraph {
+  root: string;
+  entry: string;
+  /** Exact staged copy of every audited file (remaining closure §2.5 ledger). */
+  stagedFiles: Array<{ absolutePath: string; stagedPath: string }>;
+}
+
 /**
  * Stages the exact audited transitive source graph in a fresh location and returns it for
  * sandboxed execution. A bare entry-module cache-buster is insufficient because Node's ESM
@@ -338,9 +345,10 @@ async function exposePipelineThree(stageRoot: string): Promise<void> {
  * while executing cached helper A. Staging under the graph's common ancestor keeps
  * package.json module-type semantics identical to the original location — bare "three"
  * resolution is provided by the stage-root junction in exposePipelineThree() — while every
- * load sees the bytes that produced the source hash.
+ * load sees the bytes that produced the source hash. Each byte is re-hashed against the
+ * pre-execution audit ledger during the copy (remaining closure §2.5).
  */
-export async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudit): Promise<{ root: string; entry: string }> {
+export async function stageCandidateGraph(entryPath: string, audit: CandidateModuleAudit): Promise<StagedCandidateGraph> {
   const entry = resolve(entryPath);
   const hashByAbsolute = new Map(audit.candidateFiles.map((file) => [resolve(dirname(entry), file.path), file.sha256]));
   const files = audit.files.map((file) => resolve(file));
@@ -348,15 +356,19 @@ export async function stageCandidateGraph(entryPath: string, audit: CandidateMod
   const ancestor = commonAncestor([entry, ...files]);
   const root = await mkdtemp(join(ancestor, STAGE_PREFIX));
   try {
+    const stagedFiles: Array<{ absolutePath: string; stagedPath: string }> = [];
     for (const file of files) {
       const bytes = await readFile(file);
-      if (sha256(bytes) !== hashByAbsolute.get(file)) throw new Error("candidate source changed during staging; rerun the gate");
+      if (sha256(bytes) !== hashByAbsolute.get(file)) {
+        throw new Error("CANDIDATE_CHANGED_DURING_AUTHORIZATION: candidate bytes changed between authority audit and staging; rerun from a fresh audit");
+      }
       const staged = resolve(root, relative(ancestor, file));
       await mkdir(dirname(staged), { recursive: true });
       await writeFile(staged, bytes, { flag: "wx" });
+      stagedFiles.push({ absolutePath: file, stagedPath: staged });
     }
     await exposePipelineThree(root);
-    return { root, entry: resolve(root, relative(ancestor, entry)) };
+    return { root, entry: resolve(root, relative(ancestor, entry)), stagedFiles };
   } catch (error) {
     await rm(root, { recursive: true, force: true });
     throw error;

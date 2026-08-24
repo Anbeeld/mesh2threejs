@@ -14,7 +14,7 @@ Certification is a trusted-run operation (fail-closed):
   broker only: the broker freshly replays the whole evaluation through the candidate
   sandbox, requires the current human approval bound to the exact packet/candidate/oracle/
   toolchain/replay hashes, and refuses when anything drifted.
-- Historical `passed` evidence fields are provenance; they never override current truth.
+- Historical `passed` evidence fields are provenance; they never override current truth. Finalization re-verifies every bound review artifact byte-for-byte BEFORE the fresh replay; any drift is `REVIEW_ARTIFACT_DRIFT` and requires a new review-ready plus human approval.
 
 Finalization still verifies registration, deterministic gate, style, complexity, sampled
 articulation when controls are declared, turntable evidence, and human visual approval,

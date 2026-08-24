@@ -8,8 +8,8 @@ import { composeCandidateHash } from "../core/candidate.js";
 import { fingerprintScene, sha256, canonicalJson } from "../core/hashing.js";
 import { serializeScene, serializedSceneHash } from "../core/scene-serialization.js";
 import type { SandboxBackend } from "../core/candidate-sandbox.js";
-import { developmentInProcessBackend } from "../core/dev-sandbox.js";
-import { classifyExecutionAuthority } from "../core/exec-authority.js";
+import { trustedDerivedBackend } from "../core/candidate-sandbox.js";
+import type { CandidateExecutionAuthority, DerivedGraphExpectations } from "../core/exec-authority.js";
 import { phaseSemanticScope } from "../core/phase-compose.js";
 import { snapshotScene } from "../core/geometry.js";
 import {
@@ -52,8 +52,21 @@ export interface WorkspaceExecutionInspection {
 }
 
 /**
- * The one authoritative workspace-candidate inspection path: audit -> sandbox execution ->
- * trusted reconstruction. No live untrusted runtime object is produced.
+ * Backend resolution for a trusted operation (remaining closure §2.6/§2.7): an explicit
+ * backend is honored only when it is NOT the development in-process loader; otherwise the
+ * bounded child process executes the proven graph outside this process. There is never a
+ * silent in-process fallback inside a trusted run.
+ */
+function resolveTrustedBackend(backend?: SandboxBackend): SandboxBackend {
+  if (backend && backend.name !== "in-process") return backend;
+  if (backend && backend.name === "in-process") throw new Error("TRUSTED_IN_PROCESS_EXECUTION_REFUSED: trusted operations never execute candidates inside the calling process");
+  return trustedDerivedBackend();
+}
+
+/**
+ * The one authoritative workspace-candidate inspection path: audit -> byte-verified
+ * authority establishment -> sandbox execution -> trusted reconstruction. No live untrusted
+ * runtime object is produced.
  */
 export async function inspectWorkspaceCandidateViaExecutor(input: {
   workspaceRoot?: string;
@@ -62,7 +75,11 @@ export async function inspectWorkspaceCandidateViaExecutor(input: {
   poses: Array<Record<string, number>>;
   auditOptions?: Parameters<typeof auditCandidateModule>[1];
   backend?: SandboxBackend;
-}): Promise<WorkspaceExecutionInspection & { auditFiles: ReadonlyArray<string>; trustedGeneratedModules: ReadonlyArray<string> }> {
+  /** Trusted-run execution route: refuses in-process backends and defaults to the bounded child. */
+  trusted?: boolean;
+  /** Derived byte expectations; required for trusted derived runs, computed by trusted code. */
+  authorityExpectations?: DerivedGraphExpectations;
+}): Promise<WorkspaceExecutionInspection & { auditFiles: ReadonlyArray<string>; trustedGeneratedModules: ReadonlyArray<string>; graphAuthority: import("../core/exec-authority.js").ExecutableGraphAuthority }> {
   const { executeWorkspaceModel, deserializeExecutionSamples } = await import("../core/composition-exec.js");
   const result = await executeWorkspaceModel({
     ...(input.workspaceRoot !== undefined ? { workspaceRoot: input.workspaceRoot } : {}),
@@ -70,7 +87,8 @@ export async function inspectWorkspaceCandidateViaExecutor(input: {
     boundaryRoot: input.boundaryRoot ?? dirname(input.modelEntryPath),
     poses: input.poses,
     auditOptions: input.auditOptions,
-    backend: input.backend ?? developmentInProcessBackend(),
+    backend: input.trusted ? resolveTrustedBackend(input.backend) : input.backend ?? (await import("../core/dev-sandbox.js")).developmentInProcessBackend(),
+    ...(input.authorityExpectations ? { authorityExpectations: input.authorityExpectations } : {}),
   });
   const samples = deserializeExecutionSamples(result);
   const neutralSerialization = result.samples[0]!.serialization;
@@ -88,12 +106,8 @@ export async function inspectWorkspaceCandidateViaExecutor(input: {
     deterministic: result.deterministic,
     auditFiles: [...result.audit.files],
     trustedGeneratedModules: [...result.audit.trustedGeneratedModules],
+    graphAuthority: result.graphAuthority,
   };
-}
-
-/** Classifies how the last execution's code was produced (runtime fact; see exec-authority). */
-export function classifyInspectionAuthority(backendIsolation: WorkspaceExecutionInspection["isolation"], inspection: { auditFiles: ReadonlyArray<string>; trustedGeneratedModules: ReadonlyArray<string> }): ReturnType<typeof classifyExecutionAuthority> {
-  return classifyExecutionAuthority(backendIsolation, { files: inspection.auditFiles, trustedGeneratedModules: inspection.trustedGeneratedModules });
 }
 
 /**
@@ -118,7 +132,7 @@ export function workspaceGateOutcome(evaluation: Pick<PosedEvaluationBundle, "pa
 
 export interface GateComputation {
   execution: Awaited<ReturnType<typeof inspectWorkspaceCandidateViaExecutor>>;
-  executionAuthority: ReturnType<typeof classifyExecutionAuthority>;
+  executionAuthority: CandidateExecutionAuthority;
   evaluation: PosedEvaluationBundle;
   evaluationIdentity: ReturnType<typeof createEvaluationIdentity>;
   evaluationIdentityHash: string;
@@ -132,6 +146,8 @@ export interface GateComputation {
  * Computes one whole-object (--global) or active-phase gate over a live workspace through
  * the single trusted execution path. Performs NO state mutation and NO persistence — the
  * caller decides where evidence lands (development state file vs canonical run authority).
+ * With `trusted: true` the candidate executes in the bounded child backend and, for derived
+ * runs, only after its exact bytes match the canonical scaffold/registry/generated bindings.
  */
 export async function computeWorkspaceGate(workspace: ResumedWorkspace, options: {
   isGlobal?: boolean;
@@ -141,6 +157,8 @@ export async function computeWorkspaceGate(workspace: ResumedWorkspace, options:
   projectPolicyHash?: string | null;
   /** Prefix for evidence artifact ids (unique per gate run). */
   artifactRunId: string;
+  /** Trusted execution route (§2.7): never in-process; byte-verified derived authority. */
+  trusted?: boolean;
 }): Promise<GateComputation> {
   const { verifyWorkspaceOraclePreparation } = await import("../core/workspace.js");
   const preparation = await verifyWorkspaceOraclePreparation(workspace);
@@ -157,16 +175,29 @@ export async function computeWorkspaceGate(workspace: ResumedWorkspace, options:
   const needsArticulation = !activePhase || isGlobal || profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === activePhase);
   const poses = needsArticulation ? requiredPosesForProfile(profile, subjectContract) : [neutralPoseForProfile(profile, subjectContract)];
   const auditOptions = await trustedGeneratedAuditOptions(workspace, preparationIdentity);
+  // Trusted derived runs pin the exact expected graph bytes BEFORE execution (§2.2–§2.3):
+  // scaffold scaffold bytes plus a registry regenerated from the currently bound phases.
+  let authorityExpectations: DerivedGraphExpectations | undefined;
+  if (options.trusted && workspace.state.authorshipMode === "derived") {
+    const { MODEL_DERIVED_SCAFFOLD, GENERATED_REGISTRY_PATH, generateRegistrySource, orderedDerivedPhasesFromBindings } = await import("../core/derivation.js");
+    authorityExpectations = {
+      scaffoldSource: MODEL_DERIVED_SCAFFOLD,
+      registryPath: resolve(workspace.root, GENERATED_REGISTRY_PATH),
+      registrySource: generateRegistrySource(workspace.project.profile, orderedDerivedPhasesFromBindings(workspace.project.profile, workspace.state.derivedBindings)),
+    };
+  }
   const execution = await inspectWorkspaceCandidateViaExecutor({
     workspaceRoot: workspace.root,
     boundaryRoot: resolve(workspace.root, "model"),
     modelEntryPath: workspace.resolved.model,
     poses,
     auditOptions,
+    ...(options.trusted ? { trusted: true } : {}),
+    ...(authorityExpectations ? { authorityExpectations } : {}),
     ...(options.backend ? { backend: options.backend } : {}),
   });
   if (!isGlobal) assertPhaseSemanticScope(profile, activePhase, execution.neutralRoot);
-  const executionAuthority = classifyInspectionAuthority(execution.isolation, execution);
+  const executionAuthority = execution.graphAuthority.authority;
   if (!execution.deterministic) throw new Error("candidate execution was not deterministic across repeated runs; refusing to gate");
   const certification = workspace.state.certification;
   const oraclePreparationHash = preparationIdentity ?? oraclePreparationIdentity(manifest as never);

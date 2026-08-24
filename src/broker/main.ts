@@ -31,6 +31,7 @@ const handle = await startBroker({
 });
 
 console.log(`mesh2threejs trusted broker listening on ${handle.url}`);
+console.log(`TOOLCHAIN trusted=${handle.trustedToolchain ? "true" : "false"} toolchainId=${handle.toolchainId}`);
 console.log(`toolchain: ${handle.toolchainId}${handle.trustedToolchain ? "" : " (UNANCHORED development checkout; certification unavailable)"}`);
 console.log(`builder connection descriptor written under the store directory (no admin capability inside).`);
 console.log(`ADMIN CAPABILITY (human channel only — do not share with builder tools): ${handle.adminToken}`);

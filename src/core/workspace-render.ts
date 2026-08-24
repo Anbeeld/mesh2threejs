@@ -198,6 +198,7 @@ export async function performQuickDiagnosticRun(workspace: ResumedWorkspace, man
   const views: Array<{ id: string; camera: CaptureCamera }> = [
     { id: "side", camera: frame.cameras.side },
     { id: "front", camera: frame.cameras.front },
+    { id: "plan", camera: frame.cameras.plan },
     { id: "perspective", camera: perspective },
   ];
   let captures = 0;

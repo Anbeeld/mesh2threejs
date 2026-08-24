@@ -13,6 +13,7 @@ import {
 } from "../src/core/run-authority.js";
 import type { RunPolicy } from "../src/core/policy.js";
 import { createTaskState, saveTaskState, loadTaskState, type TaskState } from "../src/core/state.js";
+import { sha256 } from "../src/core/hashing.js";
 
 /**
  * Trusted authority regression core (plan §22 attacks: toolchain 1/4/5/6/7, policy 9–15,
@@ -82,10 +83,15 @@ describe("launch hygiene and toolchain byte verification (§6)", () => {
   test("dependency identity participates in toolchainId (attack 6)", async () => {
     const a = await scratch();
     const b = await scratch();
-    for (const [root, deps] of [[a, { three: "1.0.0" }] as const, [b, { three: "2.0.0" }] as const]) {
+    // The ledger hashes INSTALLED dependency bytes, so each fixture carries its own
+    // node_modules/three at a different resolved version.
+    for (const [root, version] of [[a, "1.0.0"], [b, "2.0.0"]] as const) {
       await mkdir(join(root, "dist"), { recursive: true });
-      await writeFile(join(root, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0", dependencies: deps }));
+      await mkdir(join(root, "node_modules", "three"), { recursive: true });
+      await writeFile(join(root, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0", dependencies: { three: version } }));
       await writeFile(join(root, "dist", "main.js"), "x");
+      await writeFile(join(root, "node_modules", "three", "package.json"), JSON.stringify({ name: "three", version, main: "./index.js" }));
+      await writeFile(join(root, "node_modules", "three", "index.js"), "export const three = 1;\n");
     }
     const ta = await establishToolchain(a);
     const tb = await establishToolchain(b);
@@ -194,6 +200,12 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
 
   test("certification demands fresh replay, current approval, trusted execution; changes kill approvals (attacks 49–51)", async () => {
     const authority = new TrustedRunAuthority(new InMemoryRunAuthorityStore());
+    // Approval re-verifies bound review bytes, so the fixture workspace carries a real scene file.
+    const wsDir = await mkdtemp(join(tmpdir(), "m23-cert-ws-"));
+    roots.push(wsDir);
+    const sceneBytes = Buffer.from(JSON.stringify({ schemaVersion: 1, scene: true }), "utf8");
+    await mkdir(join(wsDir, "captures"), { recursive: true });
+    await writeFile(join(wsDir, "captures", "viewer-scene.json"), sceneBytes);
     const seeded = (): TaskState => completedState({
       oraclePreparation: { identity: "prep-1", sourceHash: "s1", preparedHash: "p1" },
       evaluationIdentityHash: "ei-1",
@@ -202,7 +214,7 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
     });
     await authority.createRun({
       runId: "run-cert",
-      workspaceRoot: ".",
+      workspaceRoot: wsDir,
       policy: basePolicy(),
       policyDecisions: [],
       initialState: seeded(),
@@ -231,13 +243,13 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
     };
     await authority.recordComputedReplay("run-cert", replayRecord);
     await authority.recordComputedReviewPacket("run-cert", {
-      packetHash: "packet-1",
+      packetHash: "packet-1", packetFile: null,
       replayHash: "replay-1",
       candidateHash: "cand-1",
       oraclePreparationIdentity: "prep-1",
       evaluationIdentityHash: "ei-1",
       toolchainId: toolchain.toolchainId,
-      scene: { path: ".mesh2threejs/captures/render-0001/viewer-scene.json", sha256: "e".repeat(64), sceneHash: "scene-1" },
+      scene: { path: "captures/viewer-scene.json", sha256: sha256(sceneBytes), sceneHash: "scene-1" },
       captures: [],
       humanApproval: null,
     });
@@ -267,7 +279,7 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
     await authority.recordComputedCandidate("run-stale", { candidateHash: "cand-1", phaseGeometryHashes: {} });
     await authority.recordComputedReplay("run-stale", replayRecord);
     await authority.recordComputedReviewPacket("run-stale", {
-      packetHash: "packet-1",
+      packetHash: "packet-1", packetFile: null,
       replayHash: "replay-1",
       candidateHash: "cand-1",
       oraclePreparationIdentity: "prep-1",
@@ -300,7 +312,7 @@ describe("run authority policy, mirrors, and certification (§3/§4/§17/§18)",
     await authority.recordExecutionAuthority("run-rehash", { authority: "trusted-host-sandbox", backendId: "host-container", backendIdentityHash: "hc" });
     await authority.recordComputedReplay("run-rehash", { ...replayRecord, replayHash: "replay-A" });
     await authority.recordComputedReviewPacket("run-rehash", {
-      packetHash: "packet-1",
+      packetHash: "packet-1", packetFile: null,
       replayHash: "replay-A",
       candidateHash: "cand-1",
       oraclePreparationIdentity: "prep-1",

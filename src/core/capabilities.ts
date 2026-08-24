@@ -12,6 +12,8 @@ export const BUILDER_OPERATIONS = new Set([
   "begin-run",
   "status",
   "next",
+  "find-runs",
+  "read-run",
   "probe",
   "route",
   "onboard-oracle",
@@ -36,6 +38,7 @@ export const BUILDER_OPERATIONS = new Set([
  */
 export const HUMAN_ADMIN_OPERATIONS = new Set([
   "create-run",
+  "create-workspace-run",
   "approve-policy",
   "migrate-rebase",
   "record-human-approval",

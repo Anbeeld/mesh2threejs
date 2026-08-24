@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import { assertAssemblyCoverage, evaluateAssemblyCoverage } from "../src/core/assembly.js";
 
 /**
- * Source assembly coverage attacks (plan §22 semantic coverage 43–46 and §11.5 multipart
+ * Source assembly coverage attacks (plan Ãƒâ€šÃ‚Â§22 semantic coverage 43ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“46 and Ãƒâ€šÃ‚Â§11.5 multipart
  * fixture requirements).
  */
 
@@ -19,7 +19,7 @@ function bigGeometry(size = 4): THREE.BufferGeometry {
 }
 
 /**
- * §11.5 fixture shape: multipart turret assembly + cupola + gun subtree + tiny detail.
+ * Ãƒâ€šÃ‚Â§11.5 fixture shape: multipart turret assembly + cupola + gun subtree + tiny detail.
  * The turret-pivot carries the phase semantic, so ownership CLOSURE covers every
  * disconnected significant child beneath it.
  */
@@ -55,7 +55,7 @@ function oneChildMappedTank(): THREE.Group {
   return root;
 }
 
-describe("source assembly coverage (§11)", () => {
+describe("source assembly coverage (Ãƒâ€šÃ‚Â§11)", () => {
   test("a fully owned multipart assembly passes coverage (fixture control)", () => {
     const report = evaluateAssemblyCoverage(multipartTank(), "tank");
     expect(report.unresolved).toEqual([]);
@@ -91,5 +91,33 @@ describe("source assembly coverage (§11)", () => {
     expect(report.unresolved.some((entry) => entry.meshName === "bolt")).toBe(false);
     // And a fully-owned bolt-class detail stays owned rather than flagged.
     expect(evaluateAssemblyCoverage(multipartTank(), "tank").passed).toBe(true);
+  });
+
+  test("assembly-relative significance protects small silhouette-defining children (remaining closure Ãƒâ€šÃ‚Â§9)", () => {
+    // Hull mapped; an unmapped-marker assembly carries a large block, a small-but-visible
+    // mantlet (globally insignificant, but >=2% of its assembly), and a tiny bolt.
+    const root = new THREE.Group();
+    root.add(mesh(new THREE.BoxGeometry(10, 10, 10), "shell", "hull"));
+    const assembly = new THREE.Group();
+    assembly.name = "unmapped-block";
+    assembly.userData.semanticId = "unmapped-module";
+    assembly.add(mesh(new THREE.BoxGeometry(4, 4, 4), "block"));
+    const mantlet = mesh(new THREE.BoxGeometry(0.645, 0.645, 0.645), "mantlet");
+    assembly.add(mantlet);
+    assembly.add(mesh(new THREE.BoxGeometry(0.05, 0.05, 0.05), "bolt"));
+    root.add(assembly);
+
+    const report = evaluateAssemblyCoverage(root, "tank");
+    // The mantlet is globally insignificant (<0.5% of total area) but silhouette-significant
+    // within its nearest critical assembly: it must NOT silently disappear.
+    expect(report.unresolved.map((entry) => entry.meshName)).toContain("mantlet");
+    // The tiny bolt remains deterministically excludable.
+    expect(report.entries.find((entry) => entry.meshName === "bolt")!.classification.kind).toBe("insignificant-excluded");
+
+    // Explicit exclusion carries provenance: marking the mantlet insignificant resolves it.
+    mantlet.userData.insignificant = true;
+    const explicit = evaluateAssemblyCoverage(root, "tank");
+    expect(explicit.unresolved.map((entry) => entry.meshName)).not.toContain("mantlet");
+    expect(explicit.entries.find((entry) => entry.meshName === "mantlet")!.classification.kind).toBe("explicitly-excluded");
   });
 });

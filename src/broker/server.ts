@@ -14,6 +14,7 @@ import {
 } from "../core/run-authority.js";
 import { establishToolchain, sanitizeLaunchEnvironment, assertSafeLaunchEnvironment } from "../core/toolchain.js";
 import { assertCapability, classifyOperation, type Capability } from "../core/capabilities.js";
+import { IMPLEMENTED_BUILDER_ROUTES, RECOGNIZED_ADMIN_ROUTES } from "./operations.js";
 import { TrustedPipeline } from "../trusted/pipeline.js";
 import type { TaskState } from "../core/state.js";
 
@@ -63,29 +64,11 @@ interface BrokerRequest {
   payload?: unknown;
 }
 
-/** Builder-safe operations are executed for either capability; admin ops require human-admin. */
-const BUILDER_SAFE_ROUTES = new Set([
-  "begin-run",
-  "status",
-  "next",
-  "find-runs",
-  "read-run",
-  "probe",
-  "onboard-oracle",
-  "repair-oracle",
-  "register",
-  "oracle-sanity",
-  "derive",
-  "gate",
-  "lock",
-  "reopen",
-  "workorders",
-  "render-quick",
-  "review-ready",
-  "viewer-status",
-]);
+/** Builder-safe operations are executed for either capability; admin ops require human-admin.
+ *  Both sets derive from the canonical registry (src/broker/operations.ts). */
+const BUILDER_SAFE_ROUTES = IMPLEMENTED_BUILDER_ROUTES;
 
-const ADMIN_ROUTES = new Set(["approve-review", "approve-viewer-start", "trusted-finalize", "viewer-start", "certify", "record-human-approval"]);
+const ADMIN_ROUTES = RECOGNIZED_ADMIN_ROUTES;
 
 export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHandle> {
   assertSafeLaunchEnvironment();
@@ -150,6 +133,12 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
           respond(res, 200, await pipeline.beginRun({ workspaceRoot: payload.workspace }, capability));
           return;
         }
+        case "create-workspace-run": {
+          const payload = (request.payload ?? {}) as { workspaceRoot?: string; goal?: string; oraclePath?: string; workspaceId?: string };
+          if (!payload.workspaceRoot || !payload.goal || !payload.oraclePath) throw new Error("create-workspace-run requires payload.workspaceRoot, payload.goal and payload.oraclePath");
+          respond(res, 200, await pipeline.createWorkspaceRun({ workspaceRoot: payload.workspaceRoot, goal: payload.goal, oraclePath: payload.oraclePath, ...(payload.workspaceId ? { workspaceId: payload.workspaceId } : {}) }, capability));
+          return;
+        }
         case "status":
           requireRun(runId);
           respond(res, 200, await pipeline.status(runId!));
@@ -190,10 +179,18 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
           requireRun(runId);
           respond(res, 200, await pipeline.reopen(runId!, (request.payload ?? {}) as { phase: string; reason: string }, capability));
           return;
-        case "render-quick": {
+        case "render-quick":
           requireRun(runId);
-          throw new Error("render-quick is served by the CLI diagnostic path; trusted runs report captures through review-ready");
-        }
+          respond(res, 200, await pipeline.renderQuick(runId!));
+          return;
+        case "probe":
+          requireRun(runId);
+          respond(res, 200, await pipeline.probe(runId!));
+          return;
+        case "workorders":
+          requireRun(runId);
+          respond(res, 200, await pipeline.workorders(runId!));
+          return;
         case "review-ready":
           requireRun(runId);
           respond(res, 200, await pipeline.reviewReady(runId!));

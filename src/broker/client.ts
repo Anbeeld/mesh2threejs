@@ -77,7 +77,31 @@ export class BrokerClient {
     return this.call("review-ready", { runId });
   }
 
+  /** Read-only oracle facts for autonomous onboarding (§7.1). */
+  probe(runId: string): Promise<Record<string, unknown>> {
+    return this.call("probe", { runId });
+  }
+
+  /** Current authoritative failing workorders from canonical trusted evidence (§7.2). */
+  workorders(runId: string): Promise<Record<string, unknown>> {
+    return this.call("workorders", { runId });
+  }
+
+  /** Trusted active-phase diagnostic render; never review/certification evidence (§7.3). */
+  renderQuick(runId: string): Promise<Record<string, unknown>> {
+    return this.call("render-quick", { runId });
+  }
+
+  viewerStatus(runId: string): Promise<{ viewerStartApproved: boolean }> {
+    return this.call("viewer-status", { runId });
+  }
+
   // ---- human/admin channel (admin token required; builder tokens are rejected server-side) ----
+
+  /** TRUSTED INTAKE (remaining closure §6.1): host/user pins goal + oracle before builder control. */
+  createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string }): Promise<{ runId: string }> {
+    return this.call("create-workspace-run", { payload: input });
+  }
 
   approveReview(runId: string): Promise<{ status: string; approvedAt?: string }> {
     return this.call("approve-review", { runId, payload: {} });
@@ -87,7 +111,11 @@ export class BrokerClient {
     return this.call("approve-viewer-start", { runId });
   }
 
-  finalize(runId: string): Promise<{ status: string; runId: string }> {
+  trustedFinalize(runId: string): Promise<{ status: string; runId: string }> {
     return this.call("trusted-finalize", { runId });
+  }
+
+  viewerStart(runId: string): Promise<{ status: string; url?: string }> {
+    return this.call("viewer-start", { runId });
   }
 }

@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile, writeFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { SerializedScene } from "./scene-serialization.js";
 import { sanitizeLaunchEnvironment } from "./toolchain.js";
 import { backendIdentity } from "./exec-authority.js";
@@ -112,8 +114,7 @@ interface ChildRequestFile {
  * pipeline-generated (`trusted-derived-generated`) or when a real verified host isolation
  * adapter wraps it (`trusted-host-sandbox`). It is never promoted based on a caller option.
  */
-export function createBoundedChildProcessBackend(options: { runnerModuleUrl: string }): SandboxBackend {
-  return {
+export function createBoundedChildProcessBackend(options: { runnerModuleUrl: string }): SandboxBackend {  return {
     name: "bounded-child-process",
     isolation: "development-untrusted",
     identityHash: backendIdentity({ name: "bounded-child-process", detail: options.runnerModuleUrl }),
@@ -173,4 +174,30 @@ export function createBoundedChildProcessBackend(options: { runnerModuleUrl: str
 export function resolveSandboxBackend(configured?: SandboxBackend): { backend: SandboxBackend | null; reason?: typeof import("./policy.js").TRUSTED_SANDBOX_UNAVAILABLE } {
   if (configured) return { backend: configured };
   return { backend: null, reason: "TRUSTED_CANDIDATE_SANDBOX_UNAVAILABLE" as const };
+}
+
+/**
+ * Locates the shipped sandbox child runner (compiled `sandbox-child.js`). Works both from a
+ * source checkout (falls back to the repository dist output) and inside an installed
+ * package where the compiled module sits beside this file.
+ */
+export function defaultSandboxRunnerUrl(): string {
+  const candidates = [
+    join(import.meta.dirname, "sandbox-child.js"),
+    join(import.meta.dirname, "..", "..", "dist", "core", "sandbox-child.js"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return pathToFileURL(resolve(candidate)).href;
+  }
+  throw new Error("compiled sandbox runner not found; run npm run build before trusted execution");
+}
+
+/**
+ * The trusted derived execution route (remaining closure §2.6): runs the proven
+ * pipeline-owned graph in a bounded child process OUTSIDE the broker process. The backend's
+ * isolation stays honestly `development-untrusted` (resource boundary), while graph purity
+ * (`trusted-derived-generated`) is what permits certification.
+ */
+export function trustedDerivedBackend(): SandboxBackend {
+  return createBoundedChildProcessBackend({ runnerModuleUrl: defaultSandboxRunnerUrl() });
 }

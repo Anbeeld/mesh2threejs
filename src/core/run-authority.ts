@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { AuthorshipMode, CertificationLevel, ProfileId } from "../types.js";
 import {
   acceptPhase,
@@ -74,6 +74,8 @@ export interface RunAuthorityRecord {
   } | null;
   /** Full authority-owned review binding (closure plan §9.F2); hashes are authority, paths are provenance. */
   review: ReviewBinding;
+  /** Run intake provenance (remaining closure §6.3): "trusted" pins goal+oracle under host authority before builder control. */
+  intake: "trusted" | "builder-prepared";
   finalReplay: TrustedReplayRecord | null;
   viewerStartApproved: boolean;
   status: "active" | "awaiting-human-review" | "certified";
@@ -96,6 +98,11 @@ export interface ReviewSceneBinding {
 /** One authority-owned review artifact set: capture, scene, replay, candidate, policy, toolchain. */
 export interface ReviewBinding {
   packetHash: string | null;
+  /**
+   * Exact-bytes binding of the packet FILE itself (remaining closure §5.1): packetHash is
+   * the semantic packet identity, this sha256 is the exact bytes the human was shown.
+   */
+  packetFile: { path: string; sha256: string } | null;
   replayHash: string | null;
   candidateHash: string | null;
   oraclePreparationIdentity: string | null;
@@ -104,6 +111,63 @@ export interface ReviewBinding {
   scene: ReviewSceneBinding | null;
   captures: ReviewCaptureReference[];
   humanApproval: HumanApproval | null;
+}
+
+/**
+ * Re-verifies EVERY artifact bound by the current review binding against its recorded hash
+ * (remaining closure §5): packet file, viewer scene, captures, boards, turntable frames,
+ * region diagnostics, deterministic index, style/articulation artifacts (the latter join
+ * through their evidence records' bound paths in canonical state). Throws
+ * REVIEW_ARTIFACT_DRIFT when any path is missing, modified, malformed, or outside the
+ * workspace root. The human approval must mean "these exact bytes exist right now".
+ */
+export async function verifyBoundReviewArtifacts(
+  record: RunAuthorityRecord,
+  readBytes?: (workspaceRelativePath: string) => Promise<Buffer>,
+): Promise<void> {
+  const reader = readBytes ?? ((path: string) => readFile(resolve(record.workspaceRoot, path)));
+  const root = resolve(record.workspaceRoot);
+  const problems: string[] = [];
+  const check = async (label: string, ref: { path: string; sha256: string } | null | undefined): Promise<void> => {
+    if (!ref?.path || !ref.sha256) return;
+    if (!/^[a-f0-9]{64}$/iu.test(ref.sha256)) {
+      problems.push(`${label} has a malformed hash binding: ${ref.path}`);
+      return;
+    }
+    const absolute = resolve(root, ref.path);
+    const relation = relative(root, absolute);
+    if (!relation || relation === ".." || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(relation)) {
+      problems.push(`${label} escapes the workspace capture root: ${ref.path}`);
+      return;
+    }
+    try {
+      const bytes = await reader(ref.path);
+      if (sha256(bytes) !== ref.sha256) problems.push(`${label} bytes changed since review-ready: ${ref.path}`);
+    } catch {
+      problems.push(`${label} is missing or unreadable: ${ref.path}`);
+    }
+  };
+  await check("review packet", record.review.packetFile);
+  await check("review scene", record.review.scene);
+  for (const capture of record.review.captures) await check(`review ${capture.role}`, capture);
+  // Deterministic/style/articulation/turntable artifacts bound to the reviewed packet hash
+  // are part of what the human approved. Their recorded artifactHash is a canonical-content
+  // hash rather than a raw byte hash, so they are verified by re-deriving that hash from
+  // the parsed file.
+  const { canonicalJson } = await import("./hashing.js");
+  for (const item of Object.values(record.embedded.state.evidence)) {
+    if (!item.valid || !item.verified || !item.artifact) continue;
+    if (!(item.configHash && item.configHash === record.review.packetHash && item.artifactHash)) continue;
+    try {
+      const parsed = JSON.parse((await reader(item.artifact)).toString("utf8")) as Record<string, unknown>;
+      const { artifactHash: _declared, ...payload } = parsed;
+      void _declared;
+      if (sha256(canonicalJson(payload)) !== item.artifactHash) problems.push(`${item.kind} evidence content changed since recording: ${item.artifact}`);
+    } catch {
+      problems.push(`${item.kind} evidence is missing or unreadable: ${item.artifact}`);
+    }
+  }
+  if (problems.length) throw new Error(`REVIEW_ARTIFACT_DRIFT:\n - ${problems.join("\n - ")}`);
 }
 
 /**
@@ -187,6 +251,8 @@ export interface TrustedRunCreation {
   initialState: TaskState;
   toolchain: RunAuthorityRecord["toolchain"];
   harnessIdentity?: string | null;
+  /** How the run's original intent entered (remaining closure §6): trusted intake pins goal+oracle under host authority; builder-prepared workspaces are a weaker path. */
+  intake?: "trusted" | "builder-prepared";
   defaults: { hasOracle: boolean; routedProfile: ProfileId };
   requestedBy: Capability;
 }
@@ -217,6 +283,7 @@ export class TrustedRunAuthority {
     }
     const emptyReview: ReviewBinding = {
       packetHash: null,
+      packetFile: null,
       replayHash: null,
       candidateHash: null,
       oraclePreparationIdentity: null,
@@ -240,6 +307,7 @@ export class TrustedRunAuthority {
       candidateHash: input.initialState.candidateHash ?? null,
       candidateExecution: null,
       review: emptyReview,
+      intake: input.intake ?? "builder-prepared",
       finalReplay: null,
       viewerStartApproved: false,
       status: "active",
@@ -481,6 +549,24 @@ export class TrustedRunAuthority {
     const replay = next.finalReplay;
     if (!replay || !replay.passed) throw new Error("human approval requires a passing trusted global replay recorded first");
     if (!next.review.packetHash) throw new Error("human approval requires a prepared review packet");
+    // Approval precondition (remaining closure §5.2): the exact bytes the human reviewed
+    // must still exist. Any drift invalidates the review packet; review-ready must run
+    // again. Nothing is silently regenerated here.
+    try {
+      await verifyBoundReviewArtifacts(next);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      next.review.packetHash = null;
+      next.review.packetFile = null;
+      next.review.scene = null;
+      next.review.captures = [];
+      next.review.humanApproval = null;
+      next.finalReplay = null;
+      if (next.status === "awaiting-human-review") next.status = "active";
+      next.mirrorSequence += 1;
+      await this.store.save(next);
+      throw new Error(`${detail}\nthe review binding is invalidated; run review-ready again for a new capture set`);
+    }
     const approval: HumanApproval = {
       packetHash: next.review.packetHash,
       candidateHash: next.candidateHash ?? "",

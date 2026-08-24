@@ -45,6 +45,12 @@ export interface DeriveOptions {
    * loaded workspace state and returns the next durable state.
    */
   persistState?: (state: TaskState) => Promise<TaskState>;
+  /**
+   * Explicit sandbox backend for trial composition evaluation. Development callers pass the
+   * in-process backend; trusted callers MUST pass a bounded child backend (remaining
+   * closure §2.7) so tier trials never execute inside the broker process.
+   */
+  backend?: import("./candidate-sandbox.js").SandboxBackend;
 }
 
 export interface DeriveTierResult {
@@ -1095,7 +1101,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     await wireGeneratedComposition(workspace, orderedDerivedPhases(workspace.project.profile, [trialManifestSeed, ...(await readAllManifests(workspace)).filter((manifest) => manifest.phase !== phase)]));
     let verdict: Awaited<ReturnType<typeof evaluateTrialComposition>>;
     try {
-      verdict = await evaluateTrialComposition(workspace, phase, oracle, authoritativeDimensions, await trialAuditOptions());
+      verdict = await evaluateTrialComposition(workspace, phase, oracle, authoritativeDimensions, await trialAuditOptions(), options.backend);
     } catch (error) {
       // A trial that cannot even execute (e.g. audit failure) is a failing tier, not a crash:
       // the derive ladder must remain bounded and informative.

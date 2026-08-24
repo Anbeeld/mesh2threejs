@@ -1,4 +1,4 @@
-﻿import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, afterAll } from "vitest";
@@ -28,7 +28,7 @@ const io = () => {
 /** Verified toolchain fixture standing in for a shipped-manifest installation (§10.G2). */
 const toolchainOverride = {
   manifest: {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const, dependencies: [] as never,
     packageName: "mesh2threejs",
     packageVersion: "1.0.0",
     runtimeHash: "test-runtime-hash",
@@ -118,7 +118,7 @@ describe("trusted broker reconstruction lifecycle (I1)", () => {
 
       // ---- Human approval sealed from canonical values; finalize runs a FRESH replay ---
       await admin.approveReview(runId);
-      const finalized = await admin.finalize(runId);
+      const finalized = await admin.trustedFinalize(runId);
       expect(finalized.status).toBe("certified");
 
       // Certified runs are immutable and the workspace mirror reflects certification.

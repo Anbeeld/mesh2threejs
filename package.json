@@ -48,9 +48,10 @@
     "benchmark:heavy": "node benchmarks/run-rss.mjs",
     "validate": "npm run validate:development",
     "validate:development": "npm run check && npm run test:coverage && npm run build && npm run validate:artifacts",
-    "ci": "npm run validate:development && npm run test:e2e && npm pack --dry-run",
+    "ci": "npm run validate:development && npm run test:e2e && npm run test:installed-package && npm pack --dry-run",
     "validate:artifacts": "node dist/validation/artifacts.js",
     "test:e2e": "node dist/validation/e2e.js",
+    "test:installed-package": "npm run build && node dist/validation/installed-package.js",
     "validate:release": "npm run ci && npm run benchmark:derive && npm run benchmark:heavy",
     "prepack": "npm run validate:development && npm run generate:toolchain-manifest"
   },
