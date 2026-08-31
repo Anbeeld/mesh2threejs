@@ -4,6 +4,8 @@ coverage/
 *.tgz
 .mesh2threejs/
 /workspaces/
+/mesh2threejs-store-*/
+
 
 toolchain/manifest.v2.json
 
