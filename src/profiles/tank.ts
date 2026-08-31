@@ -741,9 +741,16 @@ function scoresEmpty(scores: Map<string, unknown>): boolean {
 }
 
 function fabricationRow(candidate: SceneSnapshot): GateRow {
-  const structural = Object.values(candidate.components)
-    .filter((component) => isHullId(component.id) || ["turret"].includes(component.id))
-    .map((component) => component.id);
+  // Fabrication-critical MAJOR MASSES are explicit profile policy (pipeline remediation plan
+  // D6): the canonical `hull` and `turret` masses. Auxiliary `hull-*` semantics (fenders,
+  // sponsons, skirts) are legitimate as multiple source-faithful pieces — hull.contiguity is
+  // the oracle-relative authority for their structure — so they are NOT forced into
+  // artificial single-island stitches merely because their ids start with "hull". A future
+  // profile adds fabrication-critical masses here explicitly, never via a name prefix.
+  const structural = ["hull", "turret"].filter((id) => {
+    const component = candidate.components[id];
+    return Boolean(component && component.triangleIndices.length > 0);
+  });
   const checks = checkWatertightness(candidate, structural);
   const boundaryEdges = checks.reduce((sum, check) => sum + check.boundaryEdges, 0);
   const disconnected = structural.filter((id) => countConnectedIslands(candidate, id) > 1);
@@ -754,7 +761,7 @@ function fabricationRow(candidate: SceneSnapshot): GateRow {
     passed: checks.length === structural.length && boundaryEdges === 0 && disconnected.length === 0,
     score: checks.length === structural.length && boundaryEdges === 0 && disconnected.length === 0 ? 100 : 0,
     severity: "critical",
-    message: `major-mass open boundary edges: ${boundaryEdges}; disconnected major masses: ${disconnected.join(", ") || "none"}`,
+    message: `major-mass (hull, turret) open boundary edges: ${boundaryEdges}; disconnected major masses: ${disconnected.join(", ") || "none"}`,
     oracleValue: 0,
     candidateValue: boundaryEdges,
     deviation: boundaryEdges,

@@ -386,14 +386,38 @@ describe("pre-execution graph authority (remaining closure §12.1)", () => {
     }
   }, 180_000);
 
-  test("attack B: tampered generated registry refuses with DERIVED_REGISTRY_DRIFT before execution", async () => {
+  test("attack B: tampered generated registry cannot inject composition (reconciled from canonical bindings)", async () => {
     const { broker, builder, runId, root } = await beginRunToDerivedHull();
     try {
       const registryPath = join(root, "model", ".generated", "registry.mjs");
       const legitimate = await readFile(registryPath, "utf8");
       await writeFile(registryPath, `${legitimate}\n// arbitrary injected code\nexport const stolen = 1;\n`);
       await writeFile(join(root, "model", "model.mjs"), MODEL_DERIVED_SCAFFOLD);
-      await expect(builder.gate(runId)).rejects.toThrow(/DERIVED_REGISTRY_DRIFT/);
+      // The registry is pipeline-OWNED composition, not builder-authored code (remediation
+      // plan C4/D4): the injected bytes never execute. The trusted pipeline reconciles the
+      // registry from CANONICAL derived bindings before execution, so the attack is
+      // neutralized by regeneration rather than by executing tampered bytes — and the
+      // pre-execution graph authority (DERIVED_REGISTRY_DRIFT in exec-authority) still
+      // verifies the executed registry against expected derive state as defense in depth.
+      const gated = await builder.gate(runId) as { passed: boolean };
+      expect(gated.passed).toBe(true);
+      const { generateRegistrySource, orderedDerivedPhasesFromBindings } = await import("../src/core/derivation.js");
+      const state = JSON.parse(await readFile(join(root, ".mesh2threejs", "state.json"), "utf8")) as { derivedBindings: Record<string, unknown> };
+      expect(await readFile(registryPath, "utf8")).toBe(generateRegistrySource("tank", orderedDerivedPhasesFromBindings("tank", state.derivedBindings as never)));
+      expect(await readFile(registryPath, "utf8")).not.toContain("stolen");
+    } finally {
+      await broker.close();
+    }
+  }, 180_000);
+
+  test("attack B2: tampered generated module bytes still fail closed before execution", async () => {
+    const { broker, builder, runId, root } = await beginRunToDerivedHull();
+    try {
+      // Unlike the registry (regenerated from canonical bindings), generated module BYTES
+      // are five-way-hash-bound: tampering them breaks authority and must refuse.
+      const modulePath = join(root, "model", ".generated", "hull.mjs");
+      await writeFile(modulePath, `${await readFile(modulePath, "utf8")}\n// tampered\n`);
+      await expect(builder.gate(runId)).rejects.toThrow(/derived lineage violation|five-way|DERIVED_/iu);
     } finally {
       await broker.close();
     }

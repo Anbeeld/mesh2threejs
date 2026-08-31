@@ -251,7 +251,14 @@ export function applyRepairSpec(nodes: SeedNode[], spec: DerivedRepairSpec): See
     switch (operation.op) {
       case "simplify-override":
       case "component-keep":
-        break; // consumed elsewhere (simplification budget) / explicit inclusion marker
+        // Consumed BEFORE seed construction by trusted derive (see derivePhaseSeed):
+        // - simplify-override adjusts the simplification budget of the targeted semantic;
+        // - component-keep prevents insignificant-island pruning of the targeted semantic on
+        //   mesh-simplify phases, or preserves pivot-owned source geometry on the axis-fit
+        //   gun phase (emitted as a child mesh attributed to the pivot semantic). Applicability
+        //   is validated against the live seed route there; an inapplicable marker fails
+        //   derive clearly instead of silently succeeding.
+        break;
       case "component-transform": {
         const node = working.find((entry) => entry.semanticId === operation.target);
         if (!node) throw new Error(`repair target does not exist in phase ${spec.phase}: ${operation.target}`);

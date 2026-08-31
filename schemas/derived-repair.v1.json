@@ -5,9 +5,15 @@
   "description": "Agent-owned geometry repairs are DATA, never executable code. Trusted derive validates this structure mechanically and compiles it into pipeline-generated phase modules. JavaScript expressions, imports, callbacks, file paths, URLs, shell commands, code strings, and runtime state reads are structurally impossible in this schema.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "phase", "operations"],
+  "required": [
+    "schemaVersion",
+    "phase",
+    "operations"
+  ],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": {
+      "const": 1
+    },
     "phase": {
       "type": "string",
       "description": "The builder phase this repair belongs to. Must equal the active repair owner; phase escape is refused at compile time."
@@ -15,19 +21,26 @@
     "operations": {
       "type": "array",
       "maxItems": 256,
-      "items": { "$ref": "#/definitions/operation" }
+      "items": {
+        "$ref": "#/definitions/operation"
+      }
     }
   },
   "definitions": {
     "vec3": {
       "type": "array",
-      "items": { "type": "number" },
+      "items": {
+        "type": "number"
+      },
       "minItems": 3,
       "maxItems": 3
     },
     "operation": {
       "type": "object",
-      "required": ["op", "target"],
+      "required": [
+        "op",
+        "target"
+      ],
       "properties": {
         "op": {
           "enum": [
@@ -41,127 +54,240 @@
             "material"
           ]
         },
-        "target": { "type": "string", "minLength": 1, "maxLength": 128 }
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
       },
       "oneOf": [
         {
           "additionalProperties": false,
           "properties": {
-            "op": { "const": "component-transform" },
+            "op": {
+              "const": "component-transform"
+            },
             "target": {},
-            "translate": { "$ref": "#/definitions/vec3" },
-            "rotateDegrees": { "$ref": "#/definitions/vec3" },
-            "scale": { "$ref": "#/definitions/vec3" }
+            "translate": {
+              "$ref": "#/definitions/vec3"
+            },
+            "rotateDegrees": {
+              "$ref": "#/definitions/vec3"
+            },
+            "scale": {
+              "$ref": "#/definitions/vec3"
+            }
           }
         },
         {
           "additionalProperties": false,
           "properties": {
-            "op": { "const": "simplify-override" },
+            "op": {
+              "const": "simplify-override"
+            },
             "target": {},
-            "ratio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
-            "error": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 }
+            "ratio": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1
+            },
+            "error": {
+              "type": "number",
+              "minimum": 0,
+              "exclusiveMaximum": 1
+            }
           }
         },
         {
           "additionalProperties": false,
           "properties": {
-            "op": { "const": "component-keep" },
+            "op": {
+              "const": "component-keep"
+            },
             "target": {}
-          }
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "op": { "const": "component-drop" },
-            "target": {}
-          }
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "op": { "const": "hierarchy-parent" },
-            "target": {},
-            "parent": { "type": ["string", "null"] }
           },
-          "required": ["parent"]
+          "description": "Prevents insignificant-island pruning of the targeted semantic before simplification on mesh-simplify phases (hull, turret), or preserves source geometry intrinsically owned by the gun-pivot semantic on the axis-fit gun phase (emitted as a child mesh of the pivot group without a duplicate semanticId, attributed at runtime to the pivot semantic). The target must be an oracle semantic owned by the phase with intrinsic geometry; an inapplicable or unknown target fails derive clearly. keep never bypasses complexity ceilings, style gates, ownership rules, or repair ceilings."
         },
         {
           "additionalProperties": false,
           "properties": {
-            "op": { "const": "primitive-replace" },
+            "op": {
+              "const": "component-drop"
+            },
+            "target": {}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "hierarchy-parent"
+            },
+            "target": {},
+            "parent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "parent"
+          ]
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "primitive-replace"
+            },
             "target": {},
             "primitive": {
               "oneOf": [
                 {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["kind", "size"],
+                  "required": [
+                    "kind",
+                    "size"
+                  ],
                   "properties": {
-                    "kind": { "const": "box" },
-                    "size": { "$ref": "#/definitions/vec3" }
+                    "kind": {
+                      "const": "box"
+                    },
+                    "size": {
+                      "$ref": "#/definitions/vec3"
+                    }
                   }
                 },
                 {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["kind", "radius", "height", "segments"],
+                  "required": [
+                    "kind",
+                    "radius",
+                    "height",
+                    "segments"
+                  ],
                   "properties": {
-                    "kind": { "const": "cylinder" },
-                    "radius": { "type": "number", "exclusiveMinimum": 0 },
-                    "height": { "type": "number", "exclusiveMinimum": 0 },
-                    "segments": { "type": "integer", "minimum": 3, "maximum": 64 },
-                    "axis": { "enum": ["x", "y", "z"] }
+                    "kind": {
+                      "const": "cylinder"
+                    },
+                    "radius": {
+                      "type": "number",
+                      "exclusiveMinimum": 0
+                    },
+                    "height": {
+                      "type": "number",
+                      "exclusiveMinimum": 0
+                    },
+                    "segments": {
+                      "type": "integer",
+                      "minimum": 3,
+                      "maximum": 64
+                    },
+                    "axis": {
+                      "enum": [
+                        "x",
+                        "y",
+                        "z"
+                      ]
+                    }
                   }
                 },
                 {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["kind", "from", "to", "radius", "segments"],
+                  "required": [
+                    "kind",
+                    "from",
+                    "to",
+                    "radius",
+                    "segments"
+                  ],
                   "properties": {
-                    "kind": { "const": "tube" },
-                    "from": { "$ref": "#/definitions/vec3" },
-                    "to": { "$ref": "#/definitions/vec3" },
-                    "radius": { "type": "number", "exclusiveMinimum": 0 },
-                    "segments": { "type": "integer", "minimum": 3, "maximum": 64 }
+                    "kind": {
+                      "const": "tube"
+                    },
+                    "from": {
+                      "$ref": "#/definitions/vec3"
+                    },
+                    "to": {
+                      "$ref": "#/definitions/vec3"
+                    },
+                    "radius": {
+                      "type": "number",
+                      "exclusiveMinimum": 0
+                    },
+                    "segments": {
+                      "type": "integer",
+                      "minimum": 3,
+                      "maximum": 64
+                    }
                   }
                 }
               ]
             }
           },
-          "required": ["primitive"]
+          "required": [
+            "primitive"
+          ]
         },
         {
           "additionalProperties": false,
           "properties": {
-            "op": { "const": "mesh-replace" },
+            "op": {
+              "const": "mesh-replace"
+            },
             "target": {},
             "positions": {
               "type": "array",
-              "items": { "type": "number" },
+              "items": {
+                "type": "number"
+              },
               "minItems": 3,
               "maxItems": 15000,
               "description": "Finite xyz triples; length must be a multiple of 3 and within the 5000-vertex ceiling."
             },
             "indices": {
               "type": "array",
-              "items": { "type": "integer", "minimum": 0 },
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
               "minItems": 3,
               "maxItems": 30000,
               "description": "Triangle indices; length must be a multiple of 3, in vertex range, and within the 10000-triangle ceiling."
             }
           },
-          "required": ["positions", "indices"]
+          "required": [
+            "positions",
+            "indices"
+          ]
         },
         {
           "additionalProperties": false,
           "properties": {
-            "op": { "const": "material" },
+            "op": {
+              "const": "material"
+            },
             "target": {},
-            "color": { "$ref": "#/definitions/vec3" },
-            "roughness": { "type": "number", "minimum": 0, "maximum": 1 },
-            "metalness": { "type": "number", "minimum": 0, "maximum": 1 },
-            "flatShading": { "type": "boolean" }
+            "color": {
+              "$ref": "#/definitions/vec3"
+            },
+            "roughness": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "metalness": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "flatShading": {
+              "type": "boolean"
+            }
           }
         }
       ]

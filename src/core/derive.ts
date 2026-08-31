@@ -1,4 +1,4 @@
-﻿import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+﻿import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import { join } from "node:path";
@@ -23,6 +23,7 @@ import {
   discoverRepairs,
   generateRegistrySource,
   loadTrustedGeneratedModules,
+  orderedDerivedPhasesFromBindings,
   repairBinding,
   verifyDerivedLineage,
   type DerivationManifest,
@@ -346,6 +347,15 @@ export interface SeedNode {
   role?: string;
   /** Style-compatible material parameters (declarative repairs only). */
   material?: { color?: readonly [number, number, number]; roughness?: number; metalness?: number; flatShading?: boolean };
+  /**
+   * Emit this mesh WITHOUT its own userData.semanticId (pipeline remediation plan E2):
+   * runtime snapshot attribution walks to the owning ancestor semantic group, so the
+   * geometry becomes INTRINSIC geometry of that pivot semantic. Used by component-keep to
+   * preserve source geometry owned by an articulation pivot while the pivot remains a
+   * transform group. The node keeps an internal object name for attachment only; it must
+   * never declare a duplicate semantic ID.
+   */
+  attributeToParent?: boolean;
 }
 
 /** Builds the in-memory evaluation graph for one seed tier. */
@@ -379,8 +389,10 @@ export function buildSeedGroup(name: string, nodes: SeedNode[]): THREE.Group {
     material.flatShading = node.material?.flatShading ?? true;
     const object = new THREE.Mesh(geometry, material);
     object.name = node.semanticId;
-    object.userData.semanticId = node.semanticId;
-    if (node.role) object.userData.semanticRole = node.role;
+    if (!node.attributeToParent) {
+      object.userData.semanticId = node.semanticId;
+      if (node.role) object.userData.semanticRole = node.role;
+    }
     attach(object, node.parentSemanticId);
   }
   return group;
@@ -435,8 +447,13 @@ function emitGeneratedModule(name: string, nodes: SeedNode[]): string {
     lines.push(`    material.flatShading = ${node.material?.flatShading ?? true};`);
     lines.push(`    const mesh = new THREE.Mesh(geometry, material);`);
     lines.push(`    mesh.name = ${JSON.stringify(node.semanticId)};`);
-    lines.push(`    mesh.userData.semanticId = ${JSON.stringify(node.semanticId)};`);
-    if (node.role) lines.push(`    mesh.userData.semanticRole = ${JSON.stringify(node.role)};`);
+    if (node.attributeToParent) {
+      // Pivot-owned kept geometry: NO duplicate userData.semanticId; the ancestor pivot
+      // semantic owns these triangles at runtime snapshot attribution.
+    } else {
+      lines.push(`    mesh.userData.semanticId = ${JSON.stringify(node.semanticId)};`);
+      if (node.role) lines.push(`    mesh.userData.semanticRole = ${JSON.stringify(node.role)};`);
+    }
     if (node.parentSemanticId) {
       lines.push(`    (group.getObjectByName(${JSON.stringify(node.parentSemanticId)}) ?? group).add(mesh);`);
     } else {
@@ -599,10 +616,25 @@ function buildTrackSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTria
  * measured pivot anchor, gun mesh child in PIVOT-LOCAL coordinates, so gun.parent resolves
  * to gun-pivot and pose/articulation gates are structurally satisfiable.
  */
-function buildGunSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTriangles: number } {
+function buildGunSeed(snapshot: SceneSnapshot, keepTargets: ReadonlySet<string> = new Set()): { nodes: SeedNode[]; inputTriangles: number } {
   const pivotComponent = snapshot.components["gun-pivot"];
   const gun = snapshot.components.gun;
   if (!gun || !gun.triangleIndices.length) throw new Error("prepared oracle carries no gun geometry to fit");
+  // component-keep applicability for the axis-fit route (pipeline remediation plan E2):
+  // the ONLY droppable geometry on this route is source geometry intrinsically owned by the
+  // gun-pivot semantic. Anything else can never affect the seed and must fail clearly.
+  for (const target of keepTargets) {
+    if (target === "gun") {
+      throw new Error(`component-keep target "gun" cannot affect the axis-fit gun seed: the barrel is fitted unconditionally from the gun semantics`);
+    }
+    if (target !== "gun-pivot" || !pivotComponent) {
+      throw new Error(`component-keep target "${target}" is not a semantic owned by phase gun that the axis-fit seed can keep (only "gun-pivot" owns droppable geometry)`);
+    }
+    if (!pivotComponent.triangleIndices.length) {
+      throw new Error(`component-keep target "gun-pivot" owns no intrinsic oracle geometry to preserve; the keep marker would be inert`);
+    }
+  }
+  const keepPivotGeometry = keepTargets.has("gun-pivot") && Boolean(pivotComponent?.triangleIndices.length);
   const pivotOrigin: Point3 = pivotComponent?.origin ?? gun.bounds.center;
   const points: Point3[] = [];
   for (const localIndex of gun.triangleIndices) {
@@ -669,13 +701,39 @@ function buildGunSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTriang
   for (let segment = 1; segment < segments - 1; segment += 1) indices.push(0, segment, segment + 1);
   const capBase = segments;
   for (let segment = 1; segment < segments - 1; segment += 1) indices.push(capBase, capBase + segment + 1, capBase + segment);
-  return {
-    nodes: [
-      { semanticId: "gun-pivot", kind: "group", position: pivotOrigin },
-      { semanticId: "gun", kind: "mesh", parentSemanticId: "gun-pivot", positions: localPositions(Float32Array.from(world), pivotOrigin), indices: Uint32Array.from(indices) },
-    ],
-    inputTriangles: gun.triangleIndices.length,
-  };
+  const nodes: SeedNode[] = [
+    { semanticId: "gun-pivot", kind: "group", position: pivotOrigin },
+    { semanticId: "gun", kind: "mesh", parentSemanticId: "gun-pivot", positions: localPositions(Float32Array.from(world), pivotOrigin), indices: Uint32Array.from(indices) },
+  ];
+  if (keepPivotGeometry) {
+    // component-keep(gun-pivot): emit the pivot's INTRINSIC source geometry as a child mesh
+    // of the pivot group WITHOUT a duplicate semanticId (plan E2). Runtime snapshot
+    // attribution walks to the pivot semantic, so the geometry measures as pivot-intrinsic
+    // while the pivot remains a transform anchor group.
+    const worldPivotPoints: number[] = [];
+    const collarIndices: number[] = [];
+    for (const localIndex of pivotComponent!.triangleIndices) {
+      const offset = localIndex * 9;
+      const base = worldPivotPoints.length / 3;
+      for (let vertex = 0; vertex < 3; vertex += 1) {
+        worldPivotPoints.push(
+          snapshot.triangleData.positions[offset + vertex * 3]!,
+          snapshot.triangleData.positions[offset + vertex * 3 + 1]!,
+          snapshot.triangleData.positions[offset + vertex * 3 + 2]!,
+        );
+        collarIndices.push(base + vertex);
+      }
+    }
+    nodes.push({
+      semanticId: "gun-pivot-intrinsic",
+      kind: "mesh",
+      parentSemanticId: "gun-pivot",
+      attributeToParent: true,
+      positions: localPositions(Float32Array.from(worldPivotPoints), pivotOrigin),
+      indices: Uint32Array.from(collarIndices),
+    });
+  }
+  return { nodes, inputTriangles: gun.triangleIndices.length };
 }
 
 interface PhaseSeed {
@@ -716,16 +774,20 @@ const MIN_ISLAND_TRIANGLES = 24;
  * can never erase smaller silhouette-defining islands. Borders stay locked; the source
  * tier keeps everything untouched.
  */
-async function simplifyComponentwise(mesh: CleanedMesh, ratio: number | undefined, error: number | undefined): Promise<{ positions: Float32Array; indices: Uint32Array; error?: number }> {
+async function simplifyComponentwise(mesh: CleanedMesh, ratio: number | undefined, error: number | undefined, keepAllIslands = false): Promise<{ positions: Float32Array; indices: Uint32Array; error?: number }> {
   if (ratio === undefined || mesh.components.length <= 1) return simplifyMesh(mesh.positions, mesh.indices, ratio, error);
   const totalArea = mesh.components.reduce((sum, component) => sum + component.area, 0) || 1e-9;
   const maxDiagonal = Math.max(...mesh.components.map((component) => Math.hypot(component.bounds.size[0], component.bounds.size[1], component.bounds.size[2])), 1e-9);
   // Significance mirrors the seed-pruning thresholds; insignificant islands were already
-  // pruned before this point for the seed route.
-  const significant = mesh.components.filter((component) => {
-    const diagonal = Math.hypot(component.bounds.size[0], component.bounds.size[1], component.bounds.size[2]);
-    return component.area >= totalArea * 0.005 || diagonal >= maxDiagonal * 0.05;
-  });
+  // pruned before this point for the seed route. A component-keep semantic keeps ALL of its
+  // islands in the simplification input (plan E1: keep means "do not prune", for
+  // significant AND insignificant islands alike).
+  const significant = keepAllIslands
+    ? mesh.components
+    : mesh.components.filter((component) => {
+      const diagonal = Math.hypot(component.bounds.size[0], component.bounds.size[1], component.bounds.size[2]);
+      return component.area >= totalArea * 0.005 || diagonal >= maxDiagonal * 0.05;
+    });
   const weights = significant.map((component) => Math.sqrt(Math.max(component.area, 1e-9)));
   const weightSum = weights.reduce((sum, weight) => sum + weight, 0) || 1e-9;
   const totalTargetIndices = mesh.indices.length * ratio;
@@ -748,15 +810,27 @@ async function simplifyComponentwise(mesh: CleanedMesh, ratio: number | undefine
   return { positions: Float32Array.from(outPositions), indices: Uint32Array.from(outIndices), ...(simplifierError !== undefined ? { error: simplifierError } : {}) };
 }
 
-async function buildMeshSimplifySeed(snapshot: SceneSnapshot, profile: ProfileId, phase: string, simplifyOverrides: ReadonlyMap<string, { ratio?: number; error?: number }> = new Map()): Promise<PhaseSeed> {
+async function buildMeshSimplifySeed(snapshot: SceneSnapshot, profile: ProfileId, phase: string, simplifyOverrides: ReadonlyMap<string, { ratio?: number; error?: number }> = new Map(), keepTargets: ReadonlySet<string> = new Set()): Promise<PhaseSeed> {
   const route = phaseOperator(profile, phase)!;
   const soups = collectSemantics(snapshot, route.semantics);
   if (!soups.size) throw new Error(`prepared oracle carries no ${route.label} geometry to derive from`);
+  // component-keep applicability (pipeline remediation plan E1): a marker that can never
+  // affect the selected seed fails clearly instead of silently succeeding. The target must
+  // be a semantic owned by this phase's route that intrinsically owns oracle geometry.
+  for (const target of keepTargets) {
+    const component = snapshot.components[target];
+    if (!component || !component.triangleIndices.length || !route.semantics(target, component.role) || !soups.has(target)) {
+      throw new Error(`component-keep target "${target}" is not a semantic owned by phase ${phase} with intrinsic oracle geometry; nothing to keep`);
+    }
+  }
   const inputTriangles = [...soups.values()].reduce((sum, soup) => sum + soup.triangleCount, 0);
   const overallSize = measureBounds(snapshot).size.filter((value) => value > 0);
   const epsilon = Math.max(Math.max(...overallSize, 1e-9) * 2e-5, 1e-6);
   const cleanedPerSemantic = new Map<string, CleanedMesh>();
-  for (const [id, soup] of soups) cleanedPerSemantic.set(id, pruneInsignificant(cleanAndSplit(soup, epsilon)));
+  for (const [id, soup] of soups) {
+    // Keep means "do not prune": kept semantics skip insignificant-island pruning entirely.
+    cleanedPerSemantic.set(id, keepTargets.has(id) ? cleanAndSplit(soup, epsilon) : pruneInsignificant(cleanAndSplit(soup, epsilon)));
+  }
   const inputGeometryHash = sha256(canonicalJson([...soups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([id, soup]) => ({
     id,
     triangles: soup.triangleCount,
@@ -782,7 +856,7 @@ async function buildMeshSimplifySeed(snapshot: SceneSnapshot, profile: ProfileId
       for (const id of orderedIds) {
         const cleaned = cleanedPerSemantic.get(id)!;
         const override = simplifyOverrides.get(id);
-        const result = await simplifyComponentwise(cleaned, override?.ratio ?? ratio, override?.error ?? error);
+        const result = await simplifyComponentwise(cleaned, override?.ratio ?? ratio, override?.error ?? error, keepTargets.has(id));
         if (result.error !== undefined) simplifierError = Math.max(simplifierError ?? 0, result.error);
         const parentSemanticId = pivotOrigin && id !== "turret-pivot" ? "turret-pivot" : undefined;
         const positions = parentSemanticId ? localPositions(result.positions, pivotOrigin!) : result.positions;
@@ -908,20 +982,60 @@ async function wireGeneratedComposition(workspace: ResumedWorkspace, orderedPhas
   return "updated-registry";
 }
 
-async function readAllManifests(workspace: ResumedWorkspace): Promise<DerivationManifest[]> {
-  let names: string[];
+/**
+ * Reconciles pipeline-owned derived workspace artifacts from CANONICAL state bindings
+ * (pipeline remediation plan C4/D4). Responsibilities:
+ * - regenerate `model/.generated/registry.mjs` from canonical generated bindings;
+ * - remove generated modules and derivation manifests for phases no longer bound;
+ * - never modify `model/repairs/*.json` (user-authored repair input survives, D5);
+ * - be safe to run repeatedly: bytes are written only when they actually differ.
+ *
+ * Canonical run authority stays the single source of truth: this helper never invents phase
+ * presence from manifest sidecars, and a reconciliation failure surfaces a specific error
+ * while the next trusted operation can simply rerun it from canonical state.
+ */
+export async function reconcileDerivedWorkspaceFromBindings(workspace: ResumedWorkspace, state: TaskState): Promise<void> {
+  if (state.authorshipMode !== "derived") return;
+  const ordered = orderedDerivedPhasesFromBindings(workspace.project.profile, state.derivedBindings ?? {});
+  const boundPhases = new Set(ordered);
+  const generatedDirectory = resolve(workspace.root, GENERATED_DIRECTORY);
+  // Generated modules for phases no longer bound are pruned; registry.mjs is regenerated below.
+  let moduleNames: string[] = [];
   try {
-    names = await readdir(derivedDirectory(workspace.layout.internal.root));
-  } catch {
-    return [];
-  }
-  const manifests: DerivationManifest[] = [];
-  for (const name of names.filter((entry) => entry.endsWith(".json")).sort()) {
+    moduleNames = await readdir(generatedDirectory);
+  } catch { /* directory absent: nothing to prune */ }
+  for (const name of moduleNames.sort()) {
+    if (!name.endsWith(".mjs") || name === "registry.mjs") continue;
+    if (boundPhases.has(name.slice(0, -".mjs".length))) continue;
     try {
-      manifests.push(JSON.parse(await readFile(join(derivedDirectory(workspace.layout.internal.root), name), "utf8")) as DerivationManifest);
-    } catch { /* ignore unreadable sidecars */ }
+      await rm(join(generatedDirectory, name));
+    } catch (error) {
+      throw new Error(`derived workspace reconciliation could not prune unbound generated module ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
-  return manifests;
+  // Derivation manifests for unbound phases are provenance sidecars only; prune them too.
+  const manifestDirectory = derivedDirectory(workspace.layout.internal.root);
+  let manifestNames: string[] = [];
+  try {
+    manifestNames = await readdir(manifestDirectory);
+  } catch { /* directory absent: nothing to prune */ }
+  for (const name of manifestNames.sort()) {
+    if (!name.endsWith(".json")) continue;
+    if (boundPhases.has(name.slice(0, -".json".length))) continue;
+    try {
+      await rm(join(manifestDirectory, name));
+    } catch (error) {
+      throw new Error(`derived workspace reconciliation could not prune unbound derivation manifest ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const expectedRegistry = generateRegistrySource(workspace.project.profile, ordered);
+  await mkdir(generatedDirectory, { recursive: true });
+  const registryPath = resolve(workspace.root, GENERATED_REGISTRY_PATH);
+  let current: string | null = null;
+  try {
+    current = await readFile(registryPath, "utf8");
+  } catch { /* missing registry is regenerated */ }
+  if (current !== expectedRegistry) await writeFile(registryPath, expectedRegistry);
 }
 
 /** Trusted-audit options bound to preparation + state bindings + canonical paths. */
@@ -938,14 +1052,6 @@ export async function trustedGeneratedAuditOptions(workspace: ResumedWorkspace, 
     allowedPhases,
   });
   return { trustedGeneratedModules: trusted };
-}
-
-/** Ordered derived phases known to the workspace, in profile contract dependency order. */
-function orderedDerivedPhases(profile: ProfileId, manifests: DerivationManifest[]): string[] {
-  const present = new Set(manifests.map((manifest) => manifest.phase));
-  const contractOrder = getProfileContract(profile).phases.map((phase) => phase.id).filter((id) => present.has(id));
-  for (const phase of [...present].sort()) if (!contractOrder.includes(phase)) contractOrder.push(phase);
-  return contractOrder;
 }
 
 /**
@@ -1011,9 +1117,18 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const simplifyOverrides = new Map<string, { ratio?: number; error?: number }>();
+  const keepTargets = new Set<string>();
   if (phaseRepairSpec) {
     for (const operation of phaseRepairSpec.operations) {
       if (operation.op === "simplify-override") simplifyOverrides.set(operation.target, { ...(operation.ratio !== undefined ? { ratio: operation.ratio } : {}), ...(operation.error !== undefined ? { error: operation.error } : {}) });
+      if (operation.op === "component-keep") keepTargets.add(operation.target);
+    }
+  }
+  // Analytic primitive-regeneration routes have no prunable source islands; a keep marker
+  // can never affect them and must fail clearly rather than silently succeed (plan E1).
+  if (route.operator === "radial-fit" || route.operator === "course-regenerate") {
+    for (const target of keepTargets) {
+      throw new Error(`component-keep target "${target}" cannot affect the ${route.operator} ${route.label} seed: the route regenerates primitives and has no prunable source islands`);
     }
   }
   const trialAuditOptions = async (): Promise<{ trustedGeneratedModules: Map<string, unknown> }> => ({
@@ -1029,7 +1144,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   let seed: PhaseSeed;
   const analytic = route.operator !== "mesh-simplify";
   if (route.operator === "mesh-simplify") {
-    seed = await buildMeshSimplifySeed(snapshot, workspace.project.profile, phase, simplifyOverrides);
+    seed = await buildMeshSimplifySeed(snapshot, workspace.project.profile, phase, simplifyOverrides, keepTargets);
   } else if (route.operator === "radial-fit") {
     const built = buildRadialSeed(snapshot);
     if (!built.nodes.length) throw new Error("prepared oracle carries no running-gear instances to derive from");
@@ -1049,7 +1164,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
       simplify: async () => ({ nodes: built.nodes }),
     };
   } else {
-    const built = buildGunSeed(snapshot);
+    const built = buildGunSeed(snapshot, keepTargets);
     seed = {
       name: "gun",
       inputGeometryHash: geometryBytesHash(built.nodes[1]!.positions!, built.nodes[1]!.indices!),
@@ -1105,7 +1220,10 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     const trialBinding = localBindings[`${GENERATED_DIRECTORY}/${seed.name}.mjs`];
     if (!trialBinding) throw new Error("derive lost its trial binding ledger entry");
     trialBinding.manifestHash = derivationManifestHash(trialManifestSeed);
-    await wireGeneratedComposition(workspace, orderedDerivedPhases(workspace.project.profile, [trialManifestSeed, ...(await readAllManifests(workspace)).filter((manifest) => manifest.phase !== phase)]));
+    // Trial composition comes from the PROVISIONAL local binding ledger (plan C3): manifest
+    // sidecars on disk are provenance, never phase presence. The ledger already carries the
+    // trial binding for the active phase plus every still-valid earlier phase.
+    await wireGeneratedComposition(workspace, orderedDerivedPhasesFromBindings(workspace.project.profile, localBindings));
     let verdict: Awaited<ReturnType<typeof evaluateTrialComposition>>;
     try {
       verdict = await evaluateTrialComposition(workspace, phase, oracle, authoritativeDimensions, await trialAuditOptions(), options.backend, options.executionScratchRoot);
@@ -1179,7 +1297,6 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
   }
 
   const written = await writeDerivedArtifacts(workspace, manifest, moduleSource);
-  const wiring = await wireGeneratedComposition(workspace, orderedDerivedPhases(workspace.project.profile, await readAllManifests(workspace)));
 
   /** Applies the derive's durable binding/state mutations to one base TaskState. */
   const applyDeriveMutations = (base: TaskState): TaskState => {
@@ -1208,6 +1325,11 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     phase: repair.phase,
     specHash: sha256(readFileSync(resolve(workspace.root, repair.path))),
   }));
+  const mutated = applyDeriveMutations(state);
+  // After a derive is chosen, the registry regenerates from the resulting CANONICAL binding
+  // ledger (plan C3). Stale derivation manifests left on disk by earlier phases or failed
+  // trials cannot re-enter composition by being present.
+  const wiring = await wireGeneratedComposition(workspace, orderedDerivedPhasesFromBindings(workspace.project.profile, mutated.derivedBindings));
 
   const nextState = options.persistState
     ? await options.persistState(applyDeriveMutations(state))

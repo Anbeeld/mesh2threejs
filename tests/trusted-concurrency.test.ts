@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, afterAll } from "vitest";
@@ -119,6 +119,72 @@ describe("per-run serialization and store lease (final closure §12.2)", () => {
       await broker.close();
     }
   }, 180_000);
+
+  test("gate vs reopen: reopened generated bindings are never resurrected by a concurrent gate commit", async () => {
+    const { broker, builder, runId, root } = await beginRunToDerivedHull();
+    try {
+      const preGate = await builder.gate(runId) as { passed: boolean };
+      expect(preGate.passed).toBe(true);
+      await Promise.allSettled([
+        builder.lock(runId),
+        builder.reopen(runId, "hull", "concurrent reopen binding test"),
+      ]);
+      const record = await builder.readRun(runId);
+      const state = record.record.embedded.state;
+      const hullLocked = "hull" in state.locks;
+      const hullBound = "model/.generated/hull.mjs" in state.derivedBindings;
+      // Exact binding invariant (remediation plan C2/C5): an unlocked (reopened) hull must
+      // never carry active generated-module composition authority. If the gate won the race
+      // and hull is still locked, the binding must be present; if reopen won, it must be
+      // pruned. No mixed lock+pruned or unlocked+bound state may survive.
+      if (!hullLocked && hullBound) throw new Error("mixed state: hull reopened but its generated binding still composes");
+      if (hullLocked && !hullBound) throw new Error("mixed state: hull locked without its generated binding");
+      // Workspace composition mirrors the canonical ledger: the registry never imports an
+      // unbound phase.
+      const registry = await readFile(join(root, "model", ".generated", "registry.mjs"), "utf8");
+      if (!hullBound) expect(registry).not.toContain("hull.mjs");
+      expect(record.record.status).toMatch(/active|awaiting-human-review/);
+    } finally {
+      await broker.close();
+    }
+  }, 180_000);
+
+  test("reopen then derive: stale sidecars and a tampered registry cannot re-enter composition", async () => {
+    const { broker, builder, runId, root } = await beginRunToDerivedHull();
+    try {
+      const gate = await builder.gate(runId) as { passed: boolean };
+      expect(gate.passed).toBe(true);
+      await builder.lock(runId);
+      await builder.reopen(runId, "hull", "stale sidecar regression");
+      // Stale invalidated artifacts reappear on disk after the reopen (as they physically
+      // would in a real workspace) plus a registry that still imports them.
+      await mkdir(join(root, "model", ".generated"), { recursive: true });
+      await writeFile(join(root, "model", ".generated", "turret.mjs"), `export function createSeed() { return new THREE.Group(); }
+`);
+      const manifestDirectory = join(root, ".mesh2threejs", "derived");
+      await mkdir(manifestDirectory, { recursive: true });
+      await writeFile(join(manifestDirectory, "turret.json"), JSON.stringify({
+        schemaVersion: 1, kind: "mesh2threejs-derived-seed", phase: "turret",
+        oraclePreparationIdentity: "stale", preparedOracleHash: "0".repeat(64),
+        operator: "mesh-simplify", recipe: {}, inputGeometryHash: "0".repeat(64),
+        outputGeometryHash: "0".repeat(64), generatedModulePath: "model/.generated/turret.mjs",
+        generatedModuleHash: "0".repeat(64), inputTriangles: 1, outputTriangles: 1,
+      }));
+      await writeFile(join(root, "model", ".generated", "registry.mjs"), `import { createSeed as createSeedturret } from "./turret.mjs";
+export function createGeneratedCandidate() { return new THREE.Group(); }
+`);
+
+      // The next trusted operation heals composition from the canonical binding ledger.
+      await builder.derive(runId);
+      const registry = await readFile(join(root, "model", ".generated", "registry.mjs"), "utf8");
+      expect(registry).toContain("hull.mjs");
+      expect(registry).not.toContain("turret.mjs");
+      const state = JSON.parse(await readFile(join(root, ".mesh2threejs", "state.json"), "utf8")) as { derivedBindings: Record<string, unknown> };
+      expect("model/.generated/turret.mjs" in state.derivedBindings).toBe(false);
+    } finally {
+      await broker.close();
+    }
+  }, 240_000);
 
   test("approve-review vs reopen: never reopened geometry + old humanApproval current", async () => {
     const { broker, builder, admin, runId } = await beginRunToDerivedHull();

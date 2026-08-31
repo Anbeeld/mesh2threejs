@@ -39,6 +39,15 @@ function includePoint(bounds: Bounds3, point: Point3): void {
   }
 }
 
+/**
+ * Zero-volume intrinsic bounds at one point (pipeline remediation plan D1): the canonical
+ * bounds of a semantic anchor that owns no geometry. `finishBounds` keeps min/max exact and
+ * derives size 0 and center = the point.
+ */
+function pointBounds(point: Point3): Bounds3 {
+  return { min: [...point], max: [...point], size: [0, 0, 0], center: [...point] };
+}
+
 function semanticOwner(object: THREE.Object3D): { id: string; parent?: string; role?: string; critical: boolean } {
   let current: THREE.Object3D | null = object;
   let id: string | undefined;
@@ -241,9 +250,11 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
     const worldOrigin = object.getWorldPosition(new THREE.Vector3());
     const origin: Point3 = [worldOrigin.x, worldOrigin.y, worldOrigin.z];
     if (components[id]) { components[id]!.origin = origin; continue; }
-    const box = new THREE.Box3().setFromObject(object);
-    const min: Point3 = [box.min.x, box.min.y, box.min.z];
-    const max: Point3 = [box.max.x, box.max.y, box.max.z];
+    // Intrinsic-bounds invariant (pipeline remediation plan D1): a semantic owner with no
+    // owned triangles measures as ZERO-VOLUME bounds at its own world origin. Descendant
+    // geometry — including articulated subtrees — must never inflate this component's
+    // intrinsic bounds. Box3.setFromObject() would aggregate the whole subtree and give
+    // SceneComponent.bounds a second, incompatible meaning; do not restore that fallback.
     const logicalOwner = typeof object.userData.logicalOwner === "string" && object.userData.logicalOwner !== id ? object.userData.logicalOwner : undefined;
     const parent = logicalOwner ?? (object.parent && typeof object.parent.userData.semanticId === "string" ? object.parent.userData.semanticId : undefined);
     components[id] = {
@@ -253,7 +264,7 @@ export function snapshotScene(root: THREE.Object3D): SceneSnapshot {
       ...(parent ? { parentSemanticId: parent } : {}),
       critical: object.userData.critical === true,
       triangleIndices: new Uint32Array(0),
-      bounds: finishBounds({ min, max, size: [0, 0, 0], center: [0, 0, 0] }),
+      bounds: pointBounds(origin),
       origin,
       representation: { segmentCounts: [], flatOrFaceted: true, simplePbr: true, generatedOrNoTextures: true, colors: [] },
     };

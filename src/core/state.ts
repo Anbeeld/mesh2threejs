@@ -6,6 +6,8 @@ import { canonicalJson, sha256 } from "./hashing.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
 import { verifyVisualReviewPacketFiles, type VisualReviewPacket } from "./review.js";
 import { getStyleContract } from "../styles/low-poly.js";
+import { GENERATED_DIRECTORY } from "./derivation.js";
+import { phasesInvalidatedByReopen } from "./phase-compose.js";
 import { evaluationIdentityHash, type EvaluationIdentity } from "./identity.js";
 import type { OraclePreparationBinding } from "./oracle.js";
 
@@ -535,14 +537,13 @@ export function acceptPhase(state: TaskState, phase: string, input: { geometryHa
 
 export function reopenPhase(state: TaskState, phase: string, reason: string): TaskState {
   if (!reason.trim()) throw new Error("reopening a phase requires a reason");
-  const { phases, dependencies } = lifecycle(state.profile);
-  const index = phases.indexOf(phase);
-  if (index < 0 || !state.locks[phase]) throw new Error(`phase ${phase} is not locked`);
-  const invalidated = phases.filter((candidate) => {
-    const seen = new Set<string>();
-    const dependsOn = (current: string): boolean => current === phase || (dependencies[current] ?? []).some((dependency) => !seen.has(dependency) && (seen.add(dependency), dependsOn(dependency)));
-    return dependsOn(candidate);
-  });
+  if (!state.locks[phase]) throw new Error(`phase ${phase} is not locked`);
+  // One canonical lifecycle model (pipeline remediation plan D3/C1): reopening the phase at
+  // contract index i invalidates the executable contract-order suffix phases[i:] — the same
+  // model phaseWithPrerequisites() uses for cumulative scope. Dependency closure is retired:
+  // it let later-phase semantics survive a reopen while staying illegal in active-phase
+  // composition (e.g. running-gear depends only on hull yet is a later contract phase).
+  const invalidated = phasesInvalidatedByReopen(state.profile, phase);
   const next = clone(state);
   for (const affected of invalidated) {
     delete next.locks[affected];
@@ -553,6 +554,11 @@ export function reopenPhase(state: TaskState, phase: string, reason: string): Ta
   next.activePhase = phase;
   next.visualReviewStatus = "awaiting";
   invalidate(next, (evidence) => invalidated.includes(evidence.phase));
+  // Generated module bindings are composition authority (plan C2/D4): entries for invalid-
+  // ated derivable phases no longer compose. `derivedBindings` also carries repair-spec
+  // binding records — those are user-authored input and survive (D5), as do generated
+  // bindings of still-valid earlier phases.
+  for (const affected of invalidated) delete next.derivedBindings[`${GENERATED_DIRECTORY}/${affected}.mjs`];
   next.reopens.push({ phase, reason: reason.trim(), invalidated, reopenedAt: new Date().toISOString() });
   return next;
 }

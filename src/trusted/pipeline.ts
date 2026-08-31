@@ -24,7 +24,7 @@ import {
 } from "../core/oracle.js";
 import { evaluateAssemblyCoverage } from "../core/assembly.js";
 import { protectedSourceSemantics } from "../core/phase-compose.js";
-import { derivePhaseSeed } from "../core/derive.js";
+import { derivePhaseSeed, reconcileDerivedWorkspaceFromBindings } from "../core/derive.js";
 import { verifyDerivedLineage, derivedDirectory, loadTrustedGeneratedModules } from "../core/derivation.js";
 import { performRenderRun, performOracleSanityRun, performQuickDiagnosticRun, verifyLatestOracleSanity } from "../core/workspace-render.js";import { createVisualReviewPacket, verifyVisualReviewPacketFiles, type ReviewFileReference } from "../core/review.js";
 import { serializeScene } from "../core/scene-serialization.js";
@@ -125,6 +125,13 @@ export class TrustedPipeline {
    * first (§11.H4). The workspace copy is a cache; it is never a competing authority. Byte
    * contradictions of project/reference inputs are NOT silently rebound — callers surface
    * them as drift blocks.
+   *
+   * Also best-effort reconciles pipeline-owned derived artifacts from the canonical
+   * bindings (remediation plan C4): after a reopen, any operation reruns the workspace
+   * reconciliation from canonical state, so a stale registry or stale generated sidecar
+   * can never win over canonical authority. Failures are surfaced by the operations that
+   * depend on composition (derive/gate/replay) and by reopen itself, which reconciles
+   * strictly.
    */
   private async loadRunWorkspace(record: RunAuthorityRecord): Promise<ResumedWorkspace> {
     const statePath = join(record.workspaceRoot, ".mesh2threejs", "state.json");
@@ -144,7 +151,11 @@ export class TrustedPipeline {
         // If the directory cannot be written yet, fall through: resumeWorkspace may still work.
       });
     }
-    return resumeWorkspace(record.workspaceRoot);
+    const workspace = await resumeWorkspace(record.workspaceRoot);
+    try {
+      await reconcileDerivedWorkspaceFromBindings(workspace, record.embedded.state);
+    } catch { /* strict reconciliation errors surface in reopen() and composition operations */ }
+    return workspace;
   }
 
   /** Verifies project/reference/toolchain bindings against canonical policy (§5.B3/H4). */
@@ -630,6 +641,17 @@ export class TrustedPipeline {
   async reopen(runId: string, input: { phase: string; reason: string }, capability: Capability): Promise<Record<string, unknown>> {
     const next = await this.authority.applyBuilderTransition(runId, { kind: "reopen-phase", phase: input.phase, reason: input.reason }, this.context(capability));
     await this.commitCanonicalAndMirror(next);
+    // Reconcile workspace derived artifacts from the CANONICAL post-reopen bindings (plan C4):
+    // invalidated generated modules/manifests leave the workspace composition and the registry
+    // regenerates from the pruned binding ledger. Canonical state is already committed; if the
+    // filesystem reconciliation fails, surface a specific actionable error — the next trusted
+    // operation reruns reconciliation from canonical state instead of requiring a rebase.
+    const workspace = await this.loadRunWorkspace(next);
+    try {
+      await reconcileDerivedWorkspaceFromBindings(workspace, next.embedded.state);
+    } catch (error) {
+      throw new PipelineError("DERIVED_WORKSPACE_RECONCILIATION_FAILED", `canonical reopen of phase ${input.phase} succeeded, but reconciling workspace derived artifacts failed: ${error instanceof Error ? error.message : String(error)}; the next trusted operation will retry reconciliation from canonical state`, { phase: input.phase });
+    }
     return { status: "reopened", activePhase: next.embedded.state.activePhase };
   }
 

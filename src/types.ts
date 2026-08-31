@@ -42,6 +42,14 @@ export interface SceneComponent {
   parentSemanticId?: string;
   critical: boolean;
   triangleIndices: Uint32Array;
+  /**
+   * Intrinsic owned-geometry bounds (pipeline remediation plan D1): exactly the geometry
+   * this semantic owns. For a transform-only anchor (group/pivot with zero owned triangles)
+   * this is a ZERO-VOLUME box at the semantic's world origin (min == max == center ==
+   * origin, size 0). Descendant semantics never inflate it; semantic comparisons on bounds
+   * always compare like with like. Consumers needing an aggregate over a subtree must build
+   * one explicitly instead of overloading this field.
+   */
   bounds: Bounds3;
   origin?: Point3;
   representation: {

@@ -49,6 +49,22 @@ export function phaseWithPrerequisites(profile: ProfileId, phase: string): strin
 }
 
 /**
+ * Contract-order suffix invalidated by reopening one phase (pipeline remediation plan D3/C1).
+ * The pipeline locks phases in contract ARRAY order and phaseWithPrerequisites() defines the
+ * legal cumulative scope as the contract-order prefix — so reopening the phase at index i
+ * releases exactly the suffix phases[i:]. The former dependsOn-closure interpretation was a
+ * different lifecycle model and let later-phase semantics survive a reopen while remaining
+ * illegal in active-phase composition. This ONE definition is used by reopen state
+ * invalidation, generated-binding pruning, and workspace reconciliation alike.
+ */
+export function phasesInvalidatedByReopen(profile: ProfileId, phase: string): string[] {
+  const contract = getProfileContract(profile);
+  const index = contract.phases.findIndex((entry) => entry.id === phase);
+  if (index < 0) return [phase];
+  return contract.phases.slice(index).map((entry) => entry.id);
+}
+
+/**
  * Cumulative semantic scope for an active phase: semantics owned by the phase itself plus
  * every prerequisite phase. Returns null for profiles without an ownership model, meaning
  * "no mechanical restriction".
