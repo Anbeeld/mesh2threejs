@@ -269,9 +269,25 @@ describe("component-keep contract (bundle E)", () => {
       // The pivot object itself is still a transform Group, not a mesh.
       const pivotObject = runtime.root.getObjectByName("gun-pivot")!;
       expect((pivotObject as THREE.Mesh).isMesh).toBeFalsy();
-      // Barrel unchanged and still owned by the pivot.
+      // Barrel unchanged and still owned by the pivot. The fitted barrel's muzzle distance
+      // from the pivot matches the oracle (the gun.geometry measurement), while the axis-aligned
+      // bbox of the 10-segment tube may differ slightly from the oracle mesh's bbox.
       expect(candidateSnapshot.components.gun!.parentSemanticId).toBe("gun-pivot");
-      expect(candidateSnapshot.components.gun!.bounds.size[2]).toBeCloseTo(3.4, 2);
+      {
+        const pivotOrigin = candidateSnapshot.components["gun-pivot"]!.origin ?? [0, 0, 0];
+        const gun = candidateSnapshot.components.gun!;
+        let maxDistance = 0;
+        for (const localIndex of gun.triangleIndices) {
+          const offset = localIndex * 9;
+          for (let vertex = 0; vertex < 3; vertex += 1) {
+            const x = candidateSnapshot.triangleData.positions[offset + vertex * 3]!;
+            const y = candidateSnapshot.triangleData.positions[offset + vertex * 3 + 1]!;
+            const z = candidateSnapshot.triangleData.positions[offset + vertex * 3 + 2]!;
+            maxDistance = Math.max(maxDistance, Math.hypot(x - pivotOrigin[0]!, y - pivotOrigin[1]!, z - pivotOrigin[2]!));
+          }
+        }
+        expect(maxDistance).toBeCloseTo(3.4, 2);
+      }
     } finally {
       await rm(join(root, ".."), { recursive: true, force: true });
     }
