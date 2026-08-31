@@ -69,6 +69,22 @@ export interface DeriveTierResult {
   /** False when the tier cleared active gates but already violates the style complexity ceiling. */
   withinComplexityBudget?: boolean;
   simplifierError?: number;
+  /** Required-phase-gate summary used to rank failing tiers diagnostically. A shared binary
+   * zero row (e.g. connectivity) collapses the phase minimum for every tier, so retention of
+   * the most informative failing tier must not rely on that minimum alone. */
+  diagnostic?: TierDiagnostic;
+}
+
+export interface TierDiagnostic {
+  /** Required phase contract gates that passed. */
+  passedGateCount: number;
+  /** Total required phase contract gates evaluated. */
+  gateCount: number;
+  /** Mean required-gate score (0..100). */
+  meanGateScore: number;
+  /** Lowest individual required-gate score above the binary zero floor; equals gateCount when
+   * every required gate is fully blocked (pure-binary failure). */
+  minFidelityGateScore: number;
 }
 
 export type DeriveTierResultTier = "componentwise-aggressive" | "componentwise-balanced" | "componentwise-conservative" | "source-preserve";
@@ -886,6 +902,7 @@ async function evaluateTrialComposition(
   triangles: number;
   meshes: number;
   failingGates: Array<{ code: string; score: number; message: string }>;
+  diagnostic: TierDiagnostic;
 }> {
   const { executeComposedDerivedTrial, deserializeExecutionSamples } = await import("./composition-exec.js");
   const { evaluateCandidateFromSamples } = await import("./orchestration.js");
@@ -928,11 +945,20 @@ async function evaluateTrialComposition(
     // Early complexity admissibility over the COMPOSED totals: geometrically acceptable is
     // not yet lockable when the workspace hard style ceiling is already exceeded.
     const composedSnapshot = snapshotScene(samples.neutralRoot);
+    const phaseRows = phaseReport?.rows ?? evaluation.contractGates.rows;
+    const fidelityScores = phaseRows.map((row) => row.score).filter((value) => value > 0);
+    const diagnostic: TierDiagnostic = {
+      passedGateCount: phaseRows.filter((row) => row.passed).length,
+      gateCount: phaseRows.length,
+      meanGateScore: phaseRows.length ? phaseRows.reduce((sum, row) => sum + row.score, 0) / phaseRows.length : 0,
+      minFidelityGateScore: fidelityScores.length ? Math.min(...fidelityScores) : phaseRows.length,
+    };
     return {
       passed: evaluation.passed && Boolean(phaseReport?.passed),
       score: phaseReport?.score ?? evaluation.contractGates.score,
       triangles: composedSnapshot.triangleCount,
       meshes: composedSnapshot.meshCount,
+      diagnostic,
       failingGates: [
         ...evaluation.deterministic.rows.filter((row) => !row.passed).map((row) => ({ code: row.code, score: row.score, message: row.message })),
         ...Object.values(evaluation.phaseGates).flatMap((report) => report.rows.filter((row) => !row.passed).map((row) => ({ code: row.code, score: row.score, message: row.message }))),
@@ -1057,6 +1083,12 @@ export async function trustedGeneratedAuditOptions(workspace: ResumedWorkspace, 
 /**
  * Pure tier-selection policy: geometrically acceptable is distinct from LOCKABLE. A tier that
  * cleared active gates but violates the hard style ceiling is diagnostic repair input only.
+ *
+ * Passing tiers: first/simplest eligible passing tier wins (unchanged). Failing tiers: rank by
+ * diagnostic usefulness — most required gates passed, then best mean required-gate score, then
+ * best worst-fidelity score, then lower complexity — so a shared binary zero row (e.g. one
+ * connectivity gate) cannot make every failing tier indistinguishable and retain an
+ * uninformative aggressive tier over a high-fidelity source-preserve tier.
  */
 export function resolveSeedOutcome(tierResults: ReadonlyArray<DeriveTierResult>): { status: DeriveStatus; reasonCode?: DeriveReasonCode; chosen?: DeriveTierResult } {
   const eligiblePassing = tierResults.find((tier) => tier.passed && tier.withinComplexityBudget !== false);
@@ -1065,8 +1097,24 @@ export function resolveSeedOutcome(tierResults: ReadonlyArray<DeriveTierResult>)
   if (overBudgetPassing.length) {
     return { status: "seed-diagnostic-overbudget", reasonCode: "derive.over-budget-fallback", chosen: overBudgetPassing.reduce((best, tier) => (tier.score > best.score ? tier : best)) };
   }
-  const best = tierResults.reduce<DeriveTierResult | undefined>((acc, tier) => (!acc || tier.score > acc.score ? tier : acc), undefined);
+  const failing = tierResults.slice();
+  const best = failing.reduce<DeriveTierResult | undefined>((acc, tier) => {
+    if (!acc) return tier;
+    return compareFailingTiers(tier, acc) < 0 ? tier : acc;
+  }, undefined);
   return { status: "seed-retained-failing", reasonCode: "derive.no-passing-tier", ...(best ? { chosen: best } : {}) };
+}
+
+/** Diagnostic usefulness order for failing tiers; negative means `a` ranks before `b`. */
+export function compareFailingTiers(a: DeriveTierResult, b: DeriveTierResult): number {
+  const da = a.diagnostic, db = b.diagnostic;
+  if (da && db) {
+    if (da.passedGateCount !== db.passedGateCount) return db.passedGateCount - da.passedGateCount;
+    if (Math.abs(da.meanGateScore - db.meanGateScore) > 1e-9) return db.meanGateScore - da.meanGateScore;
+    if (da.minFidelityGateScore !== db.minFidelityGateScore) return db.minFidelityGateScore - da.minFidelityGateScore;
+  }
+  if (a.score !== b.score) return b.score - a.score;
+  return a.triangles - b.triangles;
 }
 
 /**
@@ -1230,7 +1278,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
     } catch (error) {
       // A trial that cannot even execute (e.g. audit failure) is a failing tier, not a crash:
       // the derive ladder must remain bounded and informative.
-      verdict = { passed: false, score: 0, triangles: Math.round(outputTriangles), meshes: built.nodes.filter((node) => node.kind === "mesh").length, failingGates: [{ code: "derive.trial-execution", score: 0, message: error instanceof Error ? error.message : String(error) }] };
+      verdict = { passed: false, score: 0, triangles: Math.round(outputTriangles), meshes: built.nodes.filter((node) => node.kind === "mesh").length, failingGates: [{ code: "derive.trial-execution", score: 0, message: error instanceof Error ? error.message : String(error) }], diagnostic: { passedGateCount: 0, gateCount: 0, meanGateScore: 0, minFidelityGateScore: 0 } };
     }
     evaluatedNodes.set(tier.tier, built.nodes);
     const withinBudget = verdict.triangles <= triangleMax && verdict.meshes <= meshMax;
@@ -1240,6 +1288,7 @@ export async function derivePhaseSeed(workspaceInput: string, options: DeriveOpt
       passed: verdict.passed,
       score: verdict.score,
       failingGates: verdict.failingGates,
+      diagnostic: verdict.diagnostic,
       withinComplexityBudget: withinBudget,
       ...(built.error !== undefined ? { simplifierError: built.error } : {}),
     });
