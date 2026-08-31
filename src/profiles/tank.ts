@@ -646,8 +646,8 @@ function runningGearRadialityAndAxleRows(oracle: SceneSnapshot, candidate: Scene
     if (!actual) continue;
     // Projected radial geometry around the measured axle: primitive class and tessellation are
     // irrelevant, so an octagonal wheel passes and a subdivided cuboid fails decisively.
-    const expectedProfile = measureWheelRadialProfile(oracle, expected.id);
-    const actualProfile = measureWheelRadialProfile(candidate, actual.id);
+    const expectedProfile = measureWheelRadialProfile(oracle, expected.id, 24, { expectedAxleAxis: 0 });
+    const actualProfile = measureWheelRadialProfile(candidate, actual.id, 24, { expectedAxleAxis: 0 });
     if (!actualProfile) { failures.push(`${actual.id}:insufficient-geometry`); continue; }
     if (!actualProfile.axleAlignedWithX) maxAxleDeviation = Math.max(maxAxleDeviation, 0.5);
     if (expectedProfile && expectedProfile.axleAlignedWithX !== actualProfile.axleAlignedWithX) maxAxleDeviation = Math.max(maxAxleDeviation, 0.4);

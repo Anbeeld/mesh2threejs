@@ -613,11 +613,18 @@ export function principalPlaneMatchCost(scale: number, oracle: PrincipalPlane, c
   return angleCost * 4 + offsetCost * 4 + centroidCost * 0.5 + coverageCost;
 }
 
+/**
+ * Physical wheel truth: determines the extrusion axis, projects the geometry into the wheel
+ * plane around the measured center, and measures a per-angle maximum radius profile from
+ * densely sampled projected triangle edges. Primitive metadata plays no part, so an octagonal
+ * wheel passes while any cuboid — subdivided or not — fails decisively.
+ */
 export interface WheelRadialProfile {
   center: Point3;
   /** Measured thin/extrusion axis: 0=x, 1=y, 2=z. */
   axleAxis: 0 | 1 | 2;
   axleAlignedWithX: boolean;
+  /** Radius measured around the axle in the profile plane. */
   meanRadius: number;
   /** Relative range of per-angle maximum radii around the wheel plane. */
   radialRange: number;
@@ -626,34 +633,24 @@ export interface WheelRadialProfile {
   sampleCount: number;
 }
 
-/**
- * Physical wheel truth: determines the extrusion axis from coordinate spread, projects the
- * geometry into the wheel plane around the measured center, and measures a per-angle maximum
- * radius profile from densely sampled projected triangle edges. Primitive metadata plays no
- * part, so an octagonal wheel passes while any cuboid — subdivided or not — fails decisively.
- */
-export function measureWheelRadialProfile(snapshot: SceneSnapshot, semanticId: string, bins = 24): WheelRadialProfile | null {
+export interface WheelRadialProfileOptions {
+  /**
+   * Canonical expected axle for constrained evaluation (tank running gear: lateral X).
+   * When provided, the radial profile is measured in the plane perpendicular to this axis
+   * and wheel orientation is judged by a robust geometric signal instead of the vertex
+   * standard-deviation heuristic, which misreads coarse wide wheels (a fitted disc can be
+   * wider along its axle than half its diameter, flipping the minimum-spread axis).
+   * Alignment accepts the expected axle only when the wheel genuinely measures most radial
+   * around it; deliberately rotated or non-lateral wheels still fail. Automatic inference
+   * remains the default for unconstrained/generic callers.
+   */
+  expectedAxleAxis?: 0 | 1 | 2;
+}
+
+/** Radial max-per-angle-bin profile of one semantic projected perpendicular to `axleAxis`. */
+function measureRadialProfileAround(snapshot: SceneSnapshot, semanticId: string, bins: number, axleAxis: 0 | 1 | 2): WheelRadialProfile | null {
   const component = snapshot.components[semanticId];
   if (!component?.triangleIndices.length) return null;
-  const spreads: [number, number, number] = [0, 0, 0];
-  const sums: [number, number, number] = [0, 0, 0];
-  const squared: [number, number, number] = [0, 0, 0];
-  let count = 0;
-  const points: Point3[] = [];
-  for (const index of component.triangleIndices) {
-    const triangle = sceneTriangleAt(snapshot, index);
-    if (!triangle) continue;
-    for (const point of triangle.points) {
-      points.push(point);
-      for (let axis = 0 as 0 | 1 | 2; axis < 3; axis = (axis + 1) as 0 | 1 | 2) sums[axis] += point[axis]!;
-      count += 1;
-    }
-  }
-  if (count < 12) return null;
-  const mean: Point3 = [sums[0]! / count, sums[1]! / count, sums[2]! / count];
-  for (const point of points) for (let axis = 0 as 0 | 1 | 2; axis < 3; axis = (axis + 1) as 0 | 1 | 2) squared[axis] += (point[axis]! - mean[axis]!) ** 2;
-  for (let axis = 0 as 0 | 1 | 2; axis < 3; axis = (axis + 1) as 0 | 1 | 2) spreads[axis] = Math.sqrt(squared[axis]! / count);
-  const axleAxis = (spreads[0]! <= spreads[1]! && spreads[0]! <= spreads[2]! ? 0 : spreads[1]! <= spreads[2]! ? 1 : 2) as 0 | 1 | 2;
   const planeAxes = ([0, 1, 2] as Array<0 | 1 | 2>).filter((axis) => axis !== axleAxis);
   const center: Point3 = [...component.bounds.center] as Point3;
   const radii: number[] = new Array(bins).fill(0);
@@ -697,4 +694,67 @@ export function measureWheelRadialProfile(snapshot: SceneSnapshot, semanticId: s
     circumferenceCoverage: occupied.length / bins,
     sampleCount: samples,
   };
+}
+
+/** Legacy axle inference: the axis of minimum vertex standard deviation. Dense wheels classify
+correctly; a coarse fitted disc that is WIDER than half its diameter flips to a wrong axis. */
+function inferWheelAxleByVertexSpread(snapshot: SceneSnapshot, semanticId: string): 0 | 1 | 2 | null {
+  const component = snapshot.components[semanticId];
+  if (!component?.triangleIndices.length) return null;
+  const sums: [number, number, number] = [0, 0, 0];
+  const squared: [number, number, number] = [0, 0, 0];
+  let count = 0;
+  for (const index of component.triangleIndices) {
+    const triangle = sceneTriangleAt(snapshot, index);
+    if (!triangle) continue;
+    for (const point of triangle.points) {
+      for (let axis = 0 as 0 | 1 | 2; axis < 3; axis = (axis + 1) as 0 | 1 | 2) sums[axis] += point[axis]!;
+      count += 1;
+    }
+  }
+  if (count < 12) return null;
+  const mean: Point3 = [sums[0]! / count, sums[1]! / count, sums[2]! / count];
+  for (const index of component.triangleIndices) {
+    const triangle = sceneTriangleAt(snapshot, index);
+    if (!triangle) continue;
+    for (const point of triangle.points) for (let axis = 0 as 0 | 1 | 2; axis < 3; axis = (axis + 1) as 0 | 1 | 2) squared[axis] += (point[axis]! - mean[axis]!) ** 2;
+  }
+  const spreads: [number, number, number] = [0, 0, 0];
+  for (let axis = 0 as 0 | 1 | 2; axis < 3; axis = (axis + 1) as 0 | 1 | 2) spreads[axis] = Math.sqrt(squared[axis]! / count);
+  return (spreads[0]! <= spreads[1]! && spreads[0]! <= spreads[2]! ? 0 : spreads[1]! <= spreads[2]! ? 1 : 2) as 0 | 1 | 2;
+}
+
+/**
+ * Measures the radial wheel profile around the wheel's axle. Without options the axle is
+ * INFERRED from the vertex standard deviation (legacy behavior for generic/unconstrained
+ * measurement). With an expected axle (tank running gear: canonical lateral X) the profile
+ * is measured in the perpendicular plane, and axle alignment is accepted only when the wheel
+ * genuinely measures most radial around the expected axis: a disc is a ring in its true
+ * axle's perpendicular plane and a stripe in the other two, independent of tessellation
+ * density, so coarse wide fitted wheels are classified correctly and deliberately rotated
+ * or non-lateral wheels are still rejected.
+ */
+export function measureWheelRadialProfile(snapshot: SceneSnapshot, semanticId: string, bins = 24, options: WheelRadialProfileOptions = {}): WheelRadialProfile | null {
+  const expected = options.expectedAxleAxis;
+  if (expected === undefined) {
+    const inferred = inferWheelAxleByVertexSpread(snapshot, semanticId);
+    if (inferred === null) return null;
+    return measureRadialProfileAround(snapshot, semanticId, bins, inferred);
+  }
+  const component = snapshot.components[semanticId];
+  if (!component?.triangleIndices.length) return null;
+  const profile = measureRadialProfileAround(snapshot, semanticId, bins, expected);
+  if (!profile) return null;
+  // Orientation audit: the wheel must measure MOST radial around the expected axle (its own
+  // perpendicular plane yields the smallest radial range of the three candidate planes).
+  const otherAxes = ([0, 1, 2] as Array<0 | 1 | 2>).filter((axis) => axis !== expected);
+  let mostRadialIsExpected = true;
+  for (const other of otherAxes) {
+    const alternative = measureRadialProfileAround(snapshot, semanticId, bins, other);
+    if (alternative && alternative.radialRange < profile.radialRange) {
+      mostRadialIsExpected = false;
+      break;
+    }
+  }
+  return { ...profile, axleAlignedWithX: expected === 0 && mostRadialIsExpected };
 }
