@@ -17,6 +17,7 @@ import {
 import { deriveCanonicalFrame, rasterizeCapture, standardRenderProfile } from "../core/render.js";
 import { filterSnapshot } from "./generic.js";
 import { sceneTriangleAt } from "../core/geometry.js";
+import { measureGunGeometry } from "../core/gun-metrics.js";
 import type { PerformanceRecorder } from "../core/performance.js";
 
 export const TANK_CANONICAL_FRAME = { x: "right", y: "up", z: "forward", ground: "minY", gunForward: "+Z" } as const;
@@ -327,8 +328,8 @@ function exteriorBoundaryContour(masked: { mask: Uint8Array; width: number; heig
 export function hullSectionsRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
   const oracleHull = componentsBy(oracle, isHullComponent);
   const candidateHull = componentsBy(candidate, isHullComponent);
-  const oracleBounds = boundsOf(oracle, isHullComponent);
-  const candidateBounds = boundsOf(candidate, isHullComponent);
+  const oracleBounds = boundsOf(oracle, (component) => component.id === "hull");
+  const candidateBounds = boundsOf(candidate, (component) => component.id === "hull");
   if (!oracleHull.length || !candidateHull.length) {
     return { code: "hull.sections", phase: "hull", component: "hull", passed: false, score: 0, severity: "critical", message: "hull semantics are missing" };
   }
@@ -423,17 +424,17 @@ function hullStationRowLegacy(oracle: SceneSnapshot, candidate: SceneSnapshot): 
   return { code: "hull.stations", phase: "hull", component: "hull", passed: score >= 90, score, severity: "critical", message: `legacy hull station mean ${(mean * 100).toFixed(2)}%, P95 ${(p95 * 100).toFixed(2)}%`, ...(worst ? { position: worst.position, oracleValue: worst.oracleValue, candidateValue: worst.candidateValue, deviation: worst.physicalDeviation } : {}), normalizedDeviation: mean, statistics: { mean, p95, coverage: locations.length / 14, sampleCount: 14, trimmedCount: 2 }, worstLocations: [...locations].sort((a, b) => Math.abs(b.physicalDeviation) - Math.abs(a.physicalDeviation)).slice(0, 6), physicalUnit: "object-unit" };
 }
 
-function hullPlaneIds(snapshot: SceneSnapshot): string[] {
-  return Object.keys(snapshot.components).filter(isHullId);
-}
-
 function hullPlanesRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
-  const oracleIds = hullPlaneIds(oracle);
-  const candidateIds = hullPlaneIds(candidate);
+  // Canonical-major-mass consistency (audit item 6): the principal-plane metric measures the
+  // CANONICAL hull semantic only. Accessory plates (fenders, skirts) under hull-* semantics
+  // must neither add phantom planes to the oracle target nor dilute the candidate's evidence —
+  // the same scoping rule hull.sections and the station bounds already follow.
+  const oracleIds = ["hull"];
+  const candidateIds = ["hull"];
   if (!oracleIds.length || !candidateIds.length) {
     return { code: "hull.planes", phase: "hull", category: "principal-planes", component: "hull", passed: false, score: 0, severity: "critical", message: "hull semantics are missing; principal planes cannot be extracted" };
   }
-  const oracleBounds = boundsOf(oracle, isHullComponent);
+  const oracleBounds = boundsOf(oracle, (component) => component.id === "hull");
   const scale = Math.max(...oracleBounds.size.filter((value) => value > 0), 1e-9);
   // Area-weighted physical plane extraction: identical geometry produces the same planes under
   // any tessellation, and triangle counts or primitive identity play no part.
@@ -1014,44 +1015,7 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
     // Unlike a farthest-vertex "muzzle", none of these depend on which rim corner a barrel
     // tessellation happens to place where, so 8-, 10-, or 12-sided barrels with any angular
     // phase measure identically. A genuinely tilted or short barrel still fails.
-    const gunMetrics = (snapshot: SceneSnapshot) => {
-      const pivot = snapshot.components["gun-pivot"]?.origin;
-      const gun = snapshot.components.gun;
-      if (!pivot || !gun) return null;
-      const points = Array.from(gun.triangleIndices).flatMap((index) => sceneTriangleAt(snapshot, index)?.points ?? []);
-      if (points.length < 3) return null;
-      const centroid = [0, 1, 2].map((axis) => points.reduce((sum, point) => sum + point[axis]!, 0) / points.length) as [number, number, number];
-      const covariance: number[][] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-      for (const point of points) {
-        const d = [point[0]! - centroid[0]!, point[1]! - centroid[1]!, point[2]! - centroid[2]!];
-        for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) covariance[i]![j]! += d[i]! * d[j]!;
-      }
-      // Power iteration for the dominant eigenvector (barrel centerline direction).
-      let axis: [number, number, number] = [0, 0, 1];
-      for (let iteration = 0; iteration < 64; iteration += 1) {
-        const next = [
-          covariance[0]![0]! * axis[0]! + covariance[0]![1]! * axis[1]! + covariance[0]![2]! * axis[2]!,
-          covariance[1]![0]! * axis[0]! + covariance[1]![1]! * axis[1]! + covariance[1]![2]! * axis[2]!,
-          covariance[2]![0]! * axis[0]! + covariance[2]![1]! * axis[1]! + covariance[2]![2]! * axis[2]!,
-        ] as [number, number, number];
-        const norm = Math.hypot(...next);
-        if (norm < 1e-12) return null;
-        axis = next.map((value) => value / norm) as [number, number, number];
-      }
-      // Orient away from the pivot so the axial projection is positive toward the muzzle.
-      const centroidVector = centroid.map((value, axis2) => value - pivot[axis2]!) as [number, number, number];
-      if (centroidVector[0]! * axis[0]! + centroidVector[1]! * axis[1]! + centroidVector[2]! * axis[2]! < 0) axis = axis.map((value) => -value) as [number, number, number];
-      let length = 0;
-      let radialExtent = 0;
-      for (const point of points) {
-        const d = [point[0]! - pivot[0]!, point[1]! - pivot[1]!, point[2]! - pivot[2]!];
-        const axial = d[0]! * axis[0]! + d[1]! * axis[1]! + d[2]! * axis[2]!;
-        if (axial > length) length = axial;
-        const radial = Math.sqrt(Math.max(d[0]! * d[0]! + d[1]! * d[1]! + d[2]! * d[2]! - axial * axial, 0));
-        if (radial > radialExtent) radialExtent = radial;
-      }
-      return { pivot, axis, length, radialExtent };
-    };
+    const gunMetrics = (snapshot: SceneSnapshot) => measureGunGeometry(snapshot);
     const expectedGun = gunMetrics(oracle); const actualGun = gunMetrics(candidate);
     const originError = expectedGun && actualGun ? Math.hypot(...expectedGun.pivot.map((value, axis) => value - actualGun.pivot[axis]!)) : Number.POSITIVE_INFINITY;
     const axisCosine = expectedGun && actualGun ? Math.abs(expectedGun.axis.reduce((sum, value, axis) => sum + value * actualGun.axis[axis]!, 0)) : -1;

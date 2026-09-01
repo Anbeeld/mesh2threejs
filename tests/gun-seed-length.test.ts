@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as THREE from "three";
 import { buildGunSeed } from "../src/core/derive.js";
+import { measureGunGeometry } from "../src/core/gun-metrics.js";
 import { snapshotScene } from "../src/index.js";
 import { sceneToGlb } from "./helpers/tank-fixtures.js";
 import type { SceneSnapshot } from "../src/types.js";
@@ -48,7 +49,12 @@ function seedTubeMetrics(snapshot: SceneSnapshot): { maxLength: number; maxRadia
     const d = [positions[i]! - centroid[0]!, positions[i + 1]! - centroid[1]!, positions[i + 2]! - centroid[2]!];
     for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) covariance[a]![b]! += d[a]! * d[b]!;
   }
-  let axis: [number, number, number] = [0, 0, 1];
+  // Start from the covariance diagonal: a fixed start vector parallel to a non-dominant
+  // eigenvector (the tube is exactly symmetric about z) is a fixed point of the iteration.
+  const diagonalNorm = Math.hypot(covariance[0]![0]!, covariance[1]![1]!, covariance[2]![2]!);
+  let axis: [number, number, number] = diagonalNorm > 1e-12
+    ? [covariance[0]![0]! / diagonalNorm, covariance[1]![1]! / diagonalNorm, covariance[2]![2]! / diagonalNorm]
+    : [0, 0, 1];
   for (let iteration = 0; iteration < 64; iteration += 1) {
     const next: [number, number, number] = [
       covariance[0]![0]! * axis[0]! + covariance[0]![1]! * axis[1]! + covariance[0]![2]! * axis[2]!,
@@ -123,5 +129,39 @@ describe("tessellation-invariant gun seed", () => {
       maxDistance = Math.max(maxDistance, Math.hypot(seedPositions[i]!, seedPositions[i + 1]!, seedPositions[i + 2]!));
     }
     expect(maxDistance).toBeGreaterThan(3.9);
+  });
+
+  it("keeps identical metrics under uneven tessellation density along the axis", async () => {
+    // Rear half tessellated as a 24-gon, front half as a 6-gon at a different ring phase:
+    // triangle density varies 4x along the barrel. A vertex-count covariance weights the
+    // dense half by its triangle count; the area-weighted surface covariance weights by
+    // physical area, so the axis, length, and radial extent must match the uniform barrel.
+    const rear = new THREE.CylinderGeometry(0.11, 0.11, 1.6, 24, 1, false, 0.4);
+    const front = new THREE.CylinderGeometry(0.11, 0.11, 1.6, 6, 1, false, 1.3);
+    for (const g of [rear, front]) { g.rotateZ(Math.PI / 2); }
+    rear.translate(0.8, 0, 0);
+    front.translate(2.4, 0, 0);
+    const merged = new THREE.BufferGeometry();
+    const ra = rear.toNonIndexed().getAttribute("position") as THREE.BufferAttribute;
+    const fa = front.toNonIndexed().getAttribute("position") as THREE.BufferAttribute;
+    const all = new Float32Array(ra.array.length + fa.array.length);
+    all.set(ra.array as Float32Array, 0);
+    all.set(fa.array as Float32Array, ra.array.length);
+    merged.setAttribute("position", new THREE.BufferAttribute(all, 3));
+    const mesh = new THREE.Mesh(merged, new THREE.MeshStandardMaterial());
+    mesh.name = "gun"; mesh.userData.semanticId = "gun";
+    const pivot = new THREE.Group(); pivot.name = "gun-pivot"; pivot.userData.semanticId = "gun-pivot";
+    pivot.position.set(0, 0, 0); pivot.add(mesh);
+    const root = new THREE.Group(); root.name = "tank"; root.add(pivot);
+    const snap = snapshotScene(root) as unknown as SceneSnapshot;
+    const metrics = measureGunGeometry(snap);
+    expect(metrics, "uneven barrel is measurable").not.toBeNull();
+    const dot = metrics!.axis[0]!;
+    expect(dot, "axis stays on x under 4x density gradient").toBeGreaterThan(0.999);
+    expect(metrics!.length).toBeCloseTo(3.2, 2);
+    expect(metrics!.radialExtent).toBeCloseTo(0.11, 2);
+    const seedMetrics = seedTubeMetrics(snap);
+    expect(seedMetrics.maxLength).toBeCloseTo(3.2, 2);
+    expect(seedMetrics.axis[0]!).toBeGreaterThan(0.999);
   });
 });

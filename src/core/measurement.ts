@@ -320,7 +320,36 @@ export function measureSectionSegments(snapshot: SceneSnapshot, request: Section
         const axes = [0, 1, 2].filter((value) => value !== axis);
         return [point[axes[0]!]!, point[axes[1]!]!];
       };
-      segments.push([project(unique[0]!), project(unique[1]!)]);
+      let start2 = project(unique[0]!);
+      let end2 = project(unique[1]!);
+      // Direct the segment along planeNormal × triangleNormal. For a consistently oriented
+      // surface this orients every section loop identically (the orientation the plane cuts
+      // into the surface), which is what the nonzero winding fill requires. Edge-order alone
+      // is NOT loop-consistent: the two triangles of one cut face can emit opposite
+      // directions, zeroing the winding everywhere. The even-odd rule sorts crossings and is
+      // direction-insensitive, so this reorientation cannot change existing parity results.
+      const [a, b, c] = triangle.points;
+      const e1: Point3 = [b[0]! - a[0]!, b[1]! - a[1]!, b[2]! - a[2]!];
+      const e2: Point3 = [c[0]! - a[0]!, c[1]! - a[1]!, c[2]! - a[2]!];
+      const n: Point3 = [
+        e1[1]! * e2[2]! - e1[2]! * e2[1]!,
+        e1[2]! * e2[0]! - e1[0]! * e2[2]!,
+        e1[0]! * e2[1]! - e1[1]! * e2[0]!,
+      ];
+      const planeNormal: Point3 = axis === 0 ? [1, 0, 0] : axis === 1 ? [0, 1, 0] : [0, 0, 1];
+      const d: Point3 = [
+        planeNormal[1]! * n[2]! - planeNormal[2]! * n[1]!,
+        planeNormal[2]! * n[0]! - planeNormal[0]! * n[2]!,
+        planeNormal[0]! * n[1]! - planeNormal[1]! * n[0]!,
+      ];
+      const dp = project(d);
+      const seg: Point2 = [end2[0]! - start2[0]!, end2[1]! - start2[1]!];
+      if (dp[0]! * seg[0]! + dp[1]! * seg[1]! < 0) {
+        const tmp = start2;
+        start2 = end2;
+        end2 = tmp;
+      }
+      segments.push([start2, end2]);
     }
   });
   return segments;
@@ -331,9 +360,11 @@ export interface SectionContour {
   max: Point2;
   width: number;
   height: number;
-  /** Even-odd filled occupancy mask over a regular width×height grid spanning [min, max]. */
+  /** Filled occupancy mask over a regular width×height grid spanning [min, max]. */
   mask: Uint8Array;
 }
+
+export type SectionFillRule = "even-odd" | "winding";
 
 function contourCell(contour: SectionContour, u: number, v: number): boolean {
   const column = Math.min(contour.width - 1, Math.max(0, Math.floor(u * contour.width)));
@@ -360,11 +391,22 @@ function contourBandWidths(contour: SectionContour): { w: number; h: number; upp
 }
 
 /**
- * Rasterizes intersection segments into a deterministic occupancy mask using even-odd row
- * filling. Closed surface intersections fill correctly regardless of how many disjoint loops
- * or joined components cross the plane. Returns null when the plane has insufficient evidence.
+ * Rasterizes intersection segments into a deterministic occupancy mask. Two fill rules:
+ *
+ * - "even-odd" (default): pairs sorted crossings per pixel row. Correct for nested shells,
+ *   but DESTROYS area where plate cross-sections overlap (two overlapping plates cross a row
+ *   four times; parity cancels the overlap to empty). Kept as the default for callers whose
+ *   meshes are not consistently oriented.
+ * - "winding": nonzero winding rule over the directed intersection segments. Segment
+ *   direction is inherited from triangle orientation (measureSectionSegments preserves edge
+ *   order), so overlapping material winds to ≥1 and stays filled — the union of plate
+ *   material — while a properly oriented interior cavity (opposite winding) stays empty.
+ *   This is the polygon-union semantics the hull exterior-boundary metric needs, computed
+ *   BEFORE any largest-component or parity post-processing can destroy area.
+ *
+ * Returns null when the plane has insufficient evidence.
  */
-export function sectionContourFromSegments(segments: Array<[Point2, Point2]>, resolution = 96): SectionContour | null {
+export function sectionContourFromSegments(segments: Array<[Point2, Point2]>, resolution = 96, fillRule: SectionFillRule = "even-odd"): SectionContour | null {
   if (segments.length < 3 || resolution < 8) return null;
   const min: Point2 = [Infinity, Infinity];
   const max: Point2 = [-Infinity, -Infinity];
@@ -378,27 +420,56 @@ export function sectionContourFromSegments(segments: Array<[Point2, Point2]>, re
   const width = Math.max(4, Math.ceil(spanU * scale));
   const height = Math.max(4, Math.ceil(spanV * scale));
   const mask = new Uint8Array(width * height);
-  // Dense segment sampling plus even-odd parity per pixel-row center.
+  // Dense segment sampling plus parity/winding per pixel-row center.
   const samplesPerSegment = 24;
   for (let row = 0; row < height; row += 1) {
     const v = min[1]! + ((row + 0.5) / height) * spanV;
-    const crossings: number[] = [];
-    for (const [start, end] of segments) {
-      const v0 = start[1];
-      const v1 = end[1];
-      if ((v0! <= v && v1! > v) || (v1! <= v && v0! > v)) {
-        const t = (v - v0!) / (v1! - v0!);
-        crossings.push(start[0]! + (end[0]! - start[0]!) * t);
+    if (fillRule === "winding") {
+      // Nonzero winding: collect directed crossings (upward = +1, downward = -1), sweep left
+      // to right, and fill exactly the cells where the running winding number is nonzero.
+      const crossings: Array<{ u: number; direction: 1 | -1 }> = [];
+      for (const [start, end] of segments) {
+        const v0 = start[1];
+        const v1 = end[1];
+        if ((v0! <= v && v1! > v) || (v1! <= v && v0! > v)) {
+          const t = (v - v0!) / (v1! - v0!);
+          crossings.push({ u: start[0]! + (end[0]! - start[0]!) * t, direction: v1! > v0! ? 1 : -1 });
+        }
       }
-    }
-    if (!crossings.length) continue;
-    crossings.sort((a, b) => a - b);
-    for (let index = 0; index + 1 < crossings.length; index += 2) {
-      const from = crossings[index]!;
-      const to = crossings[index + 1]!;
-      const cellFrom = Math.max(0, Math.floor(((from - min[0]!) / spanU) * width));
-      const cellTo = Math.min(width - 1, Math.ceil(((to - min[0]!) / spanU) * width) - 1);
-      for (let column = cellFrom; column <= cellTo; column += 1) mask[row * width + column] = 1;
+      if (!crossings.length) continue;
+      crossings.sort((a, b) => a.u - b.u);
+      let winding = 0;
+      let from: number | null = null;
+      for (const crossing of crossings) {
+        const previous = winding;
+        winding += crossing.direction;
+        if (previous === 0 && winding !== 0) from = crossing.u;
+        else if (previous !== 0 && winding === 0 && from !== null) {
+          const cellFrom = Math.max(0, Math.floor(((from - min[0]!) / spanU) * width));
+          const cellTo = Math.min(width - 1, Math.ceil(((crossing.u - min[0]!) / spanU) * width) - 1);
+          for (let column = cellFrom; column <= cellTo; column += 1) mask[row * width + column] = 1;
+          from = null;
+        }
+      }
+    } else {
+      const crossings: number[] = [];
+      for (const [start, end] of segments) {
+        const v0 = start[1];
+        const v1 = end[1];
+        if ((v0! <= v && v1! > v) || (v1! <= v && v0! > v)) {
+          const t = (v - v0!) / (v1! - v0!);
+          crossings.push(start[0]! + (end[0]! - start[0]!) * t);
+        }
+      }
+      if (!crossings.length) continue;
+      crossings.sort((a, b) => a - b);
+      for (let index = 0; index + 1 < crossings.length; index += 2) {
+        const from = crossings[index]!;
+        const to = crossings[index + 1]!;
+        const cellFrom = Math.max(0, Math.floor(((from - min[0]!) / spanU) * width));
+        const cellTo = Math.min(width - 1, Math.ceil(((to - min[0]!) / spanU) * width) - 1);
+        for (let column = cellFrom; column <= cellTo; column += 1) mask[row * width + column] = 1;
+      }
     }
   }
   // Boundary reinforcement keeps thin features visible at low resolution.

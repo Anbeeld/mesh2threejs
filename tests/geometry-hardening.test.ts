@@ -57,6 +57,19 @@ describe("principal-plane fidelity", () => {
     expect(report.rows.find((item) => item.code === "hull.planes")?.passed).toBe(false);
   });
 
+  test("hull-* accessory plates do not leak into the hull.planes target (canonical-major-mass scoping)", () => {
+    // Oracle carries an extra angled plate under a hull-fender semantic. The principal-plane
+    // metric measures the CANONICAL hull only: accessory plates must neither add target planes
+    // to the oracle nor fail a candidate that faithfully reproduces the canonical hull.
+    const oracleRoot = createSlopedTank();
+    oracleRoot.add(semanticMesh("hull-fender", new THREE.BoxGeometry(0.7, 0.05, 2.2), [1.85, 0.9, 0.2]));
+    oracleRoot.children[oracleRoot.children.length - 1]!.rotation.z = 0.35;
+    const candidate = snapshotScene(createSlopedTank());
+    const report = evaluateTankProfile(snapshotScene(oracleRoot), candidate, { certification: "oracle-relative" });
+    const row = report.rows.find((item) => item.code === "hull.planes");
+    expect(row?.passed, "canonical hull planes match despite differing accessories").toBe(true);
+  });
+
   test("front/rear Y/Z slopes alone are detected without involving the X axis", () => {
     const oracle = snapshotScene(createSlopedTank());
     // Replace the sloped hull with an AABB-matched rectangular prism built from custom triangles.

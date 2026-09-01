@@ -29,6 +29,7 @@ import {
   type DerivationManifest,
 } from "./derivation.js";
 import { applyRepairSpec, validateRepairSpec, type DerivedRepairSpec } from "./repair-spec.js";
+import { measureGunGeometry } from "./gun-metrics.js";
 import { assertAssemblyCoverage } from "./assembly.js";
 import { phaseOwnedSemantics } from "./phase-compose.js";
 import type { GenericSubjectContract } from "../profiles/generic.js";
@@ -663,46 +664,26 @@ export function buildGunSeed(snapshot: SceneSnapshot, keepTargets: ReadonlySet<s
       ]);
     }
   }
-  const distanceFromPivot = (point: Point3): number => Math.hypot(point[0] - pivotOrigin[0], point[1] - pivotOrigin[1], point[2] - pivotOrigin[2]);
-  const muzzle = points.reduce((best, point) => distanceFromPivot(point) > distanceFromPivot(best) ? point : best, points[0]!);
-  const vector = muzzle.map((value, axis) => value - pivotOrigin[axis]!) as Point3;
-  // The fitted barrel must reproduce the oracle's measured muzzle vertex EXACTLY while keeping
-  // the oracle barrel's axis-aligned envelope (style.envelope compares axis-aligned bounds).
-  // Decompose the muzzle vector against the barrel axis from the center projection: the axial
-  // component becomes the tube length and the perpendicular component becomes the tube radius,
-  // so with the ring phase aimed along that perpendicular (below) the segment-0 rim corner is
-  // the muzzle vertex itself. A center×2 length is biased short for meshes whose bounds center
-  // is pulled off the barrel line (27.8% on the T-34-85 oracle); a muzzle-DIRECTION axis is
-  // tilted by the muzzle corner's radial offset, which blew the gun style envelope (0.21).
-  const centerVector = gun.bounds.center.map((value, axis) => value - pivotOrigin[axis]!) as Point3;
-  const centerDistance = Math.max(Math.hypot(...centerVector), 1e-9);
-  const direction = centerVector.map((value) => value / centerDistance) as Point3;
-  const muzzleDot = vector[0]! * direction[0]! + vector[1]! * direction[1]! + vector[2]! * direction[2]!;
-  const muzzlePerpVector = vector.map((value, axis) => value - direction[axis]! * muzzleDot) as Point3;
-  const muzzlePerpLength = Math.hypot(...muzzlePerpVector);
-  const length = Math.max(muzzleDot, 1e-3);
-  const radii = points.filter((_, index) => index % 16 === 0).map((point) => {
-    const dx = point[0] - pivotOrigin[0]; const dy = point[1] - pivotOrigin[1]; const dz = point[2] - pivotOrigin[2];
-    const along = dx * direction[0]! + dy * direction[1]! + dz * direction[2]!;
-    return Math.sqrt(Math.max(dx * dx + dy * dy + dz * dz - along * along, 0));
-  }).sort((a, b) => a - b);
-  const radius = muzzlePerpLength > 1e-6
-    ? Math.max(muzzlePerpLength, 1e-3)
-    : Math.max(radii[Math.floor(radii.length * 0.8)] ?? 0.1, 1e-3);
+  // Mirror gun.geometry's tessellation-invariant barrel metric through the SHARED helper
+  // (core/gun-metrics.ts): area-weighted surface PCA for the axis, maximum axial projection
+  // for the length, maximum perpendicular extent for the radius. Both evaluator and seed
+  // builder call the same helper so they cannot drift. No farthest-vertex muzzle, ring-phase
+  // alignment, or seat correction is needed: an N-sided tube along the PCA axis with this
+  // length and radius measures identically regardless of angular phase or radial segments.
+  const metrics = measureGunGeometry(snapshot);
+  if (!metrics) throw new Error("prepared oracle gun geometry could not be measured for the axis-fit seed");
+  const direction = metrics.axis;
+  const length = Math.max(metrics.length, 1e-3);
+  const radius = Math.max(metrics.radialExtent, 1e-3);
   const segments = 10;
   const helper: Point3 = Math.abs(direction[1]!) > 0.95 ? [1, 0, 0] : [0, 1, 0];
-  // Ring phase: the segment-0 rim corner points along the muzzle's perpendicular direction so
-  // that corner coincides with the measured muzzle vertex (axial length + perpendicular radius).
   const sideRaw: Point3 = [
     direction[1]! * helper[2]! - direction[2]! * helper[1]!,
     direction[2]! * helper[0]! - direction[0]! * helper[2]!,
     direction[0]! * helper[1]! - direction[1]! * helper[0]!,
   ];
   const sideLength = Math.hypot(...sideRaw) || 1;
-  const sideBase = sideRaw.map((value) => value / sideLength) as Point3;
-  const side = muzzlePerpLength > 1e-9
-    ? muzzlePerpVector.map((value) => value / muzzlePerpLength) as Point3
-    : sideBase;
+  const side = sideRaw.map((value) => value / sideLength) as Point3;
   const secondRaw: Point3 = [
     direction[1]! * side[2]! - direction[2]! * side[1]!,
     direction[2]! * side[0]! - direction[0]! * side[2]!,
@@ -712,8 +693,8 @@ export function buildGunSeed(snapshot: SceneSnapshot, keepTargets: ReadonlySet<s
   const second = secondRaw.map((value) => value / secondLength) as Point3;
   const world: number[] = [];
   const indices: number[] = [];
-  // Tube spans [0, axialLength]: the segment-0 end-ring corner (axial length, perpendicular
-  // radius) IS the measured muzzle vertex, so gun.geometry measures it exactly.
+  // Tube spans [0, L] axially: the end ring sits at the maximum axial projection that
+  // gun.geometry measures as the barrel length.
   const endAlong = length;
   for (let ring = 0; ring < 2; ring += 1) {
     const along = ring * endAlong;
