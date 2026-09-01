@@ -193,7 +193,138 @@ function hullOrientationRows(oracle: SceneSnapshot, candidate: SceneSnapshot): G
   };
 }
 
-function hullSectionsRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
+/**
+ * Exterior-boundary section contour (audit item 4): rasterizes the section, keeps only the
+ * largest connected cell component (dropping nested/internal loops and parity speckle),
+ * traces its outer boundary with marching squares, and refills that single outer loop.
+ * The result encodes the exterior macro cross-section — the same external armor boundary
+ * produces the same mask whether the source is one watertight shell or overlapping plates
+ * with nested interior shells.
+ */
+function exteriorBoundaryContour(masked: { mask: Uint8Array; width: number; height: number; min: [number, number]; max: [number, number] }): { mask: Uint8Array; width: number; height: number; min: [number, number]; max: [number, number] } | null {
+  const { width, height } = masked;
+  const seen = new Uint8Array(width * height);
+  let largest: Uint8Array | null = null;
+  let largestSize = 0;
+  for (let startCell = 0; startCell < width * height; startCell++) {
+    if (masked.mask[startCell] !== 1 || seen[startCell]) continue;
+    const queue = [startCell];
+    seen[startCell] = 1;
+    const cells: number[] = [];
+    while (queue.length) {
+      const cell = queue.pop()!;
+      cells.push(cell);
+      const col = cell % width, row = Math.floor(cell / width);
+      for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+        const c2 = col + dc, r2 = row + dr;
+        if (c2 < 0 || r2 < 0 || c2 >= width || r2 >= height) continue;
+        const index = r2 * width + c2;
+        if (masked.mask[index] === 1 && !seen[index]) { seen[index] = 1; queue.push(index); }
+      }
+    }
+    if (cells.length > largestSize) {
+      largestSize = cells.length;
+      const own = new Uint8Array(width * height);
+      for (const cell of cells) own[cell] = 1;
+      largest = own;
+    }
+  }
+  if (!largest || largestSize < width * height * 0.01) return null;
+  // Marching squares (y-up corrected) on the padded grid; keep the longest loop.
+  const pw = width + 2, ph = height + 2;
+  const padded = new Uint8Array(pw * ph);
+  for (let row = 0; row < height; row++) for (let col = 0; col < width; col++) padded[(row + 1) * pw + (col + 1)] = largest![row * width + col]!;
+  const at = (col: number, row: number): boolean => col >= 0 && row >= 0 && col < pw && row < ph && padded[row * pw + col] === 1;
+  type Seg = { from: [number, number]; to: [number, number] };
+  const segments: Seg[] = [];
+  const key = (p: [number, number]): string => `${p[0]}|${p[1]}`;
+  for (let row = -1; row + 1 < ph; row++) {
+    for (let col = -1; col + 1 < pw; col++) {
+      const tl = at(col, row + 1), tr = at(col + 1, row + 1), bl = at(col, row), br = at(col + 1, row);
+      const idx = (tl ? 1 : 0) | (tr ? 2 : 0) | (bl ? 4 : 0) | (br ? 8 : 0);
+      const top: [number, number] = [col + 0.5, row + 1];
+      const bottom: [number, number] = [col + 0.5, row];
+      const left: [number, number] = [col, row + 0.5];
+      const right: [number, number] = [col + 1, row + 0.5];
+      const push = (from: [number, number], to: [number, number]): void => { segments.push({ from, to }); };
+      switch (idx) {
+        case 1: push(left, top); break;
+        case 2: push(top, right); break;
+        case 3: push(left, right); break;
+        case 4: push(bottom, left); break;
+        case 5: push(bottom, top); break;
+        case 6: push(top, right); push(bottom, left); break;
+        case 7: push(bottom, right); break;
+        case 8: push(right, bottom); break;
+        case 9: push(left, top); push(right, bottom); break;
+        case 10: push(top, bottom); break;
+        case 11: push(left, bottom); break;
+        case 12: push(right, left); break;
+        case 13: push(right, top); break;
+        case 14: push(top, left); break;
+        default: break;
+      }
+    }
+  }
+  const outgoing = new Map<string, Seg[]>();
+  for (const seg of segments) {
+    const list = outgoing.get(key(seg.from));
+    if (list) list.push(seg);
+    else outgoing.set(key(seg.from), [seg]);
+  }
+  const used = new Set<Seg>();
+  let bestLoop: Array<[number, number]> = [];
+  let bestArea = -1;
+  for (const seg of segments) {
+    if (used.has(seg)) continue;
+    const loop: Array<[number, number]> = [seg.from];
+    let current = seg;
+    used.add(current);
+    let incoming: [number, number] = [current.to[0]! - current.from[0]!, current.to[1]! - current.from[1]!];
+    for (let step = 0; step < segments.length + 4; step++) {
+      loop.push(current.to);
+      if (current.to[0] === seg.from[0] && current.to[1] === seg.from[1]) break;
+      const candidates = (outgoing.get(key(current.to)) ?? []).filter((cand) => !used.has(cand));
+      if (!candidates.length) break;
+      let best = candidates[0]!, bestScore = -Infinity;
+      for (const cand of candidates) {
+        const dx = cand.to[0]! - cand.from[0]!, dy = cand.to[1]! - cand.from[1]!;
+        const cross = incoming[0]! * dy - incoming[1]! * dx;
+        if (cross > bestScore) { bestScore = cross; best = cand; }
+      }
+      incoming = [best.to[0]! - best.from[0]!, best.to[1]! - best.from[1]!];
+      current = best;
+      used.add(current);
+    }
+    let area = 0;
+    for (let i = 0; i < loop.length; i++) { const a2 = loop[i]!, b2 = loop[(i + 1) % loop.length]!; area += a2[0]! * b2[1]! - b2[0]! * a2[1]!; }
+    area = Math.abs(area) / 2;
+    if (area > bestArea) { bestArea = area; bestLoop = loop; }
+  }
+  if (bestLoop.length < 4) return null;
+  // Refill the single outer loop on the original grid (cell-center sampling).
+  const spanU = masked.max[0]! - masked.min[0]!, spanV = masked.max[1]! - masked.min[1]!;
+  const world = bestLoop.map(([cu, cv]) => [masked.min[0]! + ((cu - 1) / width) * spanU, masked.min[1]! + ((cv - 1) / height) * spanV] as [number, number]);
+  const mask = new Uint8Array(width * height);
+  for (let row = 0; row < height; row++) {
+    const v = masked.min[1]! + ((row + 0.5) / height) * spanV;
+    const xs: number[] = [];
+    for (let i = 0; i < world.length; i++) {
+      const a = world[i]!, b = world[(i + 1) % world.length]!;
+      if ((a[1]! <= v && b[1]! > v) || (b[1]! <= v && a[1]! > v)) xs.push(a[0]! + ((v - a[1]!) / (b[1]! - a[1]!)) * (b[0]! - a[0]!));
+    }
+    xs.sort((x, y) => x - y);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const c0 = Math.max(0, Math.floor(((xs[k]! - masked.min[0]!) / spanU) * width));
+      const c1 = Math.min(width - 1, Math.ceil(((xs[k + 1]! - masked.min[0]!) / spanU) * width) - 1);
+      for (let col = c0; col <= c1; col++) mask[row * width + col] = 1;
+    }
+  }
+  return { mask, width, height, min: masked.min, max: masked.max };
+}
+
+
+export function hullSectionsRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateRow {
   const oracleHull = componentsBy(oracle, isHullComponent);
   const candidateHull = componentsBy(candidate, isHullComponent);
   const oracleBounds = boundsOf(oracle, isHullComponent);
@@ -210,10 +341,16 @@ function hullSectionsRow(oracle: SceneSnapshot, candidate: SceneSnapshot): GateR
     const fraction = (index + 0.5) / 14;
     const oracleZ = oracleBounds.min[2] + oracleBounds.size[2] * fraction;
     const candidateZ = candidateBounds.min[2] + candidateBounds.size[2] * fraction;
-    const oSegments = measureSectionSegments(oracle, { axis: "z", position: oracleZ, semanticIds: oracleIds });
-    const cSegments = measureSectionSegments(candidate, { axis: "z", position: candidateZ, semanticIds: candidateIds });
-    const oContour = sectionContourFromSegments(oSegments);
-    const cContour = sectionContourFromSegments(cSegments);
+    // Exterior-boundary metric (audit item 4): sections compare the canonical hull's exterior
+    // macro cross-section. Nested interior shells and plate parity must not change the mask,
+    // so both contours are reduced to their largest-component outer-boundary fill. Curves
+    // (curves.hull) still cover the combined hull/fender assembly for accessory protection.
+    const oSegments = measureSectionSegments(oracle, { axis: "z", position: oracleZ, semanticIds: ["hull"] });
+    const cSegments = measureSectionSegments(candidate, { axis: "z", position: candidateZ, semanticIds: ["hull"] });
+    const oRaw = sectionContourFromSegments(oSegments);
+    const cRaw = sectionContourFromSegments(cSegments);
+    const oContour = oRaw ? exteriorBoundaryContour(oRaw) : null;
+    const cContour = cRaw ? exteriorBoundaryContour(cRaw) : null;
     if (!oContour || !cContour) {
       insufficient.push(`station ${fraction.toFixed(3)}${!oContour ? " oracle" : ""}${!oContour && !cContour ? "+" : ""}${!cContour ? " candidate" : ""}`);
       errors.push(1);
@@ -871,24 +1008,59 @@ export function evaluateTankProfile(oracle: SceneSnapshot, candidate: SceneSnaps
 
   if (want("gun")) {
     const oracleGun = boundsOf(oracle, (component) => component.id === "gun");
+    // Tessellation-invariant barrel metric: the axis is the dominant direction of the gun's
+    // vertex distribution (power-iteration PCA), oriented away from the pivot; the length is
+    // the maximum axial projection from the pivot; the radial extent is reported separately.
+    // Unlike a farthest-vertex "muzzle", none of these depend on which rim corner a barrel
+    // tessellation happens to place where, so 8-, 10-, or 12-sided barrels with any angular
+    // phase measure identically. A genuinely tilted or short barrel still fails.
     const gunMetrics = (snapshot: SceneSnapshot) => {
       const pivot = snapshot.components["gun-pivot"]?.origin;
       const gun = snapshot.components.gun;
       if (!pivot || !gun) return null;
       const points = Array.from(gun.triangleIndices).flatMap((index) => sceneTriangleAt(snapshot, index)?.points ?? []);
-      const muzzle = points.sort((a, b) => Math.hypot(b[0] - pivot[0], b[1] - pivot[1], b[2] - pivot[2]) - Math.hypot(a[0] - pivot[0], a[1] - pivot[1], a[2] - pivot[2]))[0];
-      if (!muzzle) return null;
-      const vector = muzzle.map((value, axis) => value - pivot[axis]!) as [number, number, number];
-      const length = Math.hypot(...vector);
-      return { pivot, muzzle, vector: vector.map((value) => value / Math.max(length, 1e-9)) as [number, number, number], length };
+      if (points.length < 3) return null;
+      const centroid = [0, 1, 2].map((axis) => points.reduce((sum, point) => sum + point[axis]!, 0) / points.length) as [number, number, number];
+      const covariance: number[][] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+      for (const point of points) {
+        const d = [point[0]! - centroid[0]!, point[1]! - centroid[1]!, point[2]! - centroid[2]!];
+        for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) covariance[i]![j]! += d[i]! * d[j]!;
+      }
+      // Power iteration for the dominant eigenvector (barrel centerline direction).
+      let axis: [number, number, number] = [0, 0, 1];
+      for (let iteration = 0; iteration < 64; iteration += 1) {
+        const next = [
+          covariance[0]![0]! * axis[0]! + covariance[0]![1]! * axis[1]! + covariance[0]![2]! * axis[2]!,
+          covariance[1]![0]! * axis[0]! + covariance[1]![1]! * axis[1]! + covariance[1]![2]! * axis[2]!,
+          covariance[2]![0]! * axis[0]! + covariance[2]![1]! * axis[1]! + covariance[2]![2]! * axis[2]!,
+        ] as [number, number, number];
+        const norm = Math.hypot(...next);
+        if (norm < 1e-12) return null;
+        axis = next.map((value) => value / norm) as [number, number, number];
+      }
+      // Orient away from the pivot so the axial projection is positive toward the muzzle.
+      const centroidVector = centroid.map((value, axis2) => value - pivot[axis2]!) as [number, number, number];
+      if (centroidVector[0]! * axis[0]! + centroidVector[1]! * axis[1]! + centroidVector[2]! * axis[2]! < 0) axis = axis.map((value) => -value) as [number, number, number];
+      let length = 0;
+      let radialExtent = 0;
+      for (const point of points) {
+        const d = [point[0]! - pivot[0]!, point[1]! - pivot[1]!, point[2]! - pivot[2]!];
+        const axial = d[0]! * axis[0]! + d[1]! * axis[1]! + d[2]! * axis[2]!;
+        if (axial > length) length = axial;
+        const radial = Math.sqrt(Math.max(d[0]! * d[0]! + d[1]! * d[1]! + d[2]! * d[2]! - axial * axial, 0));
+        if (radial > radialExtent) radialExtent = radial;
+      }
+      return { pivot, axis, length, radialExtent };
     };
     const expectedGun = gunMetrics(oracle); const actualGun = gunMetrics(candidate);
     const originError = expectedGun && actualGun ? Math.hypot(...expectedGun.pivot.map((value, axis) => value - actualGun.pivot[axis]!)) : Number.POSITIVE_INFINITY;
-    const axisCosine = expectedGun && actualGun ? expectedGun.vector.reduce((sum, value, axis) => sum + value * actualGun.vector[axis]!, 0) : -1;
+    const axisCosine = expectedGun && actualGun ? Math.abs(expectedGun.axis.reduce((sum, value, axis) => sum + value * actualGun.axis[axis]!, 0)) : -1;
     const axisError = 1 - axisCosine;
     const lengthError = expectedGun && actualGun ? Math.abs(actualGun.length - expectedGun.length) / Math.max(expectedGun.length, 1e-9) : Number.POSITIVE_INFINITY;
     const gunError = Math.max(originError / Math.max(oracleGun.size[2], 1), axisError, lengthError);
     rows.push({ code: "gun.geometry", phase: "gun", category: "origin-axis-length-muzzle", component: "gun", passed: gunError <= 0.01, score: Number.isFinite(gunError) ? Math.max(0, 100 - gunError * 1000) : 0, severity: "critical", message: `gun origin error ${originError.toFixed(4)}, axis cosine ${axisCosine.toFixed(5)}, length error ${(lengthError * 100).toFixed(2)}%`, ...(expectedGun && actualGun ? { oracleValue: expectedGun.length, candidateValue: actualGun.length, deviation: actualGun.length - expectedGun.length } : {}), normalizedDeviation: gunError, physicalUnit: "object-unit" });
+    const radialError = expectedGun && actualGun ? Math.abs(actualGun.radialExtent - expectedGun.radialExtent) / Math.max(expectedGun.radialExtent, 1e-9) : Number.POSITIVE_INFINITY;
+    rows.push({ code: "gun.radial-extent", phase: "gun", category: "origin-axis-length-muzzle", component: "gun", passed: radialError <= 0.02, score: Number.isFinite(radialError) ? Math.max(0, 100 - radialError * 500) : 0, severity: "major", message: `gun radial extent ${actualGun ? actualGun.radialExtent.toFixed(4) : "n/a"} vs expected ${expectedGun ? expectedGun.radialExtent.toFixed(4) : "n/a"} (${(radialError * 100).toFixed(2)}% error)`, ...(expectedGun && actualGun ? { oracleValue: expectedGun.radialExtent, candidateValue: actualGun.radialExtent, deviation: actualGun.radialExtent - expectedGun.radialExtent } : {}), normalizedDeviation: radialError, physicalUnit: "object-unit" });
     const oracleGunPivot = oracle.components["gun-pivot"];
     const candidateGunPivot = candidate.components["gun-pivot"];
     const poseAvailable = Boolean(oracleGunPivot && candidateGunPivot && oracle.components.gun?.parentSemanticId === "gun-pivot" && candidate.components.gun?.parentSemanticId === "gun-pivot");

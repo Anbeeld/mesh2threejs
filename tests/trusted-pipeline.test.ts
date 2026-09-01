@@ -549,3 +549,37 @@ describe("broker-private trusted execution staging (final closure §12.1)", () =
     }
   }, 180_000);
 });
+
+describe("trusted gate exposes failing evaluator rows (diagnostic opacity)", () => {
+  test("gate response includes phase-scoped evaluator rows alongside contract workorders", async () => {
+    const { broker, builder, runId, root } = await beginRunToDerivedHull();
+    try {
+      // Drive through the hull phase and assert the trusted gate response exposes the
+      // underlying evaluator rows for the active phase (deterministic + style + articulation),
+      // phase-scoped, alongside the aggregate profile-contract workorders. This is the
+      // diagnostic-opacity fix: a failed "runtime evidence floor" wrapper must be traceable
+      // to the actual failing evaluator row via gate.evaluatorRows / gate.failingEvaluatorRows.
+      await mkdir(join(root, "model", "repairs"), { recursive: true });
+      for (const phase of ["hull"] as const) {
+        const status = await builder.status(runId) as { activePhase: string };
+        expect(status.activePhase).toBe(phase);
+        const derived = await builder.derive(runId) as { status: string };
+        expect(derived.status).toBe("seed-passing");
+        const gate = await builder.gate(runId) as {
+          passed: boolean;
+          evaluatorRows?: Array<{ code: string; phase?: string; passed: boolean }>;
+          failingEvaluatorRows?: Array<{ code: string }>;
+        };
+        const evaluatorRows = gate.evaluatorRows ?? [];
+        expect(evaluatorRows.length).toBeGreaterThan(0);
+        // Hull-fidelity rows are present and every exposed row is scoped to the active phase.
+        expect(evaluatorRows.some((row) => row.code.startsWith("hull."))).toBe(true);
+        for (const row of evaluatorRows) expect(row.phase).toBe(phase);
+        expect(gate.passed).toBe(true);
+        await builder.lock(runId);
+      }
+    } finally {
+      await broker.close();
+    }
+  }, 120_000);
+});

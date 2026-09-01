@@ -604,12 +604,23 @@ export class TrustedPipeline {
     await this.commitCanonicalAndMirror(final);
     if (!isGlobal) {
       const activeReport = computation.evaluation.phaseGates[workspace.state.activePhase];
+      // Underlying evaluator rows for the active phase from every evidence source, so a failed
+      // profile-contract wrapper (whose workorders only report an aggregate runtime-evidence
+      // floor) can be traced to the actual failing deterministic/style/articulation rows.
+      const evaluatorRows = [
+        ...(computation.evaluation.deterministic?.rows ?? []),
+        ...(computation.evaluation.style?.rows ?? []),
+        ...(computation.evaluation.articulation?.rows ?? []),
+      ].filter((row) => row.phase === workspace.state.activePhase);
       return {
         profile: computation.evaluation.deterministic.profile,
         activePhase: workspace.state.activePhase,
         passed: outcome.activePhasePassed,
         score: activeReport?.score,
         workorders: activeReport?.workorders,
+        rows: activeReport?.rows ?? [],
+        evaluatorRows,
+        failingEvaluatorRows: evaluatorRows.filter((row) => !row.passed),
         oracleHash: computation.evaluation.oracleHash,
         candidateHash: computation.evaluation.candidateHash,
         note: "active-phase only; use global:true for whole-object diagnostics",
