@@ -30,17 +30,30 @@ export interface GunBarrelMetrics {
   radialExtent: number;
 }
 
+interface SurfaceTriangle {
+  area: number;
+  centroid: [number, number, number];
+  a: [number, number, number];
+  b: [number, number, number];
+  c: [number, number, number];
+}
+
 /**
  * Area-weighted surface covariance of the gun mesh, computed exactly per triangle:
  * for each triangle, A·(c-μ)(c-μ)ᵀ contributes the parallel-axis term and
  * (A/12)·Σᵢ(vᵢ-c)(vᵢ-c)ᵀ the triangle's own second moment about its centroid.
+ * Returns the dominant axis together with the AREA-WEIGHTED surface mean, so the caller's
+ * orientation decision uses the same weighted reference as the axis itself (a raw
+ * duplicated-vertex average would let uneven tessellation flip the sign).
  */
-function surfaceCovarianceAxis(points: Array<[number, number, number]>): [number, number, number] | null {
+function surfaceCovarianceAxis(points: Array<[number, number, number]>): { axis: [number, number, number]; mean: [number, number, number] } | null {
   if (points.length < 3) return null;
   let totalArea = 0;
   let areaTimesCentroid: [number, number, number] = [0, 0, 0];
-  const centroids: Array<[number, number, number]> = [];
-  const areas: number[] = [];
+  // One record per surviving triangle: centroid/area AND its own vertices. Filtering
+  // degenerate triangles into parallel arrays would misalign the second-moment term's vertex
+  // lookup (entry t of a filtered list belongs to a different triangle than points[t*3..]).
+  const triangles: SurfaceTriangle[] = [];
   for (let i = 0; i + 2 < points.length; i += 3) {
     const a = points[i]!, b = points[i + 1]!, c = points[i + 2]!;
     const abx = b[0]! - a[0]!, aby = b[1]! - a[1]!, abz = b[2]! - a[2]!;
@@ -50,24 +63,21 @@ function surfaceCovarianceAxis(points: Array<[number, number, number]>): [number
     if (!(area > 1e-12)) continue;
     const centroid: [number, number, number] = [(a[0]! + b[0]! + c[0]!) / 3, (a[1]! + b[1]! + c[1]!) / 3, (a[2]! + b[2]! + c[2]!) / 3];
     totalArea += area;
-    centroids.push(centroid);
-    areas.push(area);
     areaTimesCentroid[0]! += area * centroid[0]!;
     areaTimesCentroid[1]! += area * centroid[1]!;
     areaTimesCentroid[2]! += area * centroid[2]!;
+    triangles.push({ area, centroid, a, b, c });
   }
   if (!(totalArea > 1e-9)) return null;
   const mean: [number, number, number] = [areaTimesCentroid[0]! / totalArea, areaTimesCentroid[1]! / totalArea, areaTimesCentroid[2]! / totalArea];
   const covariance: number[][] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-  for (let t = 0; t < centroids.length; t += 1) {
-    const area = areas[t]!, c = centroids[t]!;
-    const dc = [c[0]! - mean[0]!, c[1]! - mean[1]!, c[2]! - mean[2]!];
+  for (const { area, centroid, a, b, c } of triangles) {
+    const dc = [centroid[0]! - mean[0]!, centroid[1]! - mean[1]!, centroid[2]! - mean[2]!];
     for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) covariance[i]![j]! += area * dc[i]! * dc[j]!;
     // The triangle's own second moment about its centroid: (A/12)Σᵢ(vᵢ-c)(vᵢ-c)ᵀ.
-    const verts = [points[t * 3]!, points[t * 3 + 1]!, points[t * 3 + 2]!];
     for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) {
       let sum = 0;
-      for (const v of verts) { const dv = [v[0]! - c[0]!, v[1]! - c[1]!, v[2]! - c[2]!]; sum += dv[i]! * dv[j]!; }
+      for (const v of [a, b, c]) { const dv = [v[0]! - centroid[0]!, v[1]! - centroid[1]!, v[2]! - centroid[2]!]; sum += dv[i]! * dv[j]!; }
       covariance[i]![j]! += (area / 12) * sum;
     }
   }
@@ -90,7 +100,7 @@ function surfaceCovarianceAxis(points: Array<[number, number, number]>): [number
     if (!(norm > 1e-12)) return null;
     axis = next.map((value) => value / norm) as [number, number, number];
   }
-  return axis;
+  return { axis, mean };
 }
 
 export function measureGunGeometry(snapshot: SceneSnapshot): GunBarrelMetrics | null {
@@ -107,14 +117,13 @@ export function measureGunGeometry(snapshot: SceneSnapshot): GunBarrelMetrics | 
     }
   }
   if (points.length < 3) return null;
-  const axisOrNull = surfaceCovarianceAxis(points);
-  if (!axisOrNull) return null;
-  let axis = axisOrNull;
-  const centroidVector: Point3 = [
-    points.reduce((sum, p) => sum + p[0]!, 0) / points.length - pivot[0],
-    points.reduce((sum, p) => sum + p[1]!, 0) / points.length - pivot[1],
-    points.reduce((sum, p) => sum + p[2]!, 0) / points.length - pivot[2],
-  ];
+  const measured = surfaceCovarianceAxis(points);
+  if (!measured) return null;
+  let axis = measured.axis;
+  // Orientation against the AREA-WEIGHTED surface mean (the same reference the covariance
+  // uses): a raw duplicated-vertex average would tilt with uneven tessellation and could
+  // flip the axis sign for meshes whose material sits close to the pivot.
+  const centroidVector: Point3 = [measured.mean[0]! - pivot[0], measured.mean[1]! - pivot[1], measured.mean[2]! - pivot[2]];
   if (centroidVector[0]! * axis[0]! + centroidVector[1]! * axis[1]! + centroidVector[2]! * axis[2]! < 0) {
     axis = axis.map((value) => -value) as Point3;
   }

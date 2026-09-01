@@ -165,3 +165,99 @@ describe("tessellation-invariant gun seed", () => {
     expect(seedMetrics.axis[0]!).toBeGreaterThan(0.999);
   });
 });
+
+  it("measures identically when degenerate triangles precede valid ones", async () => {
+    // Degenerate (zero-area) triangles shift nothing: the covariance must keep per-triangle
+    // vertex records aligned, not index a filtered centroid list back into the raw array.
+    const reference = measureGunGeometry(await gunOracleSnapshot(10, 0.6))!;
+    // Same barrel but with a duplicated-degenerate triangle prepended to the geometry.
+    const snap = await gunOracleSnapshot(10, 0.6);
+    const gun = snap.components.gun!;
+    const offset = gun.triangleIndices[0]! * 9;
+    const degenerate = [0, 1, 2].map((v) => [
+      snap.triangleData.positions[offset + v * 3]!,
+      snap.triangleData.positions[offset + v * 3 + 1]!,
+      snap.triangleData.positions[offset + v * 3 + 2]!,
+    ]);
+    // Build a new snapshot whose triangle data prepends a zero-area triangle (same point 3x).
+    const tri = snap.triangleData;
+    const prepended = {
+      ...tri,
+      positions: new Float64Array([...degenerate[0]!, ...degenerate[0]!, ...degenerate[0]!, ...tri.positions]),
+      normals: new Float32Array([...tri.normals.slice(0, 3), ...tri.normals]),
+      // triangleCount lives on the snapshot root; measureGunGeometry reads positions directly.
+      triangleCount: snap.triangleCount + 1,
+    };
+    const patched: SceneSnapshot = { ...snap, triangleData: prepended, components: { ...snap.components, gun: { ...gun, triangleIndices: gun.triangleIndices.map((i) => i + 1) } } };
+    const withDegenerate = measureGunGeometry(patched);
+    expect(withDegenerate, "degenerate triangle does not break measurement").not.toBeNull();
+    expect(withDegenerate!.length).toBeCloseTo(reference!.length, 6);
+    expect(withDegenerate!.radialExtent).toBeCloseTo(reference!.radialExtent, 6);
+    const dot = withDegenerate!.axis.reduce((sum, v, a) => sum + v * reference!.axis[a]!, 0);
+    expect(dot).toBeGreaterThan(0.999999);
+  });
+
+  it("keeps the axis stable under different tessellations of an off-axis asymmetric surface", async () => {
+    // A thin barrel along +x with a small dense-tessellated breech lump offset in +y.
+    // The lump is 4% of the surface area but, tessellated 40x denser, a VERTEX-COUNT PCA
+    // would rotate the axis toward it; the area-weighted covariance must not move.
+    const build = (breechSegments: number) => {
+      const barrel = new THREE.CylinderGeometry(0.09, 0.09, 3.0, 10, 1, false, 0.7);
+      barrel.rotateZ(Math.PI / 2);
+      barrel.translate(1.7, 0, 0);
+      const breech = new THREE.SphereGeometry(0.3, breechSegments, Math.max(4, Math.floor(breechSegments / 2)));
+      breech.translate(0.35, 0.09, 0);
+      const merged = new THREE.BufferGeometry();
+      const pb = barrel.toNonIndexed().getAttribute("position") as THREE.BufferAttribute;
+      const pq = breech.toNonIndexed().getAttribute("position") as THREE.BufferAttribute;
+      const all = new Float32Array(pb.array.length + pq.array.length);
+      all.set(pb.array as Float32Array, 0);
+      all.set(pq.array as Float32Array, pb.array.length);
+      merged.setAttribute("position", new THREE.BufferAttribute(all, 3));
+      const mesh = new THREE.Mesh(merged, new THREE.MeshStandardMaterial());
+      mesh.name = "gun"; mesh.userData.semanticId = "gun";
+      const pivot = new THREE.Group(); pivot.name = "gun-pivot"; pivot.userData.semanticId = "gun-pivot";
+      pivot.position.set(0, 0, 0); pivot.add(mesh);
+      const root = new THREE.Group(); root.name = "tank"; root.add(pivot);
+      return snapshotScene(root) as unknown as SceneSnapshot;
+    };
+    // Same physical surface: coarse (6x4) vs fine (64x40) breech tessellation.
+    const coarse = measureGunGeometry(build(6))!;
+    const fine = measureGunGeometry(build(64))!;
+    // Area-weighted axis is stable across the 36x tessellation-density change.
+    const dot = coarse.axis.reduce((sum, v, a) => sum + v * fine.axis[a]!, 0);
+    expect(dot, "axis stable under breech tessellation density").toBeGreaterThan(0.9999);
+    expect(Math.abs(coarse.length - fine.length)).toBeLessThan(0.05);
+    expect(Math.abs(coarse.radialExtent - fine.radialExtent)).toBeLessThan(0.02);
+    // Teeth: a plain VERTEX-COUNT PCA (the pre-fix approach) measurably rotates under the
+    // same density change, proving this regression discriminates the two estimators.
+    const vertexCountAxis = (snap: SceneSnapshot): [number, number, number] => {
+      const verts: Array<[number, number, number]> = [];
+      for (const i of snap.components.gun!.triangleIndices) {
+        for (let v = 0; v < 3; v++) {
+          verts.push([snap.triangleData.positions[i * 9 + v * 3]!, snap.triangleData.positions[i * 9 + v * 3 + 1]!, snap.triangleData.positions[i * 9 + v * 3 + 2]!]);
+        }
+      }
+      const centroid = [0, 0, 0];
+      for (const p of verts) { centroid[0]! += p[0]! / verts.length; centroid[1]! += p[1]! / verts.length; centroid[2]! += p[2]! / verts.length; }
+      const cov: number[][] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+      for (const p of verts) { const d = [p[0]! - centroid[0]!, p[1]! - centroid[1]!, p[2]! - centroid[2]!]; for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) cov[a]![b]! += d[a]! * d[b]!; }
+      const dn = Math.hypot(cov[0]![0]!, cov[1]![1]!, cov[2]![2]!);
+      let ax: [number, number, number] = dn > 1e-12 ? [cov[0]![0]! / dn, cov[1]![1]! / dn, cov[2]![2]! / dn] : [0, 0, 1];
+      for (let it = 0; it < 200; it++) {
+        const n2 = [
+          cov[0]![0]! * ax[0]! + cov[0]![1]! * ax[1]! + cov[0]![2]! * ax[2]!,
+          cov[1]![0]! * ax[0]! + cov[1]![1]! * ax[1]! + cov[1]![2]! * ax[2]!,
+          cov[2]![0]! * ax[0]! + cov[2]![1]! * ax[1]! + cov[2]![2]! * ax[2]!,
+        ];
+        const nn = Math.hypot(...n2);
+        if (!(nn > 1e-12)) break;
+        ax = n2.map((v) => v / nn) as [number, number, number];
+      }
+      return ax;
+    };
+    const coarseVertex = vertexCountAxis(build(6));
+    const fineVertex = vertexCountAxis(build(64));
+    const vertexDot = coarseVertex.reduce((sum, v, a) => sum + v * fineVertex[a]!, 0);
+    expect(vertexDot, "vertex-count PCA measurably rotates under the density change").toBeLessThan(0.9995);
+  });

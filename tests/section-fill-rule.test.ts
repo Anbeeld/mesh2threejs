@@ -61,7 +61,7 @@ describe("section fill rules at segment level (audit item 3)", () => {
     const winding = sectionContourFromSegments(segments, 96, "winding")!;
     expect(filledFraction(winding)).toBeGreaterThan(filledFraction(evenOdd) * 1.15);
     // Winding mask spans the full union width (every column carries fill); parity cannot.
-    const activeColumns = Array.from({ length: winding.width }, (_, c) => {
+    const activeColumns = Array.from({ length: winding.width }, (_, c): number => {
       for (let r = 0; r < winding.height; r++) if (winding.mask[r * winding.width + c] === 1) return 1;
       return 0;
     }).reduce((a, b) => a + b, 0);
