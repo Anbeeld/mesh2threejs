@@ -34,7 +34,7 @@ import { assertAssemblyCoverage } from "./assembly.js";
 import { phaseOwnedSemantics } from "./phase-compose.js";
 import type { GenericSubjectContract } from "../profiles/generic.js";
 import type { TaskState } from "./state.js";
-import type { Bounds3, CandidateRuntime, Point3, ProfileId, SceneSnapshot, Workorder } from "../types.js";
+import type { Bounds3, CandidateRuntime, Point3, ProfileId, SceneComponent, SceneSnapshot, Workorder } from "../types.js";
 
 export type DeriveQuality = "aggressive" | "balanced" | "conservative";
 
@@ -542,6 +542,19 @@ function buildRadialSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTri
 }
 
 /**
+ * Dominant source material for a seed node: the oracle component's own palette, so derived
+ * seeds inherit the source's colors instead of the generic fallback. The palette gate compares
+ * candidate colors against the oracle's per-component colors, and the first entry is the
+ * dominant surface color of the source component.
+ */
+function dominantMaterial(component: SceneComponent): SeedNode["material"] {
+  const colors = component.representation.colors;
+  if (!colors.length) return undefined;
+  const hex = colors[0]!;
+  return { color: [((hex >> 16) & 0xff) / 255, ((hex >> 8) & 0xff) / 255, (hex & 0xff) / 255] };
+}
+
+/**
  * Builds the course-regenerate seed: one continuous low-poly course per measured track,
  * matching the measured envelope (length along Z, height along Y, width along X).
  */
@@ -623,7 +636,8 @@ function buildTrackSeed(snapshot: SceneSnapshot): { nodes: SeedNode[]; inputTria
       indices.push(b0, j0, j1);
       indices.push(b0, j1, b1);
     }
-    nodes.push({ semanticId: component.id, kind: "mesh", role: component.role ?? "track-course", positions: Float32Array.from(positions), indices: Uint32Array.from(indices) });
+    const material = dominantMaterial(component);
+    nodes.push({ semanticId: component.id, kind: "mesh", role: component.role ?? "track-course", positions: Float32Array.from(positions), indices: Uint32Array.from(indices), ...(material ? { material } : {}) });
   }
   return { nodes, inputTriangles };
 }
