@@ -73,9 +73,11 @@ export async function readAuthorSpec(workspaceRoot: string, path: string): Promi
 /**
  * Validates the semantic graph of a full authored composition: every required semantic has
  * exactly one root, parents exist and are legal (a parent must either be a transform-only
- * pivot/group semantic or another authored semantic root), and no cycles exist.
+ * pivot/group semantic, an EXTERNAL pivot semantic declared by the oracle semantic map via
+ * `knownExternalParents`, or another authored semantic root), and no cycles exist. An
+ * unresolvable parent is a clear compile error, never a silently unparented object.
  */
-export function validateAuthoredSemanticGraph(specs: AuthorSpec[]): { ordered: AuthorSpec[]; pivotNestings: Array<readonly [string, string]> } {
+export function validateAuthoredSemanticGraph(specs: AuthorSpec[], knownExternalParents: ReadonlySet<string> = new Set()): { ordered: AuthorSpec[]; pivotNestings: Array<readonly [string, string]> } {
   const byId = new Map<string, AuthorSpec>();
   for (const spec of specs) {
     if (byId.has(spec.semanticId)) throw new ConstructionRoutingError("AUTHOR_SPEC_INVALID", `duplicate authored semantic root: ${spec.semanticId}`);
@@ -86,7 +88,14 @@ export function validateAuthoredSemanticGraph(specs: AuthorSpec[]): { ordered: A
     const parent = spec.parentSemanticId;
     if (!parent) continue;
     const parentSpec = byId.get(parent);
-    if (!parentSpec) continue; // Pivot/anchor semantics may exist in the oracle semantic map without an authored spec.
+    if (!parentSpec) {
+      // External parents must be declared by the live oracle semantic map (trusted input);
+      // a typo degrades into a clearly refused compile, never a silently unparented object.
+      if (!knownExternalParents.has(parent)) {
+        throw new ConstructionRoutingError("AUTHOR_SPEC_INVALID", `authored semantic ${spec.semanticId} names parent "${parent}", which is neither an authored semantic root nor a known oracle pivot semantic`);
+      }
+      continue;
+    }
     if (parentSpec.parentSemanticId === spec.semanticId) throw new ConstructionRoutingError("AUTHOR_SPEC_INVALID", `authored semantic cycle: ${spec.semanticId} <-> ${parent}`);
     if ((parentSpec.kind ?? "mesh-root") !== "group" && parentSpec.parts.length === 0) {
       throw new ConstructionRoutingError("AUTHOR_SPEC_INVALID", `authored parent ${parent} must be a transform-only group or own geometry`);
@@ -155,14 +164,14 @@ export interface AuthoredCompilation {
   compiledGraphHash: string;
 }
 
-export async function compileAuthoredWorkspace(workspaceRoot: string): Promise<AuthoredCompilation> {
+export async function compileAuthoredWorkspace(workspaceRoot: string, options: { knownExternalParents?: ReadonlySet<string> } = {}): Promise<AuthoredCompilation> {
   const discovered = await discoverAuthorSpecs(workspaceRoot);
   if (!discovered.length) {
     throw new ConstructionRoutingError("MODE_REQUIRES_AUTHORED_SPEC", `no authored specs exist under ${AUTHOR_SPEC_DIRECTORY}/; author geometry from measurements, never from source-derived seeds`);
   }
   const specs: AuthorSpec[] = [];
   for (const entry of discovered) specs.push(await readAuthorSpec(workspaceRoot, entry.path));
-  const { ordered, pivotNestings } = validateAuthoredSemanticGraph(specs);
+  const { ordered, pivotNestings } = validateAuthoredSemanticGraph(specs, options.knownExternalParents ?? new Set());
   const modules: AuthoredCompilation["modules"] = [];
   for (const spec of ordered) {
     const compiled = compileAuthorSpec(spec);

@@ -201,9 +201,9 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
           return;
         }
         case "create-workspace-run": {
-          const payload = (request.payload ?? {}) as { workspaceRoot?: string; goal?: string; oraclePath?: string; workspaceId?: string; constructionMode?: "stylized-authored" | "derived-faithful" };
+          const payload = (request.payload ?? {}) as { workspaceRoot?: string; goal?: string; oraclePath?: string; workspaceId?: string; constructionMode?: "stylized-authored" | "derived-faithful"; images?: string[] };
           if (!payload.workspaceRoot || !payload.goal || !payload.oraclePath) throw new Error("create-workspace-run requires payload.workspaceRoot, payload.goal and payload.oraclePath");
-          respond(res, 200, await pipeline.createWorkspaceRun({ workspaceRoot: payload.workspaceRoot, goal: payload.goal, oraclePath: payload.oraclePath, ...(payload.workspaceId ? { workspaceId: payload.workspaceId } : {}), ...(payload.constructionMode ? { constructionMode: payload.constructionMode } : {}) }, capability));
+          respond(res, 200, await pipeline.createWorkspaceRun({ workspaceRoot: payload.workspaceRoot, goal: payload.goal, oraclePath: payload.oraclePath, ...(payload.workspaceId ? { workspaceId: payload.workspaceId } : {}), ...(payload.constructionMode ? { constructionMode: payload.constructionMode } : {}), ...(payload.images?.length ? { images: payload.images } : {}) }, capability));
           return;
         }
         case "status":

@@ -49,10 +49,11 @@ import {
   freezeAuthoring,
   reopenAuthoring,
   recordAuthoringValidation,
+  recordAuthoringReviewReady,
   assertAuthoringEditable,
   type StylizedAuthoringState,
 } from "../core/authoring-state.js";
-import { featurePlanHash } from "../core/authoring-freeze.js";
+import { verifyFreezeCurrent, featurePlanHash } from "../core/authoring-freeze.js";
 import { computeStyleBinding, verifyStyleBindingCurrent, type StyleBinding } from "../core/style-binding.js";
 import { buildReferenceScene, writeReferenceScene, verifyReferenceSceneAlignment } from "../core/reference-scene.js";
 import { buildOracleGuides } from "../core/oracle-guides.js";
@@ -244,7 +245,7 @@ export class TrustedPipeline {
    * workspace. Trusted code routes the profile and computes every policy field — the
    * builder never supplies profile, authorship mode, certification, style, or thresholds.
    */
-  async createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string; constructionMode?: "stylized-authored" | "derived-faithful" }, capability: Capability): Promise<{ runId: string; intake: string }> {
+  async createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string; constructionMode?: "stylized-authored" | "derived-faithful"; images?: string[] }, capability: Capability): Promise<{ runId: string; intake: string }> {
     assertCapability("create-workspace-run", capability);
     const routedProfile = routeSubject(input.goal);
     if (!/^[\w.-]+$/u.test(basename(input.oraclePath)) && !/\.glb$/iu.test(input.oraclePath)) {
@@ -260,6 +261,7 @@ export class TrustedPipeline {
       referenceMode: "copy",
       authorshipMode: "derived",
       ...(input.constructionMode ? { constructionMode: input.constructionMode } : {}),
+      ...(input.images?.length ? { images: input.images } : {}),
     });
     const workspace = await resumeWorkspace(initialized.root);
     if (workspace.state.mirrorOfRun) {
@@ -506,12 +508,15 @@ export class TrustedPipeline {
     await this.assertBindingsCurrent(record, workspace);
     const manifest = await verifyWorkspaceOraclePreparation(workspace);
     const oracle = await loadPreparedOracle(manifest.manifest, workspace.root);
+    const stylizedAudit = effectiveConstructionMode(record.policy.constructionMode) === "stylized-authored"
+      ? { trustedGeneratedModules: await loadTrustedAuthoredModules({ workspaceRoot: workspace.root, authoredBindings: record.embedded.state.authoredBindings ?? {} }) }
+      : await (await import("../core/derive.js")).trustedGeneratedAuditOptions(workspace, manifest.binding.identity);
     const execution = await inspectWorkspaceCandidateViaExecutor({
       workspaceRoot: workspace.root,
       modelEntryPath: workspace.resolved.model,
       boundaryRoot: resolve(workspace.root, "model"),
       poses: [neutralPoseForProfile(workspace.project.profile)],
-      auditOptions: await (await import("../core/derive.js")).trustedGeneratedAuditOptions(workspace, manifest.binding.identity),
+      auditOptions: stylizedAudit,
       trusted: true,
       ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
     });
@@ -543,6 +548,28 @@ export class TrustedPipeline {
     return { record, workspace };
   }
 
+  /**
+   * Shared stylized FROZEN authority precondition (design §19/§33.5): every post-freeze
+   * authority boundary begins by verifying the CURRENT freeze — re-reading the AuthorSpecs,
+   * feature plan, and style input from disk, and requiring the live oracle preparation to
+   * equal the bound one. A directly edited spec without recompile therefore fails closed
+   * (FREEZE_STALE) before any evaluation executes stale generated modules.
+   */
+  private async stylizedFrozenContext(runId: string): Promise<{ record: RunAuthorityRecord; workspace: ResumedWorkspace; freezeId: string }> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    const state = record.embedded.state;
+    const freeze = state.authoring?.freeze;
+    if (!freeze || state.authoring!.status === "authoring") {
+      throw new PipelineError("AUTHORING_FROZEN", `this operation applies to a frozen construction (current authoring status: ${state.authoring?.status ?? "none"})`);
+    }
+    const preparation = await verifyWorkspaceOraclePreparation(workspace);
+    if (preparation.binding.identity !== state.authoring!.oracleBinding) {
+      throw new PipelineError("FREEZE_STALE", "the live oracle preparation differs from the freeze-bound oracle binding; reopen authoring and re-freeze");
+    }
+    await verifyFreezeCurrent(state, workspace.root);
+    return { record, workspace, freezeId: freeze.id };
+  }
+
   /** Reads/computes the style binding when the workspace declares one; null when absent. */
   private async styleBindingFor(workspace: ResumedWorkspace): Promise<StyleBinding | null> {
     try {
@@ -554,7 +581,10 @@ export class TrustedPipeline {
   }
 
   async authorStatus(runId: string): Promise<Record<string, unknown>> {
-    const { record } = await this.stylizedContext(runId);
+    // Read-only status stays available on certified runs (loadRecord refuses them; status
+    // inspection of a certified chain is exactly what a handoff report needs).
+    const record = await this.authority.readRun(runId);
+    this.requireStylizedMode(record);
     const state = record.embedded.state;
     const authoring = state.authoring;
     return {
@@ -595,7 +625,11 @@ export class TrustedPipeline {
     const { record, workspace } = await this.stylizedContext(runId);
     const preparation = await verifyWorkspaceOraclePreparation(workspace);
     assertAuthoringEditable(record.embedded.state);
-    const compilation = await compileAuthoredWorkspace(workspace.root);
+    // External parent authority: the live prepared oracle's semantic map (same canonical
+    // frame the evaluator consumes) declares which non-authored pivots/anchors exist.
+    const oracleScene = await loadPreparedOracle(preparation.manifest, workspace.root);
+    const knownExternalParents = new Set(Object.keys(snapshotScene(oracleScene).components));
+    const compilation = await compileAuthoredWorkspace(workspace.root, { knownExternalParents });
     // Hard architecture boundary (design §16.1): candidate files may never reach oracle data.
     await assertNoOracleReachingCandidateFiles(workspace.root);
     // Persist pipeline-owned generated modules + manifests.
@@ -738,8 +772,11 @@ export class TrustedPipeline {
     if (!styleBinding) throw new PipelineError("STYLE_BINDING_REQUIRED", "missing style binding prevents stylized freeze; register style/references.json and rerun author-compile");
     await verifyStyleBindingCurrent(workspace.root, styleBinding);
     // The frozen compilation must be the CURRENT one: recompile deterministically and verify
-    // the durable bindings still reproduce it.
-    const compilation = await compileAuthoredWorkspace(workspace.root);
+    // the durable bindings still reproduce it. External parent authority comes from the live
+    // prepared oracle semantic map, exactly as at compile time.
+    const frozenOracle = await loadPreparedOracle(preparation.manifest, workspace.root);
+    const frozenExternalParents = new Set(Object.keys(snapshotScene(frozenOracle).components));
+    const compilation = await compileAuthoredWorkspace(workspace.root, { knownExternalParents: frozenExternalParents });
     const bindings: Record<string, AuthoredBinding> = {};
     for (const module of compilation.modules) bindings[`model/.generated-authored/${module.semanticId}.mjs`] = module.binding;
     if (canonicalJson(bindings) !== canonicalJson(state.authoredBindings ?? {})) {
@@ -794,26 +831,26 @@ export class TrustedPipeline {
 
   /** Validate a frozen construction (design §20): deterministic guardrail, not a style optimizer. */
   async validateFrozen(runId: string): Promise<Record<string, unknown>> {
-    const { record, workspace } = await this.stylizedContext(runId);
+    const { record, workspace, freezeId } = await this.stylizedFrozenContext(runId);
     const state = record.embedded.state;
-    if (state.authoring?.status !== "frozen" && state.authoring?.status !== "validated") {
-      throw new PipelineError("FREEZE_STALE", `validation applies to a frozen construction (current: ${state.authoring?.status ?? "none"})`);
-    }
     await verifyAuthoredLineage({
       modelEntryPath: workspace.resolved.model,
       workspaceRoot: workspace.root,
       constructionMode: "stylized-authored",
       authoredBindings: state.authoredBindings ?? {},
     });
+    const runTag = `validate-frozen-${record.runId}-${record.mirrorSequence + 1}`;
     const computation = await computeWorkspaceGate(workspace, {
       isGlobal: true,
       toolchainId: record.toolchain.toolchainId,
       projectPolicyHash: record.projectPolicyHash,
-      artifactRunId: `validate-frozen-${record.runId}-${record.mirrorSequence + 1}`,
+      artifactRunId: runTag,
       trusted: true,
       ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
     });
-    const evidenceDirectory = join(workspace.layout.internal.evidence, `validate-frozen-${record.mirrorSequence + 1}`);
+    // Evidence artifact paths use the SAME tag used for both writing and canonical state
+    // references (the earlier off-by-one pointed state at the previous sequence's directory).
+    const evidenceDirectory = join(workspace.layout.internal.evidence, runTag);
     await mkdir(evidenceDirectory, { recursive: true });
     const recordedArtifacts: EvidenceArtifact[] = [];
     for (const item of computation.artifacts) {
@@ -821,7 +858,7 @@ export class TrustedPipeline {
       await writeFile(artifactPath, `${JSON.stringify(item.artifact, null, 2)}\n`, { flag: "wx" });
       recordedArtifacts.push(item.artifact);
     }
-    const relativePath = (artifact: EvidenceArtifact): string => `.mesh2threejs/evidence/validate-frozen-${record.mirrorSequence}/${artifact.id}.json`;
+    const relativePath = (artifact: EvidenceArtifact): string => `.mesh2threejs/evidence/${runTag}/${artifact.id}.json`;
     const { applyGateEvidence } = await import("../operations/workspace-gate.js");
     const mutated = applyGateEvidence(state, computation, (mutatingState, artifact) => recordEvidenceArtifact(mutatingState, relativePath(artifact), artifact), computation.evaluationIdentity);
     const reportHash = sha256(canonicalJson({
@@ -829,11 +866,10 @@ export class TrustedPipeline {
       score: computation.evaluation.deterministic?.score ?? 0,
       candidateHash: computation.evaluation.candidateHash,
     }));
-    const authoringAfter = recordAuthoringValidation(structuredClone(state), {
-      freezeId: state.authoring!.freeze!.id,
-      reportHash,
-      passed: computation.evaluation.passed,
-    });
+    // Canonical authoritative-evidence lifecycle: candidate identity -> GLOBAL gate evidence
+    // (recordComputedGate, phase null) -> execution authority, exactly like the derived
+    // global replay path. The authoring-lifecycle validation record is derived from the same
+    // trusted computation, never from caller assertions.
     const withCandidate = await this.authority.recordComputedCandidate(runId, {
       candidateHash: computation.evaluation.candidateHash,
       phaseGeometryHashes: computation.evaluation.phaseGeometryHashes,
@@ -845,19 +881,30 @@ export class TrustedPipeline {
       backendId: computation.execution.isolation,
       backendIdentityHash: sha256(canonicalJson({ backendId: computation.execution.isolation })),
     });
+    const gateRecord = await this.authority.recordComputedGate(runId, {
+      phase: null,
+      passed: computation.evaluation.passed,
+      evaluationIdentityHash: computation.evaluationIdentityHash,
+      artifacts: recordedArtifacts,
+      stateAfter: withCandidate.embedded.state,
+    });
+    const authoringAfter = recordAuthoringValidation(gateRecord.embedded.state, {
+      freezeId,
+      reportHash,
+      passed: computation.evaluation.passed,
+    });
     const finalRecord = await this.authority.recordComputedAuthoring(runId, { authoringStateAfter: authoringAfter.authoring! });
     await this.commitCanonicalAndMirror(finalRecord);
     return {
       status: computation.evaluation.passed ? "validated" : "validation-failed",
       passed: computation.evaluation.passed,
       score: computation.evaluation.deterministic?.score ?? 0,
-      freezeId: state.authoring!.freeze!.id,
+      freezeId,
       candidateHash: computation.evaluation.candidateHash,
       reportHash,
       artifacts: recordedArtifacts.map((artifact) => artifact.id),
     };
   }
-
   /** Reopen (design §7.1): back to mutable authoring; invalidates all post-freeze evidence. */
   async reopenAuthoringOp(runId: string, input: { reason: string }): Promise<Record<string, unknown>> {
     await this.stylizedContext(runId);
@@ -1061,8 +1108,33 @@ export class TrustedPipeline {
       throw new PipelineError("PREPARATION_DRIFT", "live oracle preparation differs from the canonical binding; rerun onboard/register");
     }
     const state = record.embedded.state;
-    const unlocked = Object.entries(state.phaseStatus).filter(([phase, status]) => phase !== "final" && phase !== "visual-review" && status !== "passed" && status !== "skipped").map(([phase]) => phase);
-    if (unlocked.length) throw new PipelineError("PHASES_UNLOCKED", `global replay requires all builder phases locked: ${unlocked.join(", ")}`);
+    const stylized = effectiveConstructionMode(record.policy.constructionMode) === "stylized-authored";
+    if (stylized) {
+      // Stylized authority model (design §7/§19): ONE construction freeze replaces per-phase
+      // locks. A fresh replay requires the CURRENT freeze (re-verified from disk) plus a
+      // passing deterministic validation bound to THAT freeze — not phase locks.
+      const freeze = state.authoring?.freeze;
+      if (!freeze || state.authoring!.status === "authoring") {
+        throw new PipelineError("AUTHORING_FROZEN", `global replay requires a frozen construction (current authoring status: ${state.authoring?.status ?? "none"})`);
+      }
+      if (!state.authoring!.validation?.passed || state.authoring!.validation.freezeId !== freeze.id) {
+        throw new PipelineError("VALIDATION_REQUIRED", "global replay requires a passing validate-frozen outcome bound to the current construction freeze");
+      }
+      const preparationCheck = await verifyWorkspaceOraclePreparation(workspace);
+      if (preparationCheck.binding.identity !== state.authoring!.oracleBinding) {
+        throw new PipelineError("FREEZE_STALE", "the live oracle preparation differs from the freeze-bound oracle binding; reopen authoring and re-freeze");
+      }
+      await verifyFreezeCurrent(state, workspace.root);
+      await verifyAuthoredLineage({
+        modelEntryPath: workspace.resolved.model,
+        workspaceRoot: workspace.root,
+        constructionMode: "stylized-authored",
+        authoredBindings: state.authoredBindings ?? {},
+      });
+    } else {
+      const unlocked = Object.entries(state.phaseStatus).filter(([phase, status]) => phase !== "final" && phase !== "visual-review" && status !== "passed" && status !== "skipped").map(([phase]) => phase);
+      if (unlocked.length) throw new PipelineError("PHASES_UNLOCKED", `global replay requires all builder phases locked: ${unlocked.join(", ")}`);
+    }
     if (effectiveConstructionMode(record.policy.constructionMode) === "stylized-authored") {
       await verifyAuthoredLineage({
         modelEntryPath: workspace.resolved.model,
@@ -1163,6 +1235,22 @@ export class TrustedPipeline {
     const record = await this.loadRecord(runId);
     const workspace = await this.loadRunWorkspace(record);
     await this.assertBindingsCurrent(record, workspace);
+    // Stylized review authority (design §23): the packet binds the CURRENT freeze and the
+    // registered style pack, so the human judges style identity against the same immutable
+    // art-direction input the candidate was frozen against.
+    let constructionFreezeId: string | null = null;
+    let styleBindingHash: string | null = null;
+    let stylePackFiles: Array<{ path: string; sha256: string; role: "style-reference" }> = [];
+    if (effectiveConstructionMode(record.policy.constructionMode) === "stylized-authored") {
+      const frozen = await this.stylizedFrozenContext(runId);
+      constructionFreezeId = frozen.freezeId;
+      styleBindingHash = frozen.record.embedded.state.authoring!.styleBinding?.styleBindingHash ?? null;
+      if (!styleBindingHash) throw new PipelineError("STYLE_BINDING_REQUIRED", "stylized review requires the bound style pack; register style references and re-freeze");
+      stylePackFiles = [
+        ...frozen.record.embedded.state.authoring!.styleBinding!.references.map((reference) => ({ path: reference.path, sha256: reference.sha256, role: "style-reference" as const })),
+        ...(frozen.record.embedded.state.authoring!.styleBinding!.briefPath ? [{ path: frozen.record.embedded.state.authoring!.styleBinding!.briefPath!, sha256: frozen.record.embedded.state.authoring!.styleBinding!.styleBriefHash, role: "style-reference" as const }] : []),
+      ];
+    }
     const replay = await this.trustedReplay(runId);
     const fresh = await this.authority.readRun(runId);
     const manifest = await verifyWorkspaceOraclePreparation(workspace);
@@ -1250,7 +1338,12 @@ export class TrustedPipeline {
         ...(regionFile ? [{ path: regionFile.path, sha256: regionFile.sha256, role: "region-diagnostic" }] : []),
       ],
       humanApproval: null,
+      constructionFreezeId,
+      styleBindingHash,
     };
+    // Style-pack files join the exact-bytes review binding (verified by
+    // verifyBoundReviewArtifacts at approval/finalize): the human approved THESE bytes.
+    binding.captures.push(...stylePackFiles.map((file) => ({ path: file.path, sha256: file.sha256, role: "style-reference" })));
     const bound = await this.authority.recordComputedReviewPacket(runId, binding);
     // Turntable capture evidence joins canonical state bound to the exact reviewed packet.
     const { bindEvidenceConfig, createRenderEvidenceArtifact } = await import("../core/state.js");
@@ -1278,7 +1371,15 @@ export class TrustedPipeline {
       artifacts: [turntableArtifact],
       stateAfter: reviewState,
     });
-    await this.commitCanonicalAndMirror(withTurntable);
+    // Stylized lifecycle transition: validated -> visual-review, bound to the CURRENT freeze
+    // and the exact reviewed packet (mirror of the canonical review binding above).
+    if (constructionFreezeId) {
+      const authoringAfter = recordAuthoringReviewReady(withTurntable.embedded.state, { freezeId: constructionFreezeId, packetHash: packet.packetHash });
+      const withAuthoringReview = await this.authority.recordComputedAuthoring(runId, { authoringStateAfter: authoringAfter.authoring! });
+      await this.commitCanonicalAndMirror(withAuthoringReview);
+    } else {
+      await this.commitCanonicalAndMirror(withTurntable);
+    }
     return {
       status: "ready-for-user-review",
       candidateHash: replay.candidateHash,

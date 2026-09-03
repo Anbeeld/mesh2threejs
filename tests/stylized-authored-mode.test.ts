@@ -221,10 +221,16 @@ describe("authored semantic graph", () => {
   const gun: AuthorSpec = { schemaVersion: 1, semanticId: "gun", parentSemanticId: "gun-pivot", parts: [{ name: "barrel", geometry: { kind: "tube", from: [0, 0, 0], to: [1.5, 0, 0], radius: 0.05, segments: 8 } }] };
 
   test("one root per semantic; parents precede children; external pivot nestings recorded", () => {
-    const { ordered, pivotNestings } = validateAuthoredSemanticGraph([turret, turretPivot, hull, gun]);
+    const { ordered, pivotNestings } = validateAuthoredSemanticGraph([turret, turretPivot, hull, gun], new Set(["gun-pivot"]));
     expect(ordered.map((spec) => spec.semanticId)).toEqual(["turret-pivot", "turret", "hull", "gun"]);
     // Every parented semantic nests (authored pivot parents AND external pivots).
     expect(pivotNestings).toEqual([["turret", "turret-pivot"], ["gun", "gun-pivot"]]);
+  });
+
+  test("negative: unresolvable external parent fails compile instead of silently unparenting", () => {
+    expect(() => validateAuthoredSemanticGraph([hull, gun])).toThrow(/neither an authored semantic root nor a known oracle pivot semantic/u);
+    // Declared by the live oracle semantic map -> legal external pivot.
+    expect(() => validateAuthoredSemanticGraph([hull, gun], new Set(["gun-pivot"]))).not.toThrow();
   });
 
   test("negative: duplicate roots and cycles fail closed", () => {
@@ -250,8 +256,8 @@ describe("authored semantic graph", () => {
     await writeFile(join(root, "model/stylized/turret-pivot.json"), JSON.stringify(turretPivot, null, 2));
     await writeFile(join(root, "model/stylized/turret.json"), JSON.stringify(turret, null, 2));
     await writeFile(join(root, "model/stylized/gun.json"), JSON.stringify(gun, null, 2));
-    const first = await compileAuthoredWorkspace(root);
-    const second = await compileAuthoredWorkspace(root);
+    const first = await compileAuthoredWorkspace(root, { knownExternalParents: new Set(["gun-pivot"]) });
+    const second = await compileAuthoredWorkspace(root, { knownExternalParents: new Set(["gun-pivot"]) });
     expect(first.compiledGraphHash).toBe(second.compiledGraphHash);
     expect(first.ordered.map((spec) => spec.semanticId)).toEqual(["gun", "hull", "turret-pivot", "turret"]);
     expect(first.registrySource).toContain("turret-pivot.mjs");
@@ -262,7 +268,7 @@ describe("authored semantic graph", () => {
     }
     // A mutated spec changes the compiled graph hash.
     await writeFile(join(root, "model/stylized/hull.json"), JSON.stringify({ ...hull, origin: [0, 0.1, 0] }, null, 2));
-    const mutated = await compileAuthoredWorkspace(root);
+    const mutated = await compileAuthoredWorkspace(root, { knownExternalParents: new Set(["gun-pivot"]) });
     expect(mutated.compiledGraphHash).not.toBe(first.compiledGraphHash);
   });
 });
@@ -384,11 +390,13 @@ describe("style reference binding", () => {
 
   test("reference byte mutation is detected against the recorded binding", async () => {
     const { root, referenceIndex } = await stylizedWorkspaceRoot();
+    await mkdir(join(root, ".mesh2threejs"), { recursive: true });
+    await writeFile(join(root, ".mesh2threejs/references.json"), JSON.stringify(referenceIndex));
     const { computeStyleBinding, verifyStyleBindingCurrent } = await import("../src/core/style-binding.js");
     const binding = await computeStyleBinding(root, referenceIndex as never);
     await verifyStyleBindingCurrent(root, binding);
     await writeFile(join(root, "refs/style/ref-01.png"), Buffer.from("tampered"));
-    await expect(verifyStyleBindingCurrent(root, binding)).rejects.toThrow(/FREEZE_STALE|bytes changed/u);
+    await expect(verifyStyleBindingCurrent(root, binding)).rejects.toThrow(/FREEZE_STALE|style binding changed|bytes changed|re-register/u);
   });
 });
 
@@ -591,7 +599,11 @@ describe("stylized authoring lifecycle", () => {
     // Design §7.1: the failure/edit route is frozen/validated/visual-review — an approved
     // construction reopens by restarting the chain, not by a silent reopen.
     expect(() => reopenAuthoring(current, "late tweak")).toThrow(/cannot reopen authoring from status approved/u);
-    const atReview = recordAuthoringReviewReady(recordAuthoringValidation(freezeAuthoring(withFinalDraft, freezeBase), { freezeId: freezeAuthoring(withFinalDraft, freezeBase).authoring!.freeze!.id, reportHash: H, passed: true }), { freezeId: freezeAuthoring(withFinalDraft, freezeBase).authoring!.freeze!.id, packetHash: "d".repeat(64) });
+    const frozenOnce = freezeAuthoring(withFinalDraft, freezeBase);
+    const atReview = recordAuthoringReviewReady(
+      recordAuthoringValidation(frozenOnce, { freezeId: frozenOnce.authoring!.freeze!.id, reportHash: H, passed: true }),
+      { freezeId: frozenOnce.authoring!.freeze!.id, packetHash: "d".repeat(64) },
+    );
     const reopened = reopenAuthoring(atReview, "turret silhouette needs rework");
     expect(reopened.authoring!.status).toBe("authoring");
     expect(reopened.authoring!.freeze).toBeUndefined();

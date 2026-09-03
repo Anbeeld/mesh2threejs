@@ -134,7 +134,23 @@ authoring -> frozen -> validated -> visual-review -> approved -> final
   freeze identity, validation evidence, review packet, and human approval; the
   oracle and style bindings survive.
 - `validate-frozen` runs the whole-object deterministic gate against the frozen
-  candidate and records the outcome against the freeze id.
+  candidate and records the outcome against the freeze id. Every post-freeze
+  authority boundary first re-verifies the CURRENT freeze from disk
+  (`verifyFreezeCurrent`: AuthorSpecs, feature plan, style binding, compiler
+  version) plus the bound oracle preparation, so a directly edited spec without
+  recompile is `FREEZE_STALE` before any stale module can execute.
+- `trustedReplay` is mode-aware: derived runs keep the phase-lock precondition;
+  stylized runs require the current freeze plus a passing validation bound to
+  that freeze.
+- `review-ready` binds the construction freeze id, the style binding hash, and
+  the exact style-pack files (references + brief) into the canonical review
+  binding alongside the legacy deterministic/style evidence — the human judges
+  style identity against the registered art-direction pack, not just the
+  executable style contract.
+- Human approval (`approve-review`, human-admin only) advances the authoring
+  lifecycle to `approved`; `trusted-finalize` re-verifies every bound review
+  artifact, executes a fresh replay, and certifies — closing the chain
+  (`approved` -> `final`). Builder self-approval is impossible (403).
 
 ## Builder operations (all builder-safe)
 
@@ -176,3 +192,18 @@ thresholds wait for calibration against authored examples (design Q3).
 - The real SweatyPanzer T-34-85 end-to-end authoring campaign (design §48):
   requires the art-directed authored build and human visual approval, which are
   inherently outside deterministic verification.
+
+## Verification (terminal chain)
+
+- `tests/stylized-authored-mode.test.ts` — includes post-freeze staleness
+  wiring (edited spec, compiler drift, style-manifest role/entry mutation) and
+  unresolvable-external-parent compile refusal.
+- `tests/stylized-authored-terminal-e2e.test.ts` — the TERMINAL certification
+  E2E through the trusted broker: trusted intake with `constructionMode` ->
+  registration -> derive refusal -> fresh AuthorSpec compile -> checkpoints ->
+  freeze -> passing `validate-frozen` -> `review-ready` binding
+  `constructionFreezeId` + `styleBindingHash` + style-reference captures ->
+  builder 403 on approval -> human approval (`approved`) -> `trusted-finalize`
+  with fresh replay -> `certified` and authoring status `final`.
+- `tests/stylized-authored-e2e.test.ts` — the design §47 authoring-lifecycle
+  E2E (tank subject): compile/checkpoint/freeze/validate/reopen/re-freeze.

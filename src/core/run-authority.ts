@@ -99,6 +99,14 @@ export interface ReviewSceneBinding {
 export interface ReviewBinding {
   packetHash: string | null;
   /**
+   * Stylized-authored bindings (design §23/§24): the human reviews the frozen construction
+   * against the registered STYLE PACK, not merely the executable style contract. These join
+   * the existing canonical review binding — the run-level human approval authority remains
+   * the single review authority; `state.authoring.review` mirrors the lifecycle.
+   */
+  constructionFreezeId?: string | null;
+  styleBindingHash?: string | null;
+  /**
    * Exact-bytes binding of the packet FILE itself (remaining closure §5.1): packetHash is
    * the semantic packet identity, this sha256 is the exact bytes the human was shown.
    */
@@ -314,6 +322,8 @@ export class TrustedRunAuthority {
       scene: null,
       captures: [],
       humanApproval: null,
+      constructionFreezeId: null,
+      styleBindingHash: null,
     };
     const record = recomputePolicyFields({
       schemaVersion: 1,
@@ -669,7 +679,21 @@ export class TrustedRunAuthority {
     state = recordEvidenceArtifact(state, "", artifact);
     state.phaseStatus["visual-review"] = "passed";
     state.visualReviewStatus = "passed";
-    next.embedded.state = state;
+    // Stylized-authored lifecycle mirror (design §24): the human approval decision also
+    // advances the authoring lifecycle through its own recorded transition, bound to the
+    // frozen construction and the reviewed packet. The canonical approval above remains the
+    // only authority; this is the lifecycle representation of the same human act.
+    const { recordAuthoringReviewDecision } = await import("./authoring-state.js");
+    if (state.constructionMode === "stylized-authored" && state.authoring?.review && state.authoring.freeze) {
+      const stylizedAfter = recordAuthoringReviewDecision(state, {
+        freezeId: state.authoring.freeze.id,
+        packetHash: next.review.packetHash!,
+        decision: "approved",
+      });
+      next.embedded.state = stylizedAfter;
+    }
+    next.embedded.state = state.authoring && state.constructionMode === "stylized-authored" ? next.embedded.state : state;
+    next.embedded.state = next.embedded.state;
     next.review.humanApproval = approval;
     next.mirrorSequence += 1;
     await this.store.save(next, expectedSequence);
@@ -710,12 +734,35 @@ export class TrustedRunAuthority {
       if (!record.finalReplay || approval.trustedReplayHash !== record.finalReplay.replayHash) problems.push("human approval is bound to a different trusted replay");
     }
     if (state.route === "diagnose" || state.status === "blocked") problems.push("run has active diagnose/blocked state");
-    const unlocked = Object.entries(state.phaseStatus)
-      .filter(([phase, status]) => phase !== "final" && phase !== "visual-review" && status !== "passed" && status !== "skipped")
-      .map(([phase]) => phase);
-    if (unlocked.length) problems.push(`phases are unlocked: ${unlocked.join(", ")}`);
-    else if (state.phaseStatus["visual-review"] !== undefined && state.phaseStatus["visual-review"] !== "passed" && !record.review.humanApproval) {
-      problems.push("the visual-review phase requires human approval");
+    const stylized = state.constructionMode === "stylized-authored";
+    if (stylized) {
+      // Stylized authority model (design §7/§19/§24): ONE construction freeze replaces
+      // per-phase locks. Certification requires the CURRENT freeze, a passing deterministic
+      // validation bound to THAT freeze, and the human approval bound to the reviewed packet.
+      const authoring = state.authoring;
+      if (!authoring?.freeze) problems.push("stylized-authored certification requires a construction freeze");
+      else {
+        if (!authoring.validation?.passed || authoring.validation.freezeId !== authoring.freeze.id) {
+          problems.push("stylized-authored certification requires a passing deterministic validation bound to the current freeze (validate-frozen)");
+        }
+        if (!record.review.constructionFreezeId || record.review.constructionFreezeId !== authoring.freeze.id) {
+          problems.push("the review binding does not carry the current construction freeze; run review-ready after freeze");
+        }
+        if (state.authoring?.review && state.authoring.review.status !== "approved") {
+          problems.push("the stylized authoring review has not been approved by the human authority");
+        }
+        if (!record.review.styleBindingHash || (state.authoring?.styleBinding && record.review.styleBindingHash !== state.authoring.styleBinding.styleBindingHash)) {
+          problems.push("the review binding does not carry the current style binding hash; run review-ready after freeze");
+        }
+      }
+    } else {
+      const unlocked = Object.entries(state.phaseStatus)
+        .filter(([phase, status]) => phase !== "final" && phase !== "visual-review" && status !== "passed" && status !== "skipped")
+        .map(([phase]) => phase);
+      if (unlocked.length) problems.push(`phases are unlocked: ${unlocked.join(", ")}`);
+      else if (state.phaseStatus["visual-review"] !== undefined && state.phaseStatus["visual-review"] !== "passed" && !record.review.humanApproval) {
+        problems.push("the visual-review phase requires human approval");
+      }
     }
     if (record.policy.authorshipMode === "derived") {
       const { getProfileContract } = await import("./contracts.js");
@@ -729,6 +776,11 @@ export class TrustedRunAuthority {
     next.status = "certified";
     next.embedded.state.status = "certified";
     next.embedded.state.phaseStatus.final = "passed";
+    // Stylized lifecycle: certification closes the authoring chain (approved -> final).
+    if (stylized && next.embedded.state.authoring && next.embedded.state.authoring.status === "approved" && next.embedded.state.authoring.freeze) {
+      const { recordAuthoringFinal } = await import("./authoring-state.js");
+      next.embedded.state = recordAuthoringFinal(next.embedded.state, { freezeId: next.embedded.state.authoring.freeze.id });
+    }
     next.mirrorSequence += 1;
     await this.store.save(next, expectedSequence);
     return next;

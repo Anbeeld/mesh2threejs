@@ -137,7 +137,7 @@ export class BrokerClient {
   // ---- human/admin channel (admin token required; builder tokens are rejected server-side) ----
 
   /** TRUSTED INTAKE (remaining closure §6.1): host/user pins goal + oracle before builder control. */
-  createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string }): Promise<{ runId: string }> {
+  createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string; constructionMode?: "stylized-authored" | "derived-faithful"; images?: string[] }): Promise<{ runId: string; intake?: string }> {
     return this.call("create-workspace-run", { payload: input });
   }
 

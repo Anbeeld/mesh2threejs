@@ -132,7 +132,29 @@ export async function computeStyleBinding(workspaceRoot: string, references: Ref
 }
 
 /** Verifies a recorded style binding still matches the live style input bytes. */
+/**
+ * Verifies a recorded style binding against the LIVE style input. Immutability covers the
+ * whole binding, not just recorded bytes: the manifest is RE-READ and the live binding is
+ * RECOMPUTED from the current manifest + reference index, so changing WHICH images are
+ * listed, their roles, or adding/removing entries changes the live styleBindingHash and is
+ * refused even when the previously recorded image files are untouched.
+ */
 export async function verifyStyleBindingCurrent(workspaceRoot: string, recorded: StyleBinding): Promise<void> {
+  // Recompute the live binding from the current manifest + reference index.
+  let referenceIndex: ReferenceIndex;
+  try {
+    referenceIndex = JSON.parse(await readFile(resolve(workspaceRoot, ".mesh2threejs/references.json"), "utf8")) as ReferenceIndex;
+  } catch {
+    throw new ConstructionRoutingError("FREEZE_STALE", "the workspace reference index is unreadable; cannot re-verify the bound style input");
+  }
+  if (!referenceIndex || !Array.isArray(referenceIndex.records)) {
+    throw new ConstructionRoutingError("FREEZE_STALE", "the workspace reference index is invalid; cannot re-verify the bound style input");
+  }
+  const live = await computeStyleBinding(workspaceRoot, referenceIndex);
+  if (live.styleBindingHash !== recorded.styleBindingHash) {
+    throw new ConstructionRoutingError("FREEZE_STALE", "the style binding changed after freeze (manifest roles/entries, reference bytes, or brief); reopen authoring and re-freeze");
+  }
+  // Defense in depth: each recorded file must still exist with its recorded bytes.
   for (const reference of recorded.references) {
     let hash: string;
     try {
@@ -156,7 +178,6 @@ export async function verifyStyleBindingCurrent(workspaceRoot: string, recorded:
     }
   }
 }
-
 export function styleBindingHash(binding: StyleBinding): string {
   return binding.styleBindingHash;
 }
