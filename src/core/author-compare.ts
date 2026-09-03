@@ -21,16 +21,49 @@ import type { CaptureFrame, Point3 } from "../types.js";
  * first-class trusted operation rather than deferred viewer work.
  */
 
-export interface StyleImageSource {
+export interface StyleReferenceInput {
   label: string;
-  /** Absolute path of the style PNG (registered style reference). */
+  /** Absolute path of the style image (registered style reference). */
   path: string;
+  /** Declared vehicle view of the reference (side/front/rear/plan/front-3-4/rear-3-4/overview), when declared. */
+  view?: string;
+  role: string;
+  /** Raw file bytes; PNG-decodable files are composable into boards. */
+  bytes: Buffer;
+  png: boolean;
+}
+
+export type StyleMatchKind = "exact-view" | "general" | "contact-sheet";
+
+/**
+ * View-aware style resolution (lifecycle closure): for each comparison view pick
+ * 1. a reference that DECLARES that view (primary-style before style-family before other);
+ * 2. otherwise a general (view-less) primary-style reference;
+ * 3. otherwise the contact sheet — MULTIPLE references tiled, so the board never pretends
+ *    one image is a corresponding view.
+ * Only PNG-decodable references are composable; the caller supplies the composable set.
+ */
+export function resolveStyleForView(
+  references: ReadonlyArray<StyleReferenceInput & { png: boolean }>,
+  view: string,
+): { reference: StyleReferenceInput | null; match: StyleMatchKind } {
+  const withView = references.filter((reference) => reference.png && reference.view === view);
+  if (withView.length) {
+    const primary = withView.find((reference) => reference.role === "primary-style") ?? withView.find((reference) => reference.role === "style-family") ?? withView[0]!;
+    return { reference: primary, match: "exact-view" };
+  }
+  const general = references.filter((reference) => reference.png && !reference.view);
+  if (general.length) {
+    const primary = general.find((reference) => reference.role === "primary-style") ?? general.find((reference) => reference.role === "style-family") ?? general[0]!;
+    return { reference: primary, match: "general" };
+  }
+  return { reference: null, match: "contact-sheet" };
 }
 
 export interface AuthorCompareBoard {
   path: string;
   sha256: string;
-  kind: "style-triplet" | "ghost-overlay";
+  kind: "style-triplet" | "style-triplet-contact-sheet" | "ghost-overlay";
   view: string;
 }
 
@@ -47,18 +80,33 @@ export interface AuthorCompareResult {
 const COMPARISON_VIEWS = ["side", "front", "rear", "plan", "front-3-4"] as const;
 const GHOST_VIEWS = ["side", "front", "plan"] as const;
 
-function comparisonCameras(frame: CanonicalFrame): Record<string, import("../types.js").CaptureCamera> {
-  const [x, y, z] = frame.cameras.side.target as Point3;
-  const [sx, , sz] = frame.cameras.side.position as Point3;
-  const distance = Math.abs(sx - x);
+/**
+ * Comparison cameras. REAR mirrors the FRONT camera through the target (front looks along
+ * +Z in the canonical frame, so rear looks from -Z), NOT the mirrored side camera — the
+ * side view is +X, and "-X" would just be the opposite SIDE of the vehicle, not the rear.
+ * Regression-tested: rear.position === 2*target - front.position.
+ */
+export function comparisonCameras(frame: CanonicalFrame): Record<string, import("../types.js").CaptureCamera> {
+  const [tx, ty, tz] = frame.cameras.side.target as Point3;
+  const [fx, fy, fz] = frame.cameras.front.position as Point3;
+  const [sx, sy, sz] = frame.cameras.side.position as Point3;
+  const distance = Math.abs(sx - tx);
   return {
     side: frame.cameras.side,
     front: frame.cameras.front,
-    rear: { id: "rear", projection: "orthographic", position: [x - distance, y, z] as const, target: [x, y, z] as const },
+    rear: {
+      id: "rear",
+      projection: "orthographic",
+      position: [fx - 2 * (fx - tx), fy - 2 * (fy - ty), fz - 2 * (fz - tz)] as const,
+      target: [tx, ty, tz] as const,
+    },
     plan: frame.cameras.plan,
-    "front-3-4": { id: "front-3-4", projection: "perspective", position: [x + distance * 0.6, y + distance * 0.35, z + distance * 0.6] as const, target: [x, y, z] as const },
+    "front-3-4": { id: "front-3-4", projection: "perspective", position: [sx + distance * 0.35, sy + distance * 0.35, sz + distance * 0.6] as const, target: [tx, ty, tz] as const },
   };
 }
+
+export const COMPARISON_VIEW_IDS = ["side", "front", "rear", "plan", "front-3-4"] as const;
+export type ComparisonView = (typeof COMPARISON_VIEW_IDS)[number];
 
 /** Loads a style PNG and rescales it (nearest neighbor) to the given frame height. */
 function styleFrame(pngBytes: Buffer, width: number, height: number): { data: Uint8Array; width: number; height: number } {
@@ -84,28 +132,62 @@ function styleFrame(pngBytes: Buffer, width: number, height: number): { data: Ui
 
 /**
  * Oracle | Candidate | Style triplet: three columns, same row alignment, so the reviewer
- * sees the geometry authorities and the art authority side by side in one image.
+ * sees the geometry authorities and the art authority side by side in one image. When
+ * several style images are supplied (contact-sheet fallback) they are tiled VERTICALLY in
+ * the third column so the reviewer sees multiple references instead of one misleading frame.
  */
 export async function createStyleComparisonBoard(
   path: string,
   oracle: CaptureFrame,
   candidate: CaptureFrame,
-  stylePng: Buffer,
+  stylePngs: ReadonlyArray<Buffer>,
   styleLabel: string,
-): Promise<{ path: string; width: number; height: number }> {
+): Promise<{ path: string; width: number; height: number; contactSheet: boolean }> {
   if (oracle.height !== candidate.height || oracle.pass !== candidate.pass) throw new Error("comparison frames are incompatible");
   void styleLabel;
-  const style = styleFrame(stylePng, oracle.width, oracle.height);
-  const width = oracle.width + candidate.width + style.width;
+  const images = stylePngs.slice(0, 4).map((png) => styleFrame(png, oracle.width, oracle.height));
+  const contactSheet = images.length > 1;
+  const styleWidth = Math.max(...images.map((image) => image.width));
+  const styleData = new Uint8Array(styleDataFor(images, styleWidth, oracle.height));
+  const width = oracle.width + candidate.width + styleWidth;
   const height = oracle.height;
   const data = new Uint8Array(width * height * 4);
   for (let y = 0; y < height; y += 1) {
     data.set(oracle.data.subarray(y * oracle.width * 4, (y + 1) * oracle.width * 4), y * width * 4);
     data.set(candidate.data.subarray(y * candidate.width * 4, (y + 1) * candidate.width * 4), (y * width + oracle.width) * 4);
-    data.set(style.data.subarray(y * style.width * 4, (y + 1) * style.width * 4), (y * width + oracle.width + candidate.width) * 4);
+    data.set(styleData.subarray(y * styleWidth * 4, (y + 1) * styleWidth * 4), (y * width + oracle.width + candidate.width) * 4);
   }
   await writeCapturePng(path, { ...oracle, width, height, data, cameraId: `${oracle.cameraId}-style-comparison` });
-  return { path, width, height };
+  return { path, width, height, contactSheet };
+}
+
+/** Tiles style frames vertically into one column of the given width. */
+function styleDataFor(images: ReadonlyArray<{ data: Uint8Array; width: number; height: number }>, columnWidth: number, boardHeight: number): Uint8Array {
+  const column = new Uint8Array(columnWidth * boardHeight * 4);
+  const sliceHeight = Math.floor(boardHeight / images.length);
+  let painted = 0;
+  for (const [index, image] of images.entries()) {
+    const scale = sliceHeight / image.height;
+    const scaledWidth = Math.max(1, Math.round(image.width * scale));
+    const targetY = index * sliceHeight;
+    for (let y = 0; y < sliceHeight; y += 1) {
+      const sourceY = Math.min(image.height - 1, Math.floor(y / scale));
+      const copyWidth = Math.min(scaledWidth, columnWidth);
+      for (let x = 0; x < copyWidth; x += 1) {
+        const sourceX = Math.min(image.width - 1, Math.floor(x / scale));
+        const sourceOffset = (sourceY * image.width + sourceX) * 4;
+        const targetOffset = ((targetY + y) * columnWidth + x) * 4;
+        column[targetOffset] = image.data[sourceOffset]!;
+        column[targetOffset + 1] = image.data[sourceOffset + 1]!;
+        column[targetOffset + 2] = image.data[sourceOffset + 2]!;
+        column[targetOffset + 3] = 255;
+      }
+      void sourceY;
+    }
+    painted += 1;
+  }
+  void painted;
+  return column;
 }
 
 /** Oracle ghost overlay: the oracle alpha-silhouette at 50% over the candidate beauty render. */
@@ -133,7 +215,7 @@ export interface AuthorCompareRunInput {
   directory: string;
   oracle: THREE.Object3D;
   candidate: THREE.Object3D;
-  styleImages: StyleImageSource[];
+  styleReferences: ReadonlyArray<StyleReferenceInput>;
   runId: string;
   backend?: "auto" | "deterministic-cpu" | "three-webgl";
 }
@@ -163,18 +245,25 @@ export async function performAuthorCompareRun(input: AuthorCompareRunInput): Pro
   profile.camera.orthographicHeight = frame.orthographicHeight;
   profile.camera.far = Math.max(profile.camera.far, frame.orthographicHeight * 4);
   await mkdir(input.directory, { recursive: true });
-  if (!input.styleImages.length) throw new Error("author-compare requires at least one registered style reference image");
-  const stylePng = await readFile(input.styleImages[0]!.path);
+  if (!input.styleReferences.length) throw new Error("author-compare requires at least one registered style reference");
+  const composable = input.styleReferences.filter((reference) => reference.png);
+  if (!composable.length) throw new Error("author-compare requires at least one PNG-decodable style reference for board composition; register a PNG style image");
   const cameras = comparisonCameras(frame);
   const boards: AuthorCompareBoard[] = [];
   const ghostOverlays: AuthorCompareBoard[] = [];
+  const styleSelection: Array<{ view: string; match: string; referencePath: string | null }> = [];
   for (const view of COMPARISON_VIEWS) {
     const camera = cameras[view]!;
     const oracleFrame = renderCapture({ root: input.oracle, snapshot: oracleSnapshot, profile, camera, pass: "beauty", backend: input.backend ?? "deterministic-cpu" }).frame;
     const candidateFrame = renderCapture({ root: input.candidate, snapshot: candidateSnapshot, profile, camera, pass: "beauty", backend: input.backend === "three-webgl" ? "three-webgl" : "deterministic-cpu" }).frame;
+    const selection = resolveStyleForView(composable, view);
+    const stylePngs = selection.match === "contact-sheet"
+      ? composable.slice(0, 4).map((reference) => reference.bytes)
+      : [selection.reference!.bytes];
     const boardPath = join(input.directory, `${view}-oracle-candidate-style.png`);
-    await createStyleComparisonBoard(boardPath, oracleFrame, candidateFrame, stylePng, input.styleImages[0]!.label);
-    boards.push({ path: boardPath, sha256: sha256(await readFile(boardPath)), kind: "style-triplet", view });
+    const composed = await createStyleComparisonBoard(boardPath, oracleFrame, candidateFrame, stylePngs, selection.reference?.label ?? "contact-sheet");
+    styleSelection.push({ view, match: selection.match, referencePath: selection.reference?.path ?? null });
+    boards.push({ path: boardPath, sha256: sha256(await readFile(boardPath)), kind: composed.contactSheet ? "style-triplet-contact-sheet" : "style-triplet", view });
     if ((GHOST_VIEWS as readonly string[]).includes(view)) {
       const oracleSilhouette = renderCapture({ root: input.oracle, snapshot: oracleSnapshot, profile, camera, pass: "alpha-silhouette", backend: input.backend === "three-webgl" ? "three-webgl" : "deterministic-cpu" }).frame;
       const overlayPath = join(input.directory, `${view}-oracle-ghost-overlay.png`);
@@ -183,12 +272,13 @@ export async function performAuthorCompareRun(input: AuthorCompareRunInput): Pro
     }
   }
   const manifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "mesh2threejs-author-compare",
     runId: input.runId,
     views: [...COMPARISON_VIEWS],
     ghostViews: [...GHOST_VIEWS],
-    styleImages: input.styleImages,
+    styleReferences: input.styleReferences.map((reference) => ({ path: reference.path, label: reference.label, view: reference.view ?? null, role: reference.role })),
+    styleSelection,
     boards,
     ghostOverlays,
   };

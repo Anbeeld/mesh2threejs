@@ -21,7 +21,16 @@ export interface StyleReferenceEntry {
   path: string;
   role: string;
   notes?: string;
+  /**
+   * Optional view metadata (lifecycle closure): which vehicle view the reference depicts,
+   * so author-compare can pick the matching art authority per view (side/front/rear/plan/
+   * front-3-4/rear-3-4/overview). Absent = general reference.
+   */
+  view?: string;
 }
+
+/** Views a style reference may declare; author-compare resolves per view from these. */
+export const STYLE_REFERENCE_VIEWS: ReadonlySet<string> = new Set(["side", "front", "rear", "plan", "front-3-4", "rear-3-4", "overview"]);
 
 export interface StyleReferencesManifest {
   schemaVersion: 1;
@@ -34,7 +43,7 @@ export interface StyleBinding {
   styleReferenceSetHash: string;
   styleBriefHash: string;
   styleBindingHash: string;
-  references: Array<{ path: string; sha256: string; role: string }>;
+  references: Array<{ path: string; sha256: string; role: string; view?: string }>;
   briefPath: string | null;
 }
 
@@ -53,10 +62,16 @@ export function parseStyleReferences(value: unknown): StyleReferencesManifest {
     const entry = raw as Record<string, unknown>;
     if (typeof entry.path !== "string" || !entry.path.trim()) throw new ConstructionRoutingError("STYLE_BINDING_REQUIRED", "style reference path must be a non-empty string");
     if (typeof entry.role !== "string" || !entry.role.trim()) throw new ConstructionRoutingError("STYLE_BINDING_REQUIRED", "style reference role must be a non-empty string");
+    if ("view" in entry) {
+      if (typeof entry.view !== "string" || !STYLE_REFERENCE_VIEWS.has(entry.view)) {
+        throw new ConstructionRoutingError("STYLE_BINDING_REQUIRED", `style reference view must be one of ${[...STYLE_REFERENCE_VIEWS].join(", ")}: ${String(entry.view)}`);
+      }
+    }
     references.push({
       path: entry.path,
       role: entry.role,
       ...(typeof entry.notes === "string" ? { notes: entry.notes } : {}),
+      ...("view" in entry ? { view: entry.view as string } : {}),
     });
   }
   return { schemaVersion: 1, references };
@@ -103,7 +118,7 @@ export async function computeStyleBinding(workspaceRoot: string, references: Ref
     if (indexed.sha256 !== hash) {
       throw new ConstructionRoutingError("STYLE_BINDING_REQUIRED", `style reference ${entry.path} changed after registration; re-register and rebind`);
     }
-    bound.push({ path: normalized, sha256: hash, role: entry.role });
+    bound.push({ path: normalized, sha256: hash, role: entry.role, ...(entry.view ? { view: entry.view } : {}) });
   }
   const briefPath = join(workspaceRoot, STYLE_BRIEF_PATH);
   let briefHash: string | null = null;

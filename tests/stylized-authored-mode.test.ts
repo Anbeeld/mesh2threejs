@@ -488,6 +488,55 @@ describe("oracle copy contamination audit", () => {
   });
 });
 
+// ---------------------------------------------------------------- comparison surface correctness
+
+describe("author-compare comparison surface", () => {
+  test("rear camera mirrors FRONT through the target, never the side view (regression)", async () => {
+    const { comparisonCameras } = await import("../src/core/author-compare.js");
+    const { deriveCanonicalFrame } = await import("../src/core/render.js");
+    const frame = deriveCanonicalFrame({ min: [0, 0, 0], max: [2, 1, 4], size: [2, 1, 4], center: [1, 0.5, 2] }, 0.01);
+    const cameras = comparisonCameras(frame);
+    const rear = cameras.rear!;
+    const [fx, fy, fz] = frame.cameras.front.position as unknown as [number, number, number];
+    const [tx, ty, tz] = frame.cameras.side.target as unknown as [number, number, number];
+    // rear.position === 2*target - front.position (point reflection through the target).
+    expect(rear.position[0]).toBeCloseTo(2 * tx - fx, 6);
+    expect(rear.position[1]).toBeCloseTo(2 * ty - fy, 6);
+    expect(rear.position[2]).toBeCloseTo(2 * tz - fz, 6);
+    // The canonical frame looks at the subject along +Z from the front, so the rear camera
+    // sits BEHIND the vehicle (-Z) while sharing the target's X — NOT the -X opposite side.
+    expect(rear.position[2]).toBeLessThan(tz);
+    expect(Math.abs(rear.position[0] - tx)).toBeLessThan(1e-6);
+  });
+
+  test("style resolution is view-aware and falls back to a contact sheet, never a fake match", async () => {
+    const { resolveStyleForView } = await import("../src/core/author-compare.js");
+    const reference = (path: string, role: string, view?: string) => ({
+      label: role, path, role, bytes: Buffer.alloc(0), png: true, ...(view ? { view } : {}),
+    });
+    const pack = [
+      reference("refs/style/side.png", "primary-style", "side"),
+      reference("refs/style/rear.png", "style-family", "rear"),
+      reference("refs/style/hero.png", "primary-style"),
+    ];
+    // 1. exact declared view wins.
+    const side = resolveStyleForView(pack, "side");
+    expect(side.match).toBe("exact-view");
+    expect(side.reference!.path).toBe("refs/style/side.png");
+    const rear = resolveStyleForView(pack, "rear");
+    expect(rear.match).toBe("exact-view");
+    expect(rear.reference!.path).toBe("refs/style/rear.png");
+    // 2. general reference for undeclared views.
+    const plan = resolveStyleForView(pack, "plan");
+    expect(plan.match).toBe("general");
+    expect(plan.reference!.path).toBe("refs/style/hero.png");
+    // 3. no composable match at all -> contact sheet (never a pretend match).
+    const none = resolveStyleForView([], "front");
+    expect(none.match).toBe("contact-sheet");
+    expect(none.reference).toBeNull();
+  });
+});
+
 // ---------------------------------------------------------------- measurement guides + notebook (design §12/§13)
 
 describe("oracle measurement guides and notebook", () => {
@@ -543,9 +592,6 @@ describe("stylized authoring lifecycle", () => {
     oracleBinding: "prep-1",
     featurePlanHash: null,
     compilerVersion: AUTHORED_COMPILER_VERSION,
-    finalDraftCheckpointId: "final-draft-1",
-    finalDraftCapturesHash: H,
-    finalDraftAssessmentHash: null,
     neutralGeometryHash: H,
     articulationBehaviorHash: H,
   };
@@ -575,10 +621,10 @@ describe("stylized authoring lifecycle", () => {
     expect(() => freezeAuthoring(withBlockout, freezeBase)).toThrow(/VISUAL_CHECKPOINT_REQUIRED|final-draft/u);
     // Checkpoint bound to a DIFFERENT candidate fails freeze.
     const otherCandidate = "b".repeat(64);
-    const withFinalDraft = recordAuthorCheckpoint(withBlockout, { kind: "final-draft", candidateHash: otherCandidate, capturesHash: H });
+    const withFinalDraft = recordAuthorCheckpoint(withBlockout, { kind: "final-draft", candidateHash: otherCandidate, capturesHash: H, styleComparison: { candidateHash: otherCandidate, styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } });
     expect(() => freezeAuthoring(withFinalDraft, freezeBase)).toThrow(/final-draft checkpoint evidence is bound to candidate/u);
     // Matching final-draft checkpoint freezes.
-    const matching = recordAuthorCheckpoint(withBlockout, { kind: "final-draft", candidateHash: H, capturesHash: H });
+    const matching = recordAuthorCheckpoint(withBlockout, { kind: "final-draft", candidateHash: H, capturesHash: H, styleComparison: { candidateHash: H, styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } });
     const frozen = freezeAuthoring(matching, freezeBase);
     expect(frozen.authoring!.status).toBe("frozen");
     expect(frozen.authoring!.freeze!.id).toMatch(/^[a-f0-9]{64}$/);
@@ -590,25 +636,31 @@ describe("stylized authoring lifecycle", () => {
   test("freeze BINDS final-draft evidence content, not just its existence (lifecycle closure)", () => {
     const state = stateWithAuthoring();
     const capturesHash = "e".repeat(64);
-    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash, assessment: { style: "PASS" } });
+    const comparison = { candidateHash: H, styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] };
+    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash, assessment: { style: "PASS" }, styleComparison: comparison });
     const frozen = freezeAuthoring(withFinalDraft, freezeBase);
     expect(frozen.authoring!.freeze!.finalDraftCheckpointId).toBe("final-draft-1");
     expect(frozen.authoring!.freeze!.finalDraftCapturesHash).toBe(capturesHash);
-    // Caller-supplied capture hashes cannot forge the binding: the freeze binds the ACTUAL
-    // final-draft checkpoint content.
-    const forgedInput = freezeAuthoring(withFinalDraft, { ...freezeBase, finalDraftCapturesHash: "f".repeat(64) });
-    expect(forgedInput.authoring!.freeze!.finalDraftCapturesHash).toBe(capturesHash);
-    expect(forgedInput.authoring!.freeze!.id).toBe(frozen.authoring!.freeze!.id);
+    expect(frozen.authoring!.freeze!.finalDraftStyleComparison!.boardHashes).toEqual([H]);
+    // Final-draft checkpoints cannot even be RECORDED without the Oracle | Candidate | Style
+    // comparison binding (mechanical enforcement, not a remembered checklist item).
+    expect(() => recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H })).toThrow(/Style comparison evidence/u);
+    // A comparison bound to a DIFFERENT style binding is refused at record time.
+    expect(() => recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H, styleComparison: { candidateHash: H, styleBindingHash: "9".repeat(64), manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } })).toThrow(/different style binding/u);
+    // A comparison bound to a DIFFERENT candidate records but is refused at freeze.
+    const wrongCandidate = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H, styleComparison: { candidateHash: "9".repeat(64), styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } });
+    expect(() => freezeAuthoring(wrongCandidate, freezeBase)).toThrow(/bound to a different candidate/u);
     // A DIFFERENT final-draft checkpoint (fresh capture set) produces a different freeze id.
-    const freshCheckpoint = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: "f".repeat(64), assessment: { style: "PASS" } });
+    const freshCheckpoint = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: "f".repeat(64), assessment: { style: "PASS" }, styleComparison: { candidateHash: H, styleBindingHash: H, manifestHash: "d".repeat(64), boardHashes: ["d".repeat(64)], ghostOverlayHashes: [H] } });
     const refrozen = freezeAuthoring(freshCheckpoint, freezeBase);
     expect(refrozen.authoring!.freeze!.finalDraftCapturesHash).toBe("f".repeat(64));
+    expect(refrozen.authoring!.freeze!.finalDraftStyleComparison!.manifestHash).toBe("d".repeat(64));
     expect(refrozen.authoring!.freeze!.id).not.toBe(frozen.authoring!.freeze!.id);
   });
 
   test("review refresh transitions: validated/visual-review/approved -> visual-review without reopening geometry", () => {
     const state = stateWithAuthoring();
-    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H });
+    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H, styleComparison: { candidateHash: H, styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } });
     const frozen = freezeAuthoring(withFinalDraft, freezeBase);
     const freezeId = frozen.authoring!.freeze!.id;
     const validated = recordAuthoringValidation(frozen, { freezeId, reportHash: H, passed: true });
@@ -631,7 +683,7 @@ describe("stylized authoring lifecycle", () => {
 
   test("compiler version change changes freeze identity (§33.5)", () => {
     const state = stateWithAuthoring();
-    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H });
+    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H, styleComparison: { candidateHash: H, styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } });
     const frozen = freezeAuthoring(withFinalDraft, freezeBase);
     const otherCompiler = freezeAuthoring(withFinalDraft, { ...freezeBase, compilerVersion: "9.9.9" });
     expect(otherCompiler.authoring!.freeze!.id).not.toBe(frozen.authoring!.freeze!.id);
@@ -639,7 +691,7 @@ describe("stylized authoring lifecycle", () => {
 
   test("reopen invalidates freeze/validation/review but preserves oracle and style bindings (§33.6)", () => {
     const state = stateWithAuthoring();
-    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H });
+    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H, styleComparison: { candidateHash: H, styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } });
     let current = freezeAuthoring(withFinalDraft, freezeBase);
     const freezeId = current.authoring!.freeze!.id;
     current = recordAuthoringValidation(current, { freezeId, reportHash: H, passed: true });
@@ -670,7 +722,7 @@ describe("stylized authoring lifecycle", () => {
 
   test("builder cannot bypass freeze: edits after freeze are refused (AUTHORING_FROZEN)", () => {
     const state = stateWithAuthoring();
-    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H });
+    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H, styleComparison: { candidateHash: H, styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } });
     const frozen = freezeAuthoring(withFinalDraft, freezeBase);
     expect(() => recordAuthorCheckpoint(frozen, { kind: "blockout", candidateHash: H, capturesHash: H })).toThrow(/mutable authoring only|AUTHORING_FROZEN/u);
   });
@@ -680,7 +732,7 @@ describe("stylized authoring lifecycle", () => {
     const authoring = createAuthoringState();
     authoring.oracleBinding = "prep-1";
     const noStyle = { ...state, authoring };
-    const withFinalDraft = recordAuthorCheckpoint(noStyle, { kind: "final-draft", candidateHash: H, capturesHash: H });
+    const withFinalDraft = recordAuthorCheckpoint(noStyle, { kind: "final-draft", candidateHash: H, capturesHash: H, styleComparison: { candidateHash: H, styleBindingHash: H, manifestHash: H, boardHashes: [H], ghostOverlayHashes: [H] } });
     expect(() => freezeAuthoring(withFinalDraft, freezeBase)).toThrow(/STYLE_BINDING_REQUIRED|missing style binding/u);
   });
 });

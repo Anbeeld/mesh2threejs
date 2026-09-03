@@ -723,11 +723,58 @@ export class TrustedPipeline {
   }
 
   /**
-   * Minimal Bundle F comparison surface (design §12/§40): ONE supported operation that gives
-   * the builder Oracle | Candidate | Style-reference triplet boards for side/front/rear/plan/
-   * front-3/4 plus oracle ghost overlays. Diagnostic evidence only — it exists so the agent
-   * must actually LOOK at the art direction, never to satisfy gates.
+   * Shared Oracle | Candidate | Style comparison execution (lifecycle closure). Used by the
+   * `author-compare` operation AND by final-draft checkpoints, so the comparison evidence a
+   * freeze binds is produced by the same trusted path in both cases.
    */
+  private async executeAuthorCompare(input: {
+    record: RunAuthorityRecord;
+    workspace: ResumedWorkspace;
+    execution: Awaited<ReturnType<typeof inspectWorkspaceCandidateViaExecutor>>;
+    oracle: Awaited<ReturnType<typeof loadPreparedOracle>>;
+    directoryTag: string;
+    requireCurrentStyleBinding?: boolean;
+  }): Promise<{ result: Awaited<ReturnType<typeof performAuthorCompareRun>>; styleBindingHash: string; candidateHash: string }> {
+    const state = input.record.embedded.state;
+    const styleBinding = state.authoring?.styleBinding;
+    if (!styleBinding?.references.length) {
+      throw new PipelineError("STYLE_BINDING_REQUIRED", "the comparison capture requires a bound style pack; register style references and rerun author-compile");
+    }
+    if (input.requireCurrentStyleBinding) {
+      await verifyStyleBindingCurrent(input.workspace.root, styleBinding);
+    }
+    // The FULL style pack participates: per-view resolution picks a declared-view reference
+    // when one exists (primary-style before style-family), else a general reference, else a
+    // contact sheet of several references. Non-PNG references remain valid style authority
+    // (review packet) and simply are not composable into raster boards.
+    const styleReferences = [];
+    for (const reference of styleBinding.references) {
+      const absolute = resolve(input.workspace.root, reference.path);
+      const bytes = await readFile(absolute);
+      styleReferences.push({
+        label: reference.role,
+        path: absolute,
+        ...(reference.view ? { view: reference.view } : {}),
+        role: reference.role,
+        bytes,
+        png: bytes.subarray(1, 4).toString() === "PNG",
+      });
+    }
+    const directory = join(input.workspace.layout.internal.captures, input.directoryTag);
+    const result = await performAuthorCompareRun({
+      directory,
+      oracle: input.oracle,
+      candidate: input.execution.neutralRoot,
+      styleReferences,
+      runId: input.directoryTag,
+    });
+    return {
+      result,
+      styleBindingHash: styleBinding.styleBindingHash,
+      candidateHash: input.execution.candidateHash,
+    };
+  }
+
   async authorCompare(runId: string): Promise<Record<string, unknown>> {
     const { record, workspace } = await this.stylizedContext(runId);
     const state = record.embedded.state;
@@ -742,39 +789,27 @@ export class TrustedPipeline {
       trusted: true,
       ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
     });
-    // Style images come ONLY from the bound style pack (verified against the recorded binding).
-    const styleBinding = state.authoring?.styleBinding;
-    if (!styleBinding?.references.length) {
-      throw new PipelineError("STYLE_BINDING_REQUIRED", "author-compare requires a bound style pack; register style references and rerun author-compile");
-    }
-    if (state.authoring?.freeze) {
-      // Post-freeze: the compared inputs must still match the frozen binding.
-      await verifyStyleBindingCurrent(workspace.root, styleBinding);
-  }
-    const styleImages = styleBinding.references
-      .filter((reference) => /\.(png)$/iu.test(reference.path))
-      .slice(0, 1)
-      .map((reference) => ({ label: reference.role, path: resolve(workspace.root, reference.path) }));
-    if (!styleImages.length) {
-      throw new PipelineError("STYLE_BINDING_REQUIRED", "author-compare requires at least one registered style IMAGE reference (PNG)");
-    }
-    const directory = join(workspace.layout.internal.captures, `author-compare-${record.mirrorSequence + 1}`);
-    const result = await performAuthorCompareRun({
-      directory,
+    const comparison = await this.executeAuthorCompare({
+      record,
+      workspace,
+      execution,
       oracle,
-      candidate: execution.neutralRoot,
-      styleImages,
-      runId: `author-compare-${record.mirrorSequence + 1}`,
+      directoryTag: `author-compare-${record.mirrorSequence + 1}`,
+      // Post-freeze comparisons must match the frozen style binding.
+      requireCurrentStyleBinding: Boolean(state.authoring?.freeze),
     });
     return {
       status: "author-compare-captured",
-      directory: this.toProjectPath(result.directory, workspace),
-      views: result.views,
-      boards: result.boards.map((board) => ({ path: this.toProjectPath(board.path, workspace), sha256: board.sha256, view: board.view })),
-      ghostOverlays: result.ghostOverlays.map((board) => ({ path: this.toProjectPath(board.path, workspace), sha256: board.sha256, view: board.view })),
-      manifest: this.toProjectPath(result.manifestPath, workspace),
-      manifestHash: result.manifestHash,
-      note: "Oracle | Candidate | Style triplet boards + oracle ghost overlays; diagnostic evidence only — look at the art direction",
+      directory: this.toProjectPath(comparison.result.directory, workspace),
+      views: comparison.result.views,
+      styleSelection: JSON.parse(await readFile(comparison.result.manifestPath, "utf8")).styleSelection,
+      boards: comparison.result.boards.map((board) => ({ path: this.toProjectPath(board.path, workspace), sha256: board.sha256, view: board.view, kind: board.kind })),
+      ghostOverlays: comparison.result.ghostOverlays.map((board) => ({ path: this.toProjectPath(board.path, workspace), sha256: board.sha256, view: board.view })),
+      manifest: this.toProjectPath(comparison.result.manifestPath, workspace),
+      manifestHash: comparison.result.manifestHash,
+      styleBindingHash: comparison.styleBindingHash,
+      candidateHash: comparison.candidateHash,
+      note: "Oracle | Candidate | Style triplet boards + oracle ghost overlays; look at the art direction",
     };
   }
 
@@ -799,7 +834,28 @@ export class TrustedPipeline {
     const capturesHash = sha256(canonicalJson({ captures: result.captures, boards: result.boards.map((board) => this.toProjectPath(board.path, workspace)) }));
     const state = record.embedded.state;
     const authoring = state.authoring ? structuredClone(state.authoring) : createAuthoringState();
-    const withCheckpoint = recordAuthorCheckpoint({ ...state, authoring }, { kind: input.kind as never, candidateHash: execution.candidateHash, capturesHash, ...(input.assessment ? { assessment: input.assessment } : {}) });
+    // MECHANICAL art-direction evidence (lifecycle closure): a final-draft checkpoint ITSELF
+    // runs the Oracle | Candidate | Style comparison and binds its results, so the invariant
+    // "you cannot freeze a stylized candidate without current comparison evidence for this
+    // exact candidate and style pack" holds without any remembered checklist step.
+    let styleComparison: import("../core/authoring-state.js").AuthoringStyleComparison | undefined;
+    if (input.kind === "final-draft") {
+      const comparison = await this.executeAuthorCompare({
+        record,
+        workspace,
+        execution,
+        oracle,
+        directoryTag: `final-draft-compare-${record.mirrorSequence + 1}`,
+      });
+      styleComparison = {
+        candidateHash: comparison.candidateHash,
+        styleBindingHash: comparison.styleBindingHash,
+        manifestHash: comparison.result.manifestHash,
+        boardHashes: comparison.result.boards.map((board) => board.sha256),
+        ghostOverlayHashes: comparison.result.ghostOverlays.map((board) => board.sha256),
+      };
+    }
+    const withCheckpoint = recordAuthorCheckpoint({ ...state, authoring }, { kind: input.kind as never, candidateHash: execution.candidateHash, capturesHash, ...(input.assessment ? { assessment: input.assessment } : {}), ...(styleComparison ? { styleComparison } : {}) });
     const next = await this.authority.recordComputedAuthoring(runId, { authoringStateAfter: withCheckpoint.authoring!, candidateHash: execution.candidateHash });
     await this.commitCanonicalAndMirror(next);
     return {
@@ -809,6 +865,7 @@ export class TrustedPipeline {
       capturesHash,
       captures: result.captures,
       boards: result.boards.map((board) => this.toProjectPath(board.path, workspace)),
+      ...(styleComparison ? { styleComparison } : {}),
       note: "checkpoints are evidence milestones, not authority locks (design §7.2)",
     };
   }

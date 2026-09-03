@@ -20,12 +20,28 @@ export const AUTHORING_CHECKPOINT_KINDS: ReadonlySet<AuthoringCheckpointKind> = 
 
 export type AuthoringStatus = "authoring" | "frozen" | "validated" | "visual-review" | "approved" | "final";
 
+/**
+ * Style comparison evidence bound by a final-draft checkpoint (lifecycle closure): the
+ * checkpoint ITSELF runs/records the Oracle | Candidate | Style comparison run, so "look at
+ * the art direction before committing" is mechanically enforced by freeze instead of
+ * remembered by the builder.
+ */
+export interface AuthoringStyleComparison {
+  candidateHash: string;
+  styleBindingHash: string;
+  manifestHash: string;
+  boardHashes: string[];
+  ghostOverlayHashes: string[];
+}
+
 export interface AuthoringCheckpoint {
   id: string;
   kind: AuthoringCheckpointKind;
   candidateHash: string;
   capturesHash: string;
   assessmentHash?: string;
+  /** Required on final-draft checkpoints: the current Oracle | Candidate | Style evidence. */
+  styleComparison?: AuthoringStyleComparison;
   createdAt: string;
 }
 
@@ -45,6 +61,7 @@ export interface AuthoringFreezeRecord {
   finalDraftCheckpointId: string;
   finalDraftCapturesHash: string;
   finalDraftAssessmentHash: string | null;
+  finalDraftStyleComparison?: AuthoringStyleComparison | null;
   createdAt: string;
 }
 
@@ -108,22 +125,38 @@ export function recordAuthorCheckpoint(state: TaskState, input: {
   candidateHash: string;
   capturesHash: string;
   assessment?: Record<string, unknown>;
+  /** Final-draft checkpoints must bind the current Oracle | Candidate | Style comparison. */
+  styleComparison?: AuthoringStyleComparison;
 }): TaskState {
   const authoring = requireAuthoring(state);
   if (authoring.status !== "authoring") fail("AUTHORING_FROZEN", "checkpoints are recorded during mutable authoring only");
   if (!AUTHORING_CHECKPOINT_KINDS.has(input.kind)) fail("AUTHOR_SPEC_INVALID", `unknown checkpoint kind: ${input.kind}`);
+  if (input.styleComparison && authoring.styleBinding && input.styleComparison.styleBindingHash !== authoring.styleBinding.styleBindingHash) {
+    fail("STYLE_BINDING_REQUIRED", "the style comparison evidence was captured against a different style binding; rerun author-compile and capture a fresh comparison");
+  }
   if (!/^[a-f0-9]{64}$/u.test(input.candidateHash) || !/^[a-f0-9]{64}$/u.test(input.capturesHash)) {
     fail("AUTHOR_SPEC_INVALID", "checkpoint candidate/captures hashes must be sha256");
   }
   const next = structuredClone(state);
   const authoringNext = next.authoring!;
   const id = `${input.kind}-${authoringNext.checkpoints.length + 1}`;
+  if (input.kind === "final-draft") {
+    const comparison = input.styleComparison;
+    if (!comparison) fail("VISUAL_CHECKPOINT_REQUIRED", "a final-draft checkpoint must bind the current Oracle | Candidate | Style comparison evidence (author-compare); run the comparison capture first");
+    if (!/^[a-f0-9]{64}$/u.test(comparison.candidateHash) || !/^[a-f0-9]{64}$/u.test(comparison.styleBindingHash) || !/^[a-f0-9]{64}$/u.test(comparison.manifestHash)) {
+      fail("AUTHOR_SPEC_INVALID", "style comparison binding hashes must be sha256");
+    }
+    if (!comparison.boardHashes.length || comparison.boardHashes.some((hash) => !/^[a-f0-9]{64}$/u.test(hash))) {
+      fail("VISUAL_CHECKPOINT_REQUIRED", "style comparison binding requires the captured board hashes");
+    }
+  }
   authoringNext.checkpoints.push({
     id,
     kind: input.kind,
     candidateHash: input.candidateHash,
     capturesHash: input.capturesHash,
     ...(input.assessment ? { assessmentHash: sha256(canonicalJson(input.assessment)) } : {}),
+    ...(input.styleComparison ? { styleComparison: structuredClone(input.styleComparison) } : {}),
     createdAt: new Date().toISOString(),
   });
   if (input.assessment) {
@@ -137,7 +170,9 @@ export function recordAuthorCheckpoint(state: TaskState, input: {
  * a bound style input and a final-draft checkpoint whose candidate hash matches the frozen
  * candidate (design Q5: final-draft visual evidence before freeze is mandatory).
  */
-export function freezeAuthoring(state: TaskState, freeze: Omit<AuthoringFreezeRecord, "id" | "createdAt">): TaskState {
+export type AuthoringFreezeInput = Omit<AuthoringFreezeRecord, "id" | "createdAt" | "finalDraftCheckpointId" | "finalDraftCapturesHash" | "finalDraftAssessmentHash" | "finalDraftStyleComparison">;
+
+export function freezeAuthoring(state: TaskState, freeze: AuthoringFreezeInput): TaskState {
   const authoring = requireAuthoring(state);
   if (authoring.status !== "authoring") fail("AUTHORING_FROZEN", `cannot freeze from status ${authoring.status}`);
   if (!authoring.styleBinding) fail("STYLE_BINDING_REQUIRED", "missing style binding prevents stylized freeze; register style references first");
@@ -148,12 +183,22 @@ export function freezeAuthoring(state: TaskState, freeze: Omit<AuthoringFreezeRe
     fail("VISUAL_CHECKPOINT_REQUIRED", `final-draft checkpoint evidence is bound to candidate ${finalDraft.candidateHash.slice(0, 12)}…, not the frozen candidate ${freeze.candidateHash.slice(0, 12)}…; capture a fresh final-draft checkpoint`);
   }
   const next = structuredClone(state);
+  // The comparison evidence must belong to THIS frozen candidate and the CURRENT style pack.
+  const comparison = finalDraft.styleComparison;
+  if (!comparison) fail("VISUAL_CHECKPOINT_REQUIRED", "the final-draft checkpoint lacks its Oracle | Candidate | Style comparison binding; capture a fresh final-draft checkpoint");
+  if (comparison.candidateHash !== freeze.candidateHash) {
+    fail("VISUAL_CHECKPOINT_REQUIRED", "the final-draft style comparison is bound to a different candidate; capture a fresh comparison for the frozen candidate");
+  }
+  if (!authoring.styleBinding || comparison.styleBindingHash !== authoring.styleBinding.styleBindingHash) {
+    fail("STYLE_BINDING_REQUIRED", "the final-draft comparison evidence is bound to a different style binding; rerun author-compile and capture a fresh comparison");
+  }
   const record: AuthoringFreezeRecord = {
     ...structuredClone(freeze),
     // The freeze BINDS the final-draft evidence content, not just its existence.
     finalDraftCheckpointId: finalDraft.id,
     finalDraftCapturesHash: finalDraft.capturesHash,
     finalDraftAssessmentHash: finalDraft.assessmentHash ?? null,
+    finalDraftStyleComparison: structuredClone(comparison),
     id: "",
     createdAt: new Date().toISOString(),
   };

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as THREE from "three";
 import { describe, expect, test, afterAll } from "vitest";
+import { PNG } from "pngjs";
 import { startBroker } from "../src/broker/server.js";
 import { BrokerClient } from "../src/broker/client.js";
 import { sceneToGlb, stableSemanticIdentityMap } from "./helpers/tank-fixtures.js";
@@ -58,7 +59,14 @@ describe("stylized-authored terminal certification E2E", () => {
     const source = join(parent, "box.glb");
     await writeFile(source, sceneToGlb(createBoxSubject()));
     const styleImage = join(parent, "style-ref-01.png");
-    await writeFile(styleImage, Buffer.from("style-image-bytes"));
+    const stylePng = new PNG({ width: 64, height: 48 });
+    for (let index = 0; index < 64 * 48; index += 1) {
+      stylePng.data[index * 4] = 90;
+      stylePng.data[index * 4 + 1] = 80;
+      stylePng.data[index * 4 + 2] = 30;
+      stylePng.data[index * 4 + 3] = 255;
+    }
+    await writeFile(styleImage, PNG.sync.write(stylePng));
 
     const broker = await startBroker({ toolchainOverride });
     roots.push(broker.url);
@@ -114,9 +122,16 @@ describe("stylized-authored terminal certification E2E", () => {
       await builder.authorCompile(runId);
       await builder.referenceScene(runId);
       await builder.authorCheckpoint(runId, { kind: "blockout", assessment: { geometry_vs_oracle: { primary: "PASS" } } });
-      await builder.authorCheckpoint(runId, { kind: "final-draft", assessment: { geometry_vs_oracle: { primary: "PASS" }, style_vs_references: { abstraction_density: "PASS" } } });
+      const finalDraft = await builder.authorCheckpoint(runId, { kind: "final-draft", assessment: { geometry_vs_oracle: { primary: "PASS" }, style_vs_references: { abstraction_density: "PASS" } } }) as { styleComparison?: { candidateHash: string; styleBindingHash: string; manifestHash: string; boardHashes: string[]; ghostOverlayHashes: string[] } };
+      // The final-draft checkpoint MECHANICALLY binds current Oracle | Candidate | Style evidence.
+      expect(finalDraft.styleComparison).toBeDefined();
+      expect(finalDraft.styleComparison!.boardHashes.length).toBe(5);
+      expect(finalDraft.styleComparison!.ghostOverlayHashes.length).toBe(3);
       const frozen = await builder.freezeConstruction(runId) as { status: string; freezeId: string; candidateHash: string };
       expect(frozen.status).toBe("frozen");
+      // The freeze record carries the bound comparison evidence.
+      const freezeFile = JSON.parse(await readFile(join(root, ".mesh2threejs/authoring/freeze.json"), "utf8")) as { finalDraftStyleComparison?: { manifestHash: string } };
+      expect(freezeFile.finalDraftStyleComparison!.manifestHash).toBe(finalDraft.styleComparison!.manifestHash);
 
       // ---- Deterministic validation bound to the freeze -----------------------------------
       const validation = await builder.validateFrozen(runId) as { status: string; passed: boolean; freezeId: string };
