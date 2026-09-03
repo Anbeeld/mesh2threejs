@@ -201,9 +201,9 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
           return;
         }
         case "create-workspace-run": {
-          const payload = (request.payload ?? {}) as { workspaceRoot?: string; goal?: string; oraclePath?: string; workspaceId?: string };
+          const payload = (request.payload ?? {}) as { workspaceRoot?: string; goal?: string; oraclePath?: string; workspaceId?: string; constructionMode?: "stylized-authored" | "derived-faithful" };
           if (!payload.workspaceRoot || !payload.goal || !payload.oraclePath) throw new Error("create-workspace-run requires payload.workspaceRoot, payload.goal and payload.oraclePath");
-          respond(res, 200, await pipeline.createWorkspaceRun({ workspaceRoot: payload.workspaceRoot, goal: payload.goal, oraclePath: payload.oraclePath, ...(payload.workspaceId ? { workspaceId: payload.workspaceId } : {}) }, capability));
+          respond(res, 200, await pipeline.createWorkspaceRun({ workspaceRoot: payload.workspaceRoot, goal: payload.goal, oraclePath: payload.oraclePath, ...(payload.workspaceId ? { workspaceId: payload.workspaceId } : {}), ...(payload.constructionMode ? { constructionMode: payload.constructionMode } : {}) }, capability));
           return;
         }
         case "status":
@@ -245,6 +245,42 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
         case "reopen":
           requireRun(runId);
           respond(res, 200, await executeMutating(runId!, () => pipeline.reopen(runId!, (request.payload ?? {}) as { phase: string; reason: string }, capability)));
+          return;
+        case "author-status":
+          requireRun(runId);
+          respond(res, 200, await pipeline.authorStatus(runId!));
+          return;
+        case "author-compile":
+          requireRun(runId);
+          respond(res, 200, await executeMutating(runId!, () => pipeline.authorCompile(runId!)));
+          return;
+        case "author-check":
+          requireRun(runId);
+          respond(res, 200, await executeMutating(runId!, () => pipeline.authorCheck(runId!, (request.payload ?? {}) as { scope?: string })));
+          return;
+        case "author-checkpoint":
+          requireRun(runId);
+          respond(res, 200, await executeMutating(runId!, () => pipeline.authorCheckpoint(runId!, (request.payload ?? {}) as { kind: string; assessment?: Record<string, unknown> })));
+          return;
+        case "author-measure":
+          requireRun(runId);
+          respond(res, 200, await pipeline.authorMeasure(runId!, (request.payload ?? {}) as { semantics?: string[] }));
+          return;
+        case "reference-scene":
+          requireRun(runId);
+          respond(res, 200, await executeMutating(runId!, () => pipeline.referenceScene(runId!)));
+          return;
+        case "validate-frozen":
+          requireRun(runId);
+          respond(res, 200, await executeMutating(runId!, () => pipeline.validateFrozen(runId!)));
+          return;
+        case "freeze-construction":
+          requireRun(runId);
+          respond(res, 200, await executeMutating(runId!, () => pipeline.freezeConstruction(runId!)));
+          return;
+        case "reopen-authoring":
+          requireRun(runId);
+          respond(res, 200, await executeMutating(runId!, () => pipeline.reopenAuthoringOp(runId!, (request.payload ?? {}) as { reason: string })));
           return;
         case "render-quick":
           requireRun(runId);

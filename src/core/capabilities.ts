@@ -29,6 +29,18 @@ export const BUILDER_OPERATIONS = new Set([
   "render-quick",
   "review-ready",
   "viewer-status",
+  // Stylized-authored mode (design §26): builder-safe authoring operations. These may edit
+  // AuthorSpec-derived artifacts, measure, checkpoint, request freeze/reopen and validation;
+  // they may never approve review, alter run authority, or bypass freeze hashes.
+  "author-status",
+  "author-compile",
+  "author-check",
+  "author-checkpoint",
+  "author-measure",
+  "reference-scene",
+  "validate-frozen",
+  "freeze-construction",
+  "reopen-authoring",
 ]);
 
 /**

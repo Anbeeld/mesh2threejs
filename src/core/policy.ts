@@ -1,5 +1,6 @@
 import { canonicalJson, sha256 } from "./hashing.js";
-import type { AuthorshipMode, CertificationLevel, ProfileId } from "../types.js";
+import type { AuthorshipMode, CertificationLevel, ConstructionMode, ProfileId } from "../types.js";
+import { effectiveConstructionMode, isConstructionMode } from "./construction-mode.js";
 import type { ProjectManifest, ReferenceIndex } from "./workspace.js";
 
 /**
@@ -10,6 +11,13 @@ import type { ProjectManifest, ReferenceIndex } from "./workspace.js";
  */
 export interface RunPolicy {
   profile: ProfileId;
+  /**
+   * Construction architecture (stylized-authored design §5). Optional for legacy policy
+   * records: an absent field behaves as "derived-faithful" and keeps historical policy
+   * identities byte-identical. Declared in project.json for stylized workspaces; switching
+   * requires a new evidence chain / rebind.
+   */
+  constructionMode?: ConstructionMode;
   style: string;
   certification: CertificationLevel;
   authorshipMode: AuthorshipMode;
@@ -46,11 +54,16 @@ export function projectPolicyIdentity(project: ProjectManifest, references: Refe
     ? references.records.find((record) => record.kind === "oracle" && record.operationalPath === project.oracle)
     : undefined;
   if (project.oracle && !oracleRecord) throw new Error(`project oracle selection is absent from the reference index: ${project.oracle}`);
+  if (project.constructionMode !== undefined && !isConstructionMode(project.constructionMode)) {
+    throw new Error(`project constructionMode is invalid: ${String(project.constructionMode)}`);
+  }
   return {
     profile: project.profile,
     style: project.style,
     certification: project.certification,
     authorshipMode: project.authorshipMode ?? "independent",
+    // Legacy policy records stay byte-identical: the field participates only when declared.
+    ...(project.constructionMode ? { constructionMode: project.constructionMode } : {}),
     geometryAuthority: "prepared-oracle",
     oracleReference: oracleRecord ? { path: oracleRecord.operationalPath, sha256: oracleRecord.sha256 } : null,
     subjectContractHash: project.subjectContract
@@ -117,13 +130,20 @@ export function computeSafeDefaultPolicy(input: {
   if (project.style && project.style !== input.defaultStyle) conflicts.push(`project style ${project.style} is not the package default`);
   if (project.certification && project.certification !== input.defaultCertification) conflicts.push(`project certification ${project.certification} is not the package default`);
   if (project.authorshipMode && project.authorshipMode !== expectedAuthorship) conflicts.push(`project authorshipMode ${project.authorshipMode} is not the safe default for this subject`);
+  const declaredMode = project.constructionMode;
+  if (declaredMode !== undefined && !isConstructionMode(declaredMode)) conflicts.push(`project constructionMode ${String(declaredMode)} is not a recognized construction mode`);
+  // Stylized-authored is a deliberate workspace-creation choice (design §5.1): the project
+  // manifest declares it and the decision is recorded as user-policy, so builder-initiated
+  // runs cannot flip into it silently while explicitly created stylized workspaces bind it.
   if (conflicts.length) return { blocked: "POLICY_APPROVAL_REQUIRED", conflicts };
   const identity = projectPolicyIdentity(project, references);
-  return {
-    policy: identity,
-    decisions: [
-      { field: "authorshipMode", value: expectedAuthorship, source: "safe-default", reason: "derived from oracle presence" },
-      { field: "profile", value: routedProfile, source: "trusted-router", reason: "router classification of the project goal" },
-    ],
-  };
+  const decisions: PolicyDecision[] = [
+    { field: "authorshipMode", value: expectedAuthorship, source: "safe-default", reason: "derived from oracle presence" },
+    { field: "profile", value: routedProfile, source: "trusted-router", reason: "router classification of the project goal" },
+  ];
+  if (declaredMode) {
+    decisions.push({ field: "constructionMode", value: declaredMode, source: "user-policy", reason: "declared in project.json at workspace creation" });
+  }
+  void effectiveConstructionMode;
+  return { policy: identity, decisions };
 }

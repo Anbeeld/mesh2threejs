@@ -11,6 +11,16 @@ export type CertificationLevel = "exact-real" | "oracle-relative";
  * oracle at runtime. A missing field on legacy projects/states behaves as "independent".
  */
 export type AuthorshipMode = "derived" | "independent";
+
+/**
+ * Construction architecture (stylized-authored mode design §5). "derived-faithful" is the
+ * existing source-derived reconstruction pipeline; "stylized-authored" builds every visible
+ * candidate triangle from a declarative authored specification compiled by trusted code, with
+ * the prepared oracle reduced to a read-only reference scene and measurement source. A missing
+ * field on legacy projects/states behaves as "derived-faithful" (identical to the pre-mode
+ * pipeline), so no existing workspace requires migration.
+ */
+export type ConstructionMode = "derived-faithful" | "stylized-authored";
 export type CapturePass =
   | "beauty"
   | "alpha-silhouette"

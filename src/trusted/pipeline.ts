@@ -28,7 +28,39 @@ import { derivePhaseSeed, reconcileDerivedWorkspaceFromBindings } from "../core/
 import { verifyDerivedLineage, derivedDirectory, loadTrustedGeneratedModules } from "../core/derivation.js";
 import { performRenderRun, performOracleSanityRun, performQuickDiagnosticRun, verifyLatestOracleSanity } from "../core/workspace-render.js";import { createVisualReviewPacket, verifyVisualReviewPacketFiles, type ReviewFileReference } from "../core/review.js";
 import { serializeScene } from "../core/scene-serialization.js";
+import {
+  effectiveConstructionMode,
+  deriveAllowedIn,
+  ConstructionRoutingError,
+} from "../core/construction-mode.js";
+import {
+  compileAuthoredWorkspace,
+  discoverAuthorSpecs,
+  verifyAuthoredLineage,
+  loadTrustedAuthoredModules,
+  orderedAuthoredSemanticsFromBindings,
+  assertNoOracleReachingCandidateFiles,
+  AUTHOR_SPEC_DIRECTORY,
+  type AuthoredBinding,
+} from "../core/authored-candidate.js";
+import {
+  createAuthoringState,
+  recordAuthorCheckpoint,
+  freezeAuthoring,
+  reopenAuthoring,
+  recordAuthoringValidation,
+  assertAuthoringEditable,
+  type StylizedAuthoringState,
+} from "../core/authoring-state.js";
+import { featurePlanHash } from "../core/authoring-freeze.js";
+import { computeStyleBinding, verifyStyleBindingCurrent, type StyleBinding } from "../core/style-binding.js";
+import { buildReferenceScene, writeReferenceScene, verifyReferenceSceneAlignment } from "../core/reference-scene.js";
+import { buildOracleGuides } from "../core/oracle-guides.js";
+import { auditOracleCopy } from "../core/oracle-copy-audit.js";
+import { snapshotScene } from "../core/geometry.js";
 import { trustedDerivedBackend } from "../core/candidate-sandbox.js";
+import { MODEL_STYLIZED_SCAFFOLD } from "../core/author-compiler.js";
+import { AUTHORED_COMPILER_VERSION, authorSpecHash as authorSpecHashOf } from "../core/author-spec.js";
 import { inspectWorkspaceCandidateViaExecutor, computeWorkspaceGate, applyGateEvidence, workspaceGateOutcome } from "../operations/workspace-gate.js";
 
 /**
@@ -212,7 +244,7 @@ export class TrustedPipeline {
    * workspace. Trusted code routes the profile and computes every policy field — the
    * builder never supplies profile, authorship mode, certification, style, or thresholds.
    */
-  async createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string }, capability: Capability): Promise<{ runId: string; intake: string }> {
+  async createWorkspaceRun(input: { workspaceRoot: string; goal: string; oraclePath: string; workspaceId?: string; constructionMode?: "stylized-authored" | "derived-faithful" }, capability: Capability): Promise<{ runId: string; intake: string }> {
     assertCapability("create-workspace-run", capability);
     const routedProfile = routeSubject(input.goal);
     if (!/^[\w.-]+$/u.test(basename(input.oraclePath)) && !/\.glb$/iu.test(input.oraclePath)) {
@@ -227,6 +259,7 @@ export class TrustedPipeline {
       oracle: input.oraclePath,
       referenceMode: "copy",
       authorshipMode: "derived",
+      ...(input.constructionMode ? { constructionMode: input.constructionMode } : {}),
     });
     const workspace = await resumeWorkspace(initialized.root);
     if (workspace.state.mirrorOfRun) {
@@ -493,10 +526,355 @@ export class TrustedPipeline {
     };
   }
 
+  // ---------------------------------------------------------------- stylized-authored mode (design §26)
+
+  /** Mode guard: stylized operations fail closed outside stylized-authored runs. */
+  private requireStylizedMode(record: RunAuthorityRecord): void {
+    if (effectiveConstructionMode(record.policy.constructionMode) !== "stylized-authored") {
+      throw new PipelineError("MODE_REQUIRES_AUTHORED_SPEC", `operation requires constructionMode "stylized-authored"; this run is "${record.policy.constructionMode ?? "derived-faithful"}"`);
+    }
+  }
+
+  private async stylizedContext(runId: string): Promise<{ record: RunAuthorityRecord; workspace: ResumedWorkspace }> {
+    const record = await this.loadRecord(runId);
+    this.requireStylizedMode(record);
+    const workspace = await this.loadRunWorkspace(record);
+    await this.assertBindingsCurrent(record, workspace);
+    return { record, workspace };
+  }
+
+  /** Reads/computes the style binding when the workspace declares one; null when absent. */
+  private async styleBindingFor(workspace: ResumedWorkspace): Promise<StyleBinding | null> {
+    try {
+      return await computeStyleBinding(workspace.root, workspace.references);
+    } catch (error) {
+      if (error instanceof ConstructionRoutingError && error.code === "STYLE_BINDING_REQUIRED") return null;
+      throw error;
+    }
+  }
+
+  async authorStatus(runId: string): Promise<Record<string, unknown>> {
+    const { record } = await this.stylizedContext(runId);
+    const state = record.embedded.state;
+    const authoring = state.authoring;
+    return {
+      runId,
+      mode: record.policy.constructionMode ?? "derived-faithful",
+      authoring: authoring ? {
+        status: authoring.status,
+        oracleBinding: authoring.oracleBinding,
+        styleBound: Boolean(authoring.styleBinding),
+        styleBindingHash: authoring.styleBinding?.styleBindingHash ?? null,
+        checkpoints: authoring.checkpoints.map((checkpoint) => ({ id: checkpoint.id, kind: checkpoint.kind, candidateHash: checkpoint.candidateHash })),
+        freeze: authoring.freeze ? { id: authoring.freeze.id, candidateHash: authoring.freeze.candidateHash, createdAt: authoring.freeze.createdAt } : null,
+        validation: authoring.validation ?? null,
+        review: authoring.review ?? null,
+      } : null,
+      authoredBindings: Object.keys(state.authoredBindings ?? {}).length,
+      candidateHash: record.candidateHash,
+    };
+  }
+
+  /** ReferenceScene generation + alignment proof (design §11/§33.4); read-only comparison artifact. */
+  async referenceScene(runId: string): Promise<Record<string, unknown>> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    void record;
+    const preparation = await verifyWorkspaceOraclePreparation(workspace);
+    const oracle = await loadPreparedOracle(preparation.manifest, workspace.root);
+    const scene = buildReferenceScene(oracle, preparation.binding);
+    const manifest = await writeReferenceScene(workspace.layout.internal.root, scene);
+    const alignment = verifyReferenceSceneAlignment(scene, oracle);
+    if (!alignment.aligned) {
+      throw new PipelineError("REFERENCE_SCENE_STALE", `reference scene does not align with the evaluator's prepared oracle: ${alignment.problems.join("; ")}`);
+    }
+    return { status: "reference-scene-generated", file: manifest.referenceSceneFile, referenceSceneHash: manifest.referenceSceneHash, oraclePreparationIdentity: manifest.oraclePreparationIdentity, aligned: true, note: "read-only comparison artifact; candidate compilation never receives it" };
+  }
+
+  /** Trusted author compilation (design §10): specs -> modules -> registry + binding ledger. */
+  async authorCompile(runId: string): Promise<Record<string, unknown>> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    const preparation = await verifyWorkspaceOraclePreparation(workspace);
+    assertAuthoringEditable(record.embedded.state);
+    const compilation = await compileAuthoredWorkspace(workspace.root);
+    // Hard architecture boundary (design §16.1): candidate files may never reach oracle data.
+    await assertNoOracleReachingCandidateFiles(workspace.root);
+    // Persist pipeline-owned generated modules + manifests.
+    const generatedDirectory = resolve(workspace.root, "model/.generated-authored");
+    await mkdir(generatedDirectory, { recursive: true });
+    const manifestDirectory = resolve(workspace.root, ".mesh2threejs/authored/manifests");
+    await mkdir(manifestDirectory, { recursive: true });
+    const bindings: Record<string, AuthoredBinding> = {};
+    for (const module of compilation.modules) {
+      await writeFile(resolve(workspace.root, module.path), module.source);
+      await writeFile(join(manifestDirectory, `${module.semanticId}.json`), `${JSON.stringify(module.manifest, null, 2)}\n`);
+      bindings[`model/.generated-authored/${module.semanticId}.mjs`] = module.binding;
+    }
+    await writeFile(resolve(workspace.root, compilation.registryPath), compilation.registrySource);
+    // Candidate identity through the SAME authorized execution graph (no separate route).
+    const execution = await inspectWorkspaceCandidateViaExecutor({
+      workspaceRoot: workspace.root,
+      modelEntryPath: workspace.resolved.model,
+      boundaryRoot: resolve(workspace.root, "model"),
+      poses: [neutralPoseForProfile(workspace.project.profile)],
+      auditOptions: { trustedGeneratedModules: await loadTrustedAuthoredModules({ workspaceRoot: workspace.root, authoredBindings: bindings }) },
+      trusted: true,
+      authorityExpectations: {
+        scaffoldSource: MODEL_STYLIZED_SCAFFOLD,
+        registryPath: resolve(workspace.root, compilation.registryPath),
+        registrySource: compilation.registrySource,
+      },
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
+    });
+    const styleBinding = await this.styleBindingFor(workspace);
+    const state = record.embedded.state;
+    const authoring: StylizedAuthoringState = state.authoring ? structuredClone(state.authoring) : createAuthoringState();
+    authoring.oracleBinding = preparation.binding.identity;
+    authoring.styleBinding = styleBinding;
+    const next = await this.authority.recordComputedAuthoring(runId, {
+      authoredBindings: bindings,
+      authoringStateAfter: authoring,
+      candidateHash: execution.candidateHash,
+    });
+    await this.commitCanonicalAndMirror(next);
+    return {
+      status: "compiled",
+      semantics: compilation.ordered.map((spec) => spec.semanticId),
+      modules: compilation.modules.map((module) => ({ semanticId: module.semanticId, path: module.path, triangles: module.manifest.triangleCount, geometryHash: module.manifest.geometryHash })),
+      compiledGraphHash: compilation.compiledGraphHash,
+      candidateHash: execution.candidateHash,
+      styleBinding: styleBinding ? { hash: styleBinding.styleBindingHash, references: styleBinding.references.length } : null,
+      styleBindingWarning: styleBinding ? null : "no style binding is recorded yet; register style/references.json before freeze",
+    };
+  }
+
+  /** Authoring diagnostics (design §17): advisory; never creates authority locks. */
+  async authorCheck(runId: string, options: { scope?: string } = {}): Promise<Record<string, unknown>> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    void record;
+    const preparation = await verifyWorkspaceOraclePreparation(workspace);
+    const oracle = await loadPreparedOracle(preparation.manifest, workspace.root);
+    const oracleSnapshot = snapshotScene(oracle);
+    const execution = await inspectWorkspaceCandidateViaExecutor({
+      workspaceRoot: workspace.root,
+      modelEntryPath: workspace.resolved.model,
+      boundaryRoot: resolve(workspace.root, "model"),
+      poses: [neutralPoseForProfile(workspace.project.profile)],
+      auditOptions: { trustedGeneratedModules: await loadTrustedAuthoredModules({ workspaceRoot: workspace.root, authoredBindings: workspace.state.authoredBindings ?? {} }) },
+      trusted: true,
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
+    });
+    const candidateSnapshot = snapshotScene(execution.neutralRoot);
+    const copyAudit = auditOracleCopy(oracleSnapshot, candidateSnapshot);
+    const scope = options.scope ?? "whole";
+    const complexity = Object.values(candidateSnapshot.components)
+      .filter((component) => scope === "whole" || component.id === scope || component.id.startsWith(`${scope}-`) || component.id.startsWith(`${scope}/`))
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map((component) => ({ semanticId: component.id, triangles: component.triangleIndices.length }));
+    return {
+      status: "author-check-diagnostic",
+      advisory: true,
+      scope,
+      candidateHash: execution.candidateHash,
+      complexity,
+      copyAudit: { status: copyAudit.status, warnings: copyAudit.warnings, totalMatchedFraction: copyAudit.totalMatchedFraction, enforcement: copyAudit.enforcement },
+      note: "diagnostic results do not create authority locks (design §17)",
+    };
+  }
+
+  /** Low-dimensional oracle measurement guides (design §12/§13); never returns source topology. */
+  async authorMeasure(runId: string, options: { semantics?: string[] } = {}): Promise<Record<string, unknown>> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    void record;
+    const preparation = await verifyWorkspaceOraclePreparation(workspace);
+    const oracle = await loadPreparedOracle(preparation.manifest, workspace.root);
+    const guide = buildOracleGuides(snapshotScene(oracle), preparation.binding.identity, options.semantics);
+    return { status: "guides-computed", guide, note: "low-dimensional measurement facts only; source topology never leaves the trusted boundary" };
+  }
+
+  /** Visual checkpoint evidence (design §18): renders first, then records the checkpoint. */
+  async authorCheckpoint(runId: string, input: { kind: string; assessment?: Record<string, unknown> }): Promise<Record<string, unknown>> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    if (record.embedded.state.authoring?.status !== "authoring") {
+      throw new PipelineError("AUTHORING_FROZEN", "checkpoints are recorded during mutable authoring only");
+    }
+    const manifest = await verifyWorkspaceOraclePreparation(workspace);
+    const oracle = await loadPreparedOracle(manifest.manifest, workspace.root);
+    const execution = await inspectWorkspaceCandidateViaExecutor({
+      workspaceRoot: workspace.root,
+      modelEntryPath: workspace.resolved.model,
+      boundaryRoot: resolve(workspace.root, "model"),
+      poses: [neutralPoseForProfile(workspace.project.profile)],
+      auditOptions: { trustedGeneratedModules: await loadTrustedAuthoredModules({ workspaceRoot: workspace.root, authoredBindings: workspace.state.authoredBindings ?? {} }) },
+      trusted: true,
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
+    });
+    const result = await performQuickDiagnosticRun(workspace, manifest.manifest, oracle, { candidateHash: execution.candidateHash }, execution.neutralRoot);
+    const capturesHash = sha256(canonicalJson({ captures: result.captures, boards: result.boards.map((board) => this.toProjectPath(board.path, workspace)) }));
+    const state = record.embedded.state;
+    const authoring = state.authoring ? structuredClone(state.authoring) : createAuthoringState();
+    const withCheckpoint = recordAuthorCheckpoint({ ...state, authoring }, { kind: input.kind as never, candidateHash: execution.candidateHash, capturesHash, ...(input.assessment ? { assessment: input.assessment } : {}) });
+    const next = await this.authority.recordComputedAuthoring(runId, { authoringStateAfter: withCheckpoint.authoring!, candidateHash: execution.candidateHash });
+    await this.commitCanonicalAndMirror(next);
+    return {
+      status: "checkpoint-recorded",
+      kind: input.kind,
+      candidateHash: execution.candidateHash,
+      capturesHash,
+      captures: result.captures,
+      boards: result.boards.map((board) => this.toProjectPath(board.path, workspace)),
+      note: "checkpoints are evidence milestones, not authority locks (design §7.2)",
+    };
+  }
+
+  /** Construction freeze (design §19): first strong authority boundary after setup. */
+  async freezeConstruction(runId: string): Promise<Record<string, unknown>> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    const preparation = await verifyWorkspaceOraclePreparation(workspace);
+    const state = record.embedded.state;
+    if (state.authoring?.status !== "authoring") {
+      throw new PipelineError("AUTHORING_FROZEN", `construction freeze applies to mutable authoring (current: ${state.authoring?.status ?? "none"})`);
+    }
+    const styleBinding = state.authoring.styleBinding;
+    if (!styleBinding) throw new PipelineError("STYLE_BINDING_REQUIRED", "missing style binding prevents stylized freeze; register style/references.json and rerun author-compile");
+    await verifyStyleBindingCurrent(workspace.root, styleBinding);
+    // The frozen compilation must be the CURRENT one: recompile deterministically and verify
+    // the durable bindings still reproduce it.
+    const compilation = await compileAuthoredWorkspace(workspace.root);
+    const bindings: Record<string, AuthoredBinding> = {};
+    for (const module of compilation.modules) bindings[`model/.generated-authored/${module.semanticId}.mjs`] = module.binding;
+    if (canonicalJson(bindings) !== canonicalJson(state.authoredBindings ?? {})) {
+      throw new PipelineError("FREEZE_STALE", "authored bindings changed since the last author-compile; run author-compile before freeze");
+    }
+    const execution = await inspectWorkspaceCandidateViaExecutor({
+      workspaceRoot: workspace.root,
+      modelEntryPath: workspace.resolved.model,
+      boundaryRoot: resolve(workspace.root, "model"),
+      poses: [neutralPoseForProfile(workspace.project.profile)],
+      auditOptions: { trustedGeneratedModules: await loadTrustedAuthoredModules({ workspaceRoot: workspace.root, authoredBindings: bindings }) },
+      trusted: true,
+      authorityExpectations: {
+        scaffoldSource: MODEL_STYLIZED_SCAFFOLD,
+        registryPath: resolve(workspace.root, compilation.registryPath),
+        registrySource: compilation.registrySource,
+      },
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
+    });
+    const authorSpecHash = sha256(canonicalJson(compilation.specs.map((spec) => ({ semanticId: spec.semanticId, hash: authorSpecHashOf(spec) })).sort((a, b) => a.semanticId.localeCompare(b.semanticId))));
+    const freeze = {
+      candidateHash: execution.candidateHash,
+      authorSpecHash,
+      compiledGraphHash: compilation.compiledGraphHash,
+      styleBinding: styleBinding.styleBindingHash,
+      oracleBinding: preparation.binding.identity,
+      featurePlanHash: await featurePlanHash(workspace.root),
+      compilerVersion: AUTHORED_COMPILER_VERSION,
+      finalDraftCheckpointId: "",
+      neutralGeometryHash: execution.neutralSceneHash,
+      articulationBehaviorHash: sha256(canonicalJson({ posedRoots: execution.posedRoots.length, deterministic: execution.deterministic })),
+    };
+    const authoringAfter = freezeAuthoring({ ...structuredClone(state), authoring: structuredClone(state.authoring!) }, freeze);
+    // Persist the canonical freeze artifact (design §19).
+    const freezeDirectory = resolve(workspace.root, ".mesh2threejs/authoring");
+    await mkdir(freezeDirectory, { recursive: true });
+    const freezePath = join(freezeDirectory, "freeze.json");
+    // Re-freeze after a reopen replaces the invalidated freeze artifact: reopenAuthoring
+    // already deleted the prior freeze identity from canonical state, so the stale bytes
+    // carry no authority and must not block the new evidence chain.
+    await writeFile(freezePath, `${JSON.stringify(authoringAfter.authoring!.freeze, null, 2)}\n`);
+    const next = await this.authority.recordComputedAuthoring(runId, { authoringStateAfter: authoringAfter.authoring!, candidateHash: execution.candidateHash });
+    await this.commitCanonicalAndMirror(next);
+    return {
+      status: "frozen",
+      freezeId: authoringAfter.authoring!.freeze!.id,
+      candidateHash: execution.candidateHash,
+      freezeFile: ".mesh2threejs/authoring/freeze.json",
+      note: "model writes are now rejected by trusted operations; reopen-authoring(reason) invalidates all post-freeze evidence",
+    };
+  }
+
+  /** Validate a frozen construction (design §20): deterministic guardrail, not a style optimizer. */
+  async validateFrozen(runId: string): Promise<Record<string, unknown>> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    const state = record.embedded.state;
+    if (state.authoring?.status !== "frozen" && state.authoring?.status !== "validated") {
+      throw new PipelineError("FREEZE_STALE", `validation applies to a frozen construction (current: ${state.authoring?.status ?? "none"})`);
+    }
+    await verifyAuthoredLineage({
+      modelEntryPath: workspace.resolved.model,
+      workspaceRoot: workspace.root,
+      constructionMode: "stylized-authored",
+      authoredBindings: state.authoredBindings ?? {},
+    });
+    const computation = await computeWorkspaceGate(workspace, {
+      isGlobal: true,
+      toolchainId: record.toolchain.toolchainId,
+      projectPolicyHash: record.projectPolicyHash,
+      artifactRunId: `validate-frozen-${record.runId}-${record.mirrorSequence + 1}`,
+      trusted: true,
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
+    });
+    const evidenceDirectory = join(workspace.layout.internal.evidence, `validate-frozen-${record.mirrorSequence + 1}`);
+    await mkdir(evidenceDirectory, { recursive: true });
+    const recordedArtifacts: EvidenceArtifact[] = [];
+    for (const item of computation.artifacts) {
+      const artifactPath = join(evidenceDirectory, `${item.suggestedId}.json`);
+      await writeFile(artifactPath, `${JSON.stringify(item.artifact, null, 2)}\n`, { flag: "wx" });
+      recordedArtifacts.push(item.artifact);
+    }
+    const relativePath = (artifact: EvidenceArtifact): string => `.mesh2threejs/evidence/validate-frozen-${record.mirrorSequence}/${artifact.id}.json`;
+    const { applyGateEvidence } = await import("../operations/workspace-gate.js");
+    const mutated = applyGateEvidence(state, computation, (mutatingState, artifact) => recordEvidenceArtifact(mutatingState, relativePath(artifact), artifact), computation.evaluationIdentity);
+    const reportHash = sha256(canonicalJson({
+      passed: computation.evaluation.passed,
+      score: computation.evaluation.deterministic?.score ?? 0,
+      candidateHash: computation.evaluation.candidateHash,
+    }));
+    const authoringAfter = recordAuthoringValidation(structuredClone(state), {
+      freezeId: state.authoring!.freeze!.id,
+      reportHash,
+      passed: computation.evaluation.passed,
+    });
+    const withCandidate = await this.authority.recordComputedCandidate(runId, {
+      candidateHash: computation.evaluation.candidateHash,
+      phaseGeometryHashes: computation.evaluation.phaseGeometryHashes,
+      evaluationIdentity: computation.evaluationIdentity,
+      stateAfter: mutated,
+    });
+    await this.authority.recordExecutionAuthority(runId, {
+      authority: computation.executionAuthority,
+      backendId: computation.execution.isolation,
+      backendIdentityHash: sha256(canonicalJson({ backendId: computation.execution.isolation })),
+    });
+    const finalRecord = await this.authority.recordComputedAuthoring(runId, { authoringStateAfter: authoringAfter.authoring! });
+    await this.commitCanonicalAndMirror(finalRecord);
+    return {
+      status: computation.evaluation.passed ? "validated" : "validation-failed",
+      passed: computation.evaluation.passed,
+      score: computation.evaluation.deterministic?.score ?? 0,
+      freezeId: state.authoring!.freeze!.id,
+      candidateHash: computation.evaluation.candidateHash,
+      reportHash,
+      artifacts: recordedArtifacts.map((artifact) => artifact.id),
+    };
+  }
+
+  /** Reopen (design §7.1): back to mutable authoring; invalidates all post-freeze evidence. */
+  async reopenAuthoringOp(runId: string, input: { reason: string }): Promise<Record<string, unknown>> {
+    await this.stylizedContext(runId);
+    const state = (await this.authority.readRun(runId)).embedded.state;
+    const authoringAfter = reopenAuthoring(structuredClone(state), input.reason);
+    const next = await this.authority.recordComputedAuthoring(runId, { authoringStateAfter: authoringAfter.authoring!, invalidateReview: true });
+    await this.commitCanonicalAndMirror(next);
+    return { status: "authoring-reopened", reason: input.reason, note: "freeze identity, deterministic validation, review packet, and human approval were invalidated; oracle and style bindings preserved" };
+  }
+
   // ---------------------------------------------------------------- derive/gate/lock/reopen
 
   async derive(runId: string, options: { quality?: "aggressive" | "balanced" | "conservative" } = {}, capability: Capability): Promise<Record<string, unknown>> {
     const record = await this.loadRecord(runId);
+    if (!deriveAllowedIn(effectiveConstructionMode(record.policy.constructionMode))) {
+      throw new PipelineError("MODE_FORBIDS_DERIVATION", "derive is not a construction route in stylized-authored mode: candidate geometry is authored from declarative AuthorSpecs, never simplified from the oracle (design invariant 1/§5.2)");
+    }
     const workspace = await this.loadRunWorkspace(record);
     await this.assertBindingsCurrent(record, workspace);
     const preparation = await verifyWorkspaceOraclePreparation(workspace);
@@ -685,7 +1063,14 @@ export class TrustedPipeline {
     const state = record.embedded.state;
     const unlocked = Object.entries(state.phaseStatus).filter(([phase, status]) => phase !== "final" && phase !== "visual-review" && status !== "passed" && status !== "skipped").map(([phase]) => phase);
     if (unlocked.length) throw new PipelineError("PHASES_UNLOCKED", `global replay requires all builder phases locked: ${unlocked.join(", ")}`);
-    if (state.authorshipMode === "derived") {
+    if (effectiveConstructionMode(record.policy.constructionMode) === "stylized-authored") {
+      await verifyAuthoredLineage({
+        modelEntryPath: workspace.resolved.model,
+        workspaceRoot: workspace.root,
+        constructionMode: "stylized-authored",
+        authoredBindings: state.authoredBindings ?? {},
+      });
+    } else if (state.authorshipMode === "derived") {
       await verifyDerivedLineage({
         modelEntryPath: workspace.resolved.model,
         workspaceRoot: workspace.root,

@@ -179,11 +179,36 @@ export async function computeWorkspaceGate(workspace: ResumedWorkspace, options:
   // inspected without applying articulation controls unless this gate evaluates that phase.
   const needsArticulation = !activePhase || isGlobal || profileContract.gates.some((gate) => gate.code === "articulation.poses" && gate.phase === activePhase);
   const poses = needsArticulation ? requiredPosesForProfile(profile, subjectContract) : [neutralPoseForProfile(profile, subjectContract)];
-  const auditOptions = await trustedGeneratedAuditOptions(workspace, preparationIdentity);
+  const isStylized = workspace.state.constructionMode === "stylized-authored";
+  const auditOptions = isStylized
+    ? { trustedGeneratedModules: await (await import("../core/authored-candidate.js")).loadTrustedAuthoredModules({
+        workspaceRoot: workspace.root,
+        authoredBindings: workspace.state.authoredBindings ?? {},
+      }) }
+    : await trustedGeneratedAuditOptions(workspace, preparationIdentity);
   // Trusted derived runs pin the exact expected graph bytes BEFORE execution (§2.2–§2.3):
   // scaffold scaffold bytes plus a registry regenerated from the currently bound phases.
+  // Trusted stylized runs pin the authored scaffold + authored registry equivalently.
   let authorityExpectations: DerivedGraphExpectations | undefined;
-  if (options.trusted && workspace.state.authorshipMode === "derived") {
+  if (options.trusted && isStylized) {
+    const { MODEL_STYLIZED_SCAFFOLD, AUTHORED_REGISTRY_PATH, generateAuthoredRegistrySource } = await import("../core/author-compiler.js");
+    const bindings = workspace.state.authoredBindings ?? {};
+    const ordered = (await import("../core/authored-candidate.js")).orderedAuthoredSemanticsFromBindings(bindings);
+    // Pivot nestings (child under a NON-authored pivot semantic) are reconstructable from
+    // the bindings' parentSemanticId fields.
+    const nestings = ordered
+      .map((semanticId) => {
+        const binding = Object.values(bindings).find((item) => item.semanticId === semanticId);
+        return binding?.parentSemanticId ? ([semanticId, binding.parentSemanticId] as const) : null;
+      })
+      .filter((item): item is readonly [string, string] => item !== null);
+    authorityExpectations = {
+      scaffoldSource: MODEL_STYLIZED_SCAFFOLD,
+      registryPath: resolve(workspace.root, AUTHORED_REGISTRY_PATH),
+      registrySource: generateAuthoredRegistrySource(ordered, nestings),
+    };
+  }
+  else if (options.trusted && workspace.state.authorshipMode === "derived") {
     const { MODEL_DERIVED_SCAFFOLD, GENERATED_REGISTRY_PATH, generateRegistrySource, orderedDerivedPhasesFromBindings } = await import("../core/derivation.js");
     authorityExpectations = {
       scaffoldSource: MODEL_DERIVED_SCAFFOLD,
@@ -202,7 +227,7 @@ export async function computeWorkspaceGate(workspace: ResumedWorkspace, options:
     ...(options.backend ? { backend: options.backend } : {}),
     ...(options.executionScratchRoot ? { executionScratchRoot: options.executionScratchRoot } : {}),
   });
-  if (!isGlobal) assertPhaseSemanticScope(profile, activePhase, execution.neutralRoot);
+  if (!isGlobal && !isStylized) assertPhaseSemanticScope(profile, activePhase, execution.neutralRoot);
   const executionAuthority = execution.graphAuthority.authority;
   if (!execution.deterministic) throw new Error("candidate execution was not deterministic across repeated runs; refusing to gate");
   const certification = workspace.state.certification;

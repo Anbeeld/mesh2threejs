@@ -15,3 +15,31 @@ description: Route, initialize, and resume a live-oracle procedural Three.js rec
 Do not import the oracle into candidate source. Do not let repair wording authorize candidate edits or review wording authorize mutation.
 
 Treat "show me the current model", "let me inspect it", or "give me progress renders" as user-review handoffs, not reconstruction mutations: refresh the full capture (`review-ready`), report its paths, and then ask before starting the viewer. "Open/start the viewer" is explicit authorization: on a trusted run deliver it as human/admin `approve-viewer-start` then `viewer-start`; on an unbound development workspace `mesh2threejs viewer start <workspace>` may run directly. Map viewer feedback to the owning phase and route it through the normal reopen/repair lifecycle; it never satisfies gates or visual review.
+
+## Stylized-authored mode
+
+If the workspace declares `constructionMode: "stylized-authored"`, the workflow is
+different by design (see `docs/stylized-authored-mode.md`): author geometry from
+scratch as declarative AuthorSpec JSON under `model/stylized/`, one file per
+semantic. `derive` and all source-derived repair routes are refused
+(`MODE_FORBIDS_DERIVATION`). Work like an artist using engineering measurement
+tools:
+
+1. LOOK: `reference-scene` + oracle sanity + style references; record the
+   authority split (oracle = geometry truth, style pack = abstraction truth).
+2. MEASURE: `author-measure` for bounds/origins/dimensions; record facts in
+   `model/stylized/measurements.json` (scalars only, never contours).
+3. AUTHOR: blockout the whole subject (hull/turret/gun/wheels/tracks) from
+   measurements, then refine primary forms. Loft rings, polygons, and mesh
+   positions are authored numbers - the oracle never supplies candidate vertices.
+4. RENDER + COMPARE: `author-checkpoint` at blockout/primary-forms/final-draft
+   captures the whole object and records your structured assessment (diagnostic,
+   not approval). `author-check` returns advisory diagnostics incl. the copy audit.
+5. FREEZE: `freeze-construction` requires a style binding
+   (`style/references.json` + `style/brief.md`) and a final-draft checkpoint.
+6. VALIDATE: `validate-frozen` is a deterministic guardrail, not a style
+   optimizer; fix failures with the smallest art-preserving authored change -
+   if a fix tempts you to copy source geometry, `reopen-authoring` and redesign
+   the authored form instead.
+7. REVIEW: human visual approval stays the final style authority; a builder can
+   never self-approve.

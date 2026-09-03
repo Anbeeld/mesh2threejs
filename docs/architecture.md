@@ -30,6 +30,32 @@ State writes are atomic. A versioned evaluation identity binds evaluator and mea
 
 Visual review is a separate read-only role. Its packet binds all hashes and immutable captures. When genuine image inspection is unavailable, state remains `awaiting-visual-review`.
 
+## Stylized-authored construction mode
+
+A second construction architecture beside the derived pipeline (see
+[stylized-authored-mode.md](stylized-authored-mode.md) for the full mode
+documentation). `constructionMode` in `project.json` selects between
+`derived-faithful` (legacy default, unchanged behavior) and
+`stylized-authored`, where every visible candidate triangle is compiled from
+declarative AuthorSpec JSON under `model/stylized/` by the trusted author
+compiler (`src/core/author-spec.ts`, `src/core/author-compiler.ts`,
+`src/core/authored-candidate.ts`) into `model/.generated-authored/` modules and
+a pipeline-owned registry. The prepared oracle becomes a read-only ReferenceScene
+(`src/core/reference-scene.ts`) plus low-dimensional measurement guides
+(`src/core/oracle-guides.ts`); candidate imports that reach `refs/`,
+`.mesh2threejs/oracle/`, `.mesh2threejs/reference-view/`, or the derived
+`.generated/` tree fail closed. The mode replaces per-phase immutable locks with
+one mutable authoring phase, checkpoints, and a single construction freeze
+(`src/core/authoring-state.ts`, `src/core/authoring-freeze.ts`); style
+references (`style/references.json` + `style/brief.md`) are hash-bound run
+authority (`src/core/style-binding.ts`); `derive` throws
+`MODE_FORBIDS_DERIVATION`; and an exact-triangle contamination audit
+(`src/core/oracle-copy-audit.ts`) backstops blatant copied components as a
+diagnostic. The broker exposes the builder-safe operations `author-status`,
+`author-compile`, `author-check`, `author-checkpoint`, `author-measure`,
+`reference-scene`, `validate-frozen`, `freeze-construction`, and
+`reopen-authoring`; human visual approval authority is unchanged.
+
 ## Trusted reconstruction authority
 
 Four authorities are genuinely separate (see the source-authority plan): the **trusted run

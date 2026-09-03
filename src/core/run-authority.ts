@@ -467,6 +467,41 @@ export class TrustedRunAuthority {
     return this.persistComputed(next, expectedSequence);
   }
 
+  /**
+   * INTERNAL — trusted pipeline only. Records stylized-authored construction state computed
+   * by trusted author operations (design §10/§25): the authored binding ledger, the authoring
+   * lifecycle state, and an optionally bound candidate identity. Builders never supply these
+   * authoritative values.
+   */
+  async recordComputedAuthoring(runId: string, input: {
+    authoredBindings?: Record<string, import("./authored-candidate.js").AuthoredBinding>;
+    authoringStateAfter?: import("./authoring-state.js").StylizedAuthoringState;
+    candidateHash?: string;
+    phaseGeometryHashes?: Record<string, string>;
+    evaluationIdentity?: import("./identity.js").EvaluationIdentity;
+    invalidateReview?: boolean;
+  }): Promise<RunAuthorityRecord> {
+    const record = await this.store.load(runId);
+    const expectedSequence = record.mirrorSequence;
+    const next = clone(record);
+    let state = next.embedded.state;
+    if (input.authoredBindings) {
+      state = structuredClone(state);
+      state.authoredBindings = clone(input.authoredBindings);
+    }
+    if (input.authoringStateAfter) state.authoring = clone(input.authoringStateAfter);
+    if (input.invalidateReview) this.invalidateReviewAndReplay(next);
+    if (input.candidateHash !== undefined) {
+      const changed = next.candidateHash !== null && next.candidateHash !== input.candidateHash;
+      state = bindCandidatePhases(state, input.candidateHash, input.phaseGeometryHashes ?? state.phaseGeometryHashes, input.evaluationIdentity);
+      next.candidateHash = input.candidateHash;
+      next.review.candidateHash = input.candidateHash;
+      if (changed) this.invalidateReviewAndReplay(next);
+    }
+    next.embedded.state = state;
+    return this.persistComputed(next, expectedSequence);
+  }
+
   /** INTERNAL — trusted pipeline only. Binds an onboarded/repaired oracle preparation. */
   async recordComputedPreparation(runId: string, input: {
     binding: OraclePreparationBinding;

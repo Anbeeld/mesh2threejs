@@ -86,6 +86,7 @@ export const projectManifestSchema = {
     portable: { type: "boolean" },
     subjectContract: { type: "string", minLength: 1 },
     authorshipMode: { enum: ["derived", "independent"] },
+    constructionMode: { enum: ["derived-faithful", "stylized-authored"] },
   },
   additionalProperties: false,
 } as const;

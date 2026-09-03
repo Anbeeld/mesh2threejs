@@ -1,11 +1,13 @@
 import { access, copyFile, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
-import type { AuthorshipMode, CertificationLevel, ProfileId } from "../types.js";
+import type { AuthorshipMode, CertificationLevel, ConstructionMode, ProfileId } from "../types.js";
+import { isConstructionMode, effectiveConstructionMode } from "./construction-mode.js";
 import { determineNextAction, loadTaskState, saveTaskState, createTaskState, type TaskState } from "./state.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { validateOracleManifest, validateProjectManifest, validateReferenceIndex } from "./schema.js";
 import { emptyGeneratedRegistry, MODEL_DERIVED_SCAFFOLD, MODEL_SCAFFOLD } from "./derivation.js";
+import { emptyAuthoredRegistry, MODEL_STYLIZED_SCAFFOLD } from "./author-compiler.js";
 import { verifyOraclePreparation, type OracleManifest, type OraclePreparationBinding } from "./oracle.js";
 import { loadStyleContract, type StyleContract } from "../styles/low-poly.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
@@ -33,6 +35,8 @@ export interface ProjectManifest {
   subjectContract?: string;
   /** Build-time authorship strategy; absent on legacy projects, which behave as "independent". */
   authorshipMode?: AuthorshipMode;
+  /** Construction architecture (design §5); absent on legacy projects, which behave as "derived-faithful". */
+  constructionMode?: ConstructionMode;
 }
 
 export interface ReferenceRecord {
@@ -75,6 +79,7 @@ export function projectConfigurationIdentity(project: ProjectManifest, reference
     certification: project.certification,
     model: project.model,
     authorshipMode: project.authorshipMode ?? "independent",
+    ...(project.constructionMode ? { constructionMode: project.constructionMode } : {}),
     goal: project.goal,
     oracle: selected(project.oracle, "oracle"),
     subjectContract: selected(project.subjectContract, "document"),
@@ -99,6 +104,7 @@ export interface InitializeWorkspaceInput {
   model?: string;
   subjectContract?: string;
   authorshipMode?: AuthorshipMode;
+  constructionMode?: ConstructionMode;
 }
 
 export interface WorkspaceLayout {
@@ -323,6 +329,9 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
   // New 3D-oracle workspaces default to derived authorship; an explicit clean-room project
   // declares "independent". Projects without a 3D oracle stay independent.
   const authorshipMode: AuthorshipMode = input.authorshipMode ?? (oracleRecord ? "derived" : "independent");
+  if (input.constructionMode !== undefined && !isConstructionMode(input.constructionMode)) {
+    throw new Error(`constructionMode is invalid: ${String(input.constructionMode)}`);
+  }
   const project: ProjectManifest = {
     schemaVersion: 1,
     id: input.id,
@@ -337,6 +346,7 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
     referenceMode: mode,
     portable: records.every((record) => record.mode === "copy"),
     authorshipMode,
+    ...(input.constructionMode ? { constructionMode: input.constructionMode } : {}),
     ...(subjectContractRecord ? { subjectContract: subjectContractRecord.operationalPath } : {}),
   };
   const referenceIndex: ReferenceIndex = { schemaVersion: 1, records: records.map(({ source: _source, destination: _destination, ...record }) => record) };
@@ -360,18 +370,29 @@ export async function initializeWorkspace(directory: string, input: InitializeWo
     if (!await pathExists(modelPath)) {
       await mkdir(dirname(modelPath), { recursive: true });
       // Derived projects get the stable registry-composed entry immediately so every later
-      // derivation stays pipeline-wired; independent/legacy projects keep the plain scaffold.
-      await writeFile(modelPath, project.authorshipMode === "derived" ? MODEL_DERIVED_SCAFFOLD : MODEL_SCAFFOLD, { flag: "wx" });
+      // derivation stays pipeline-wired; stylized-authored projects get the authored registry
+      // entry; independent/legacy projects keep the plain scaffold.
+      const scaffold = project.constructionMode === "stylized-authored"
+        ? MODEL_STYLIZED_SCAFFOLD
+        : project.authorshipMode === "derived" ? MODEL_DERIVED_SCAFFOLD : MODEL_SCAFFOLD;
+      await writeFile(modelPath, scaffold, { flag: "wx" });
       created.push(modelPath);
     }
-    if (project.authorshipMode === "derived") {
+    if (project.constructionMode === "stylized-authored") {
+      const authoredDirectory = resolver.resolveProjectPath("model/.generated-authored");
+      await mkdir(authoredDirectory, { recursive: true });
+      const authoredRegistryPath = join(authoredDirectory, "registry.mjs");
+      if (!await pathExists(authoredRegistryPath)) { await writeFile(authoredRegistryPath, emptyAuthoredRegistry()); created.push(authoredRegistryPath); }
+      await mkdir(resolver.resolveProjectPath("model/stylized"), { recursive: true });
+    }
+    if (project.authorshipMode === "derived" && project.constructionMode !== "stylized-authored") {
       const generatedDirectory = resolver.resolveProjectPath("model/.generated");
       await mkdir(generatedDirectory, { recursive: true });
       const registryPath = join(generatedDirectory, "registry.mjs");
       if (!await pathExists(registryPath)) { await writeFile(registryPath, emptyGeneratedRegistry(project.profile)); created.push(registryPath); }
     }
     await writeFile(layout.internal.references, `${JSON.stringify(referenceIndex, null, 2)}\n`, { flag: "wx" }); created.push(layout.internal.references);
-    await saveTaskState(layout.internal.state, createTaskState({ taskId: project.id, profile: project.profile, style: project.style, certification: project.certification, styleContractHash: style.hash, projectConfigurationHash: configurationHash, subjectContractHash, articulationRequired, ...(project.authorshipMode ? { authorshipMode: project.authorshipMode } : {}) })); created.push(layout.internal.state);
+    await saveTaskState(layout.internal.state, createTaskState({ taskId: project.id, profile: project.profile, style: project.style, certification: project.certification, styleContractHash: style.hash, projectConfigurationHash: configurationHash, subjectContractHash, articulationRequired, ...(project.authorshipMode ? { authorshipMode: project.authorshipMode } : {}), ...(project.constructionMode ? { constructionMode: project.constructionMode } : {}) })); created.push(layout.internal.state);
     await writeFile(layout.project, `${JSON.stringify(project, null, 2)}\n`, { flag: "wx" }); created.push(layout.project);
   } catch (error) {
     for (const path of created.reverse()) await rm(path, { force: true });
@@ -505,6 +526,7 @@ export async function resumeWorkspace(input: string): Promise<ResumedWorkspace> 
   if (!state.projectConfigurationHash) throw new Error("workspace state has no bound project configuration; run an explicit migration or rebind");
   if (state.projectConfigurationHash !== currentProjectHash || state.profile !== project.profile || state.style !== project.style || state.certification !== project.certification) throw new Error("project configuration differs from state; run an explicit migration or rebind");
   if (state.authorshipMode !== (project.authorshipMode ?? "independent")) throw new Error("project authorship mode differs from state; run an explicit rebind to change the authorship strategy");
+  if (effectiveConstructionMode(state.constructionMode) !== effectiveConstructionMode(project.constructionMode)) throw new Error("project construction mode differs from state; construction mode is bound to the run identity and requires an explicit rebind (design §5.1)");
   if (state.profileContractHash !== profileContractHash(getProfileContract(project.profile))) throw new Error("profile contract differs from state; rebind before continuing");
   if (state.styleContractHash !== style.hash) throw new Error("style contract differs from state; rebind before continuing");
   if (state.subjectContractHash !== subjectContractHash || state.articulationRequired !== (getProfileContract(project.profile).articulation.length > 0 || Boolean(subjectContractValue?.articulation?.length))) throw new Error("subject articulation contract differs from state; rebind before continuing");
@@ -556,6 +578,7 @@ export async function rebindWorkspace(input: string): Promise<ResumedWorkspace> 
     subjectContractHash: optionalContractHash(subjectContract),
     articulationRequired: getProfileContract(project.profile).articulation.length > 0 || Boolean(subjectContract?.articulation?.length),
     ...(project.authorshipMode ? { authorshipMode: project.authorshipMode } : {}),
+    ...(project.constructionMode ? { constructionMode: project.constructionMode } : {}),
   });
   next.systemDecisions.push({ id: "workspace-rebind", value: next.projectConfigurationHash, reason: "explicit rebind started a new evidence chain for current project configuration and reference bytes" });
   const archivedPreparation = await archiveWorkspacePreparation(root);

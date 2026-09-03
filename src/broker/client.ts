@@ -88,6 +88,44 @@ export class BrokerClient {
   }
 
   /** Trusted active-phase diagnostic render; never review/certification evidence (§7.3). */
+  // ---- stylized-authored mode (design §26) ----
+
+  authorStatus(runId: string): Promise<Record<string, unknown>> {
+    return this.call("author-status", { runId });
+  }
+
+  authorCompile(runId: string): Promise<Record<string, unknown>> {
+    return this.call("author-compile", { runId });
+  }
+
+  authorCheck(runId: string, scope?: string): Promise<Record<string, unknown>> {
+    return this.call("author-check", { runId, ...(scope ? { payload: { scope } } : {}) });
+  }
+
+  authorCheckpoint(runId: string, input: { kind: string; assessment?: Record<string, unknown> }): Promise<Record<string, unknown>> {
+    return this.call("author-checkpoint", { runId, payload: input });
+  }
+
+  authorMeasure(runId: string, semantics?: string[]): Promise<Record<string, unknown>> {
+    return this.call("author-measure", { runId, ...(semantics ? { payload: { semantics } } : {}) });
+  }
+
+  referenceScene(runId: string): Promise<Record<string, unknown>> {
+    return this.call("reference-scene", { runId });
+  }
+
+  validateFrozen(runId: string): Promise<Record<string, unknown>> {
+    return this.call("validate-frozen", { runId });
+  }
+
+  freezeConstruction(runId: string): Promise<Record<string, unknown>> {
+    return this.call("freeze-construction", { runId });
+  }
+
+  reopenAuthoring(runId: string, reason: string): Promise<Record<string, unknown>> {
+    return this.call("reopen-authoring", { runId, payload: { reason } });
+  }
+
   renderQuick(runId: string): Promise<Record<string, unknown>> {
     return this.call("render-quick", { runId });
   }

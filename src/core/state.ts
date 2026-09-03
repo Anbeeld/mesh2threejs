@@ -1,6 +1,8 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import type { AuthorshipMode, CertificationLevel, GateReport, ProfileId } from "../types.js";
+import type { AuthorshipMode, CertificationLevel, ConstructionMode, GateReport, ProfileId } from "../types.js";
+import type { AuthoredBinding } from "./authored-candidate.js";
+import type { StylizedAuthoringState } from "./authoring-state.js";
 import type { Route } from "./routing.js";
 import { canonicalJson, sha256 } from "./hashing.js";
 import { getProfileContract, profileContractHash } from "./contracts.js";
@@ -146,6 +148,15 @@ export interface TaskState {
   authorshipMode: AuthorshipMode;
   /** Trusted generated modules recorded by the derive pipeline, keyed by generated module path. */
   derivedBindings: Record<string, DerivedBinding>;
+  /** Construction architecture (design §5); absent on legacy states, which behave as "derived-faithful". */
+  constructionMode?: ConstructionMode;
+  /**
+   * Authored binding ledger (design §10/§25): DISTINCT from derivedBindings. Recorded only
+   * by trusted author-compile code; a stylized run composes ONLY these bindings.
+   */
+  authoredBindings?: Record<string, AuthoredBinding>;
+  /** Stylized authoring lifecycle (design §7/§25); meaningful only in stylized-authored mode. */
+  authoring?: StylizedAuthoringState;
   /**
    * Mirror metadata for trusted runs. The workspace copy of state is a cache of the
    * canonical run authority record; when present it must match the authority or the run
@@ -183,7 +194,7 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-export function createTaskState(input: { taskId: string; profile: ProfileId; style: string; certification?: CertificationLevel; styleContractHash?: string; projectConfigurationHash?: string; subjectContractHash?: string | null; articulationRequired?: boolean; authorshipMode?: AuthorshipMode }): TaskState {
+export function createTaskState(input: { taskId: string; profile: ProfileId; style: string; certification?: CertificationLevel; styleContractHash?: string; projectConfigurationHash?: string; subjectContractHash?: string | null; articulationRequired?: boolean; authorshipMode?: AuthorshipMode; constructionMode?: ConstructionMode }): TaskState {
   const contract = getProfileContract(input.profile);
   const styleContractHash = input.styleContractHash ?? getStyleContract(input.style).hash;
   const phases = contract.phases.map((phase) => phase.id);
@@ -225,6 +236,7 @@ export function createTaskState(input: { taskId: string; profile: ProfileId; sty
     phaseGeometryHashes: {},
     authorshipMode: input.authorshipMode ?? "independent",
     derivedBindings: {},
+    ...(input.constructionMode ? { constructionMode: input.constructionMode } : {}),
   };
 }
 
@@ -733,6 +745,7 @@ export async function loadTaskState(path: string): Promise<TaskState> {
   // independent behavior until the project is explicitly rebound with a declared mode.
   state.authorshipMode ??= "independent";
   state.derivedBindings ??= {};
+  state.authoredBindings ??= {};
   const lacksEvidenceAuthority = Object.values(state.evidence).some((evidence) => evidence.valid && evidence.verified && (!evidence.authority || !evidence.generatorVersion
     || (evidence.authority as unknown as string) === "external-visual-review"));
   if (lacksEvidenceAuthority) {
