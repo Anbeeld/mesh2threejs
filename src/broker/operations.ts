@@ -37,6 +37,7 @@ export const BROKER_OPERATIONS: ReadonlyArray<BrokerOperationDescriptor> = [
   { name: "author-check", capability: "builder", status: "implemented" },
   { name: "author-checkpoint", capability: "builder", status: "implemented" },
   { name: "author-measure", capability: "builder", status: "implemented" },
+  { name: "author-compare", capability: "builder", status: "implemented" },
   { name: "reference-scene", capability: "builder", status: "implemented" },
   { name: "validate-frozen", capability: "builder", status: "implemented" },
   { name: "freeze-construction", capability: "builder", status: "implemented" },

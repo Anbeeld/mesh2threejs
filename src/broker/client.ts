@@ -106,6 +106,10 @@ export class BrokerClient {
     return this.call("author-checkpoint", { runId, payload: input });
   }
 
+  authorCompare(runId: string): Promise<Record<string, unknown>> {
+    return this.call("author-compare", { runId });
+  }
+
   authorMeasure(runId: string, semantics?: string[]): Promise<Record<string, unknown>> {
     return this.call("author-measure", { runId, ...(semantics ? { payload: { semantics } } : {}) });
   }

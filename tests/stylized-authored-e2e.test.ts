@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, afterAll } from "vitest";
+import { PNG } from "pngjs";
 import { startBroker } from "../src/broker/server.js";
 import { BrokerClient } from "../src/broker/client.js";
 import { createSlopedTank, stableSemanticIdentityMap, sceneToGlb } from "./helpers/tank-fixtures.js";
@@ -45,7 +46,14 @@ describe("stylized-authored terminal E2E (design §47)", () => {
     const source = join(parent, "tank.glb");
     await writeFile(source, sceneToGlb(createSlopedTank()));
     const styleImage = join(parent, "style-ref-01.png");
-    await writeFile(styleImage, Buffer.from("style-image-bytes"));
+    const stylePng = new PNG({ width: 64, height: 48 });
+    for (let index = 0; index < 64 * 48; index += 1) {
+      stylePng.data[index * 4] = 120;
+      stylePng.data[index * 4 + 1] = 110;
+      stylePng.data[index * 4 + 2] = 40;
+      stylePng.data[index * 4 + 3] = 255;
+    }
+    await writeFile(styleImage, PNG.sync.write(stylePng));
 
     // Workspace scaffolding (dev surface): stylized mode is declared at CREATION (design §5.1)
     // together with the style reference pack. Every trusted act below goes through the broker.
@@ -126,6 +134,13 @@ describe("stylized-authored terminal E2E (design §47)", () => {
       expect(compiled.semantics).toContain("hull");
       expect(compiled.candidateHash).toMatch(/^[a-f0-9]{64}$/);
       expect(compiled.styleBinding).not.toBeNull();
+
+      // ---- Minimal Bundle F: Oracle | Candidate | Style boards + ghost overlays ----------
+      const compare = await builder.authorCompare(runId) as { status: string; views: string[]; boards: Array<{ view: string }>; ghostOverlays: Array<{ view: string }> };
+      expect(compare.status).toBe("author-compare-captured");
+      expect(compare.views).toEqual(["side", "front", "rear", "plan", "front-3-4"]);
+      expect(compare.boards.length).toBe(5);
+      expect(compare.ghostOverlays.length).toBe(3);
 
       // ---- Advisory diagnostics (author-check) incl. copy audit -----------------------
       const check = await builder.authorCheck(runId) as { copyAudit: { status: string; enforcement: string } };

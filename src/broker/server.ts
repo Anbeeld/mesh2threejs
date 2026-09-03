@@ -266,6 +266,10 @@ export async function startBroker(options: BrokerOptions = {}): Promise<BrokerHa
           requireRun(runId);
           respond(res, 200, await pipeline.authorMeasure(runId!, (request.payload ?? {}) as { semantics?: string[] }));
           return;
+        case "author-compare":
+          requireRun(runId);
+          respond(res, 200, await executeMutating(runId!, () => pipeline.authorCompare(runId!)));
+          return;
         case "reference-scene":
           requireRun(runId);
           respond(res, 200, await executeMutating(runId!, () => pipeline.referenceScene(runId!)));

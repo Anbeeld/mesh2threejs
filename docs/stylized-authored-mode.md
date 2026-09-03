@@ -82,7 +82,11 @@ duplicate part/semantic ids, illegal hierarchy/cycles, complexity ceilings,
 executable payloads/URLs/imports (all `AUTHOR_SPEC_INVALID`).
 
 Pivot semantics (`kind: "group"`) own zero geometry — transform-only groups whose
-bounds are a zero-volume box at the origin (design §28.2).
+bounds are a zero-volume box at the origin (design §28.2). EVERY
+`parentSemanticId` must itself have an AuthorSpec: pivots are explicitly authored
+as zero-geometry group specs with oracle-measured origins, because the authored
+registry composes authored objects only and an unauthored parent would silently
+leave the child unparented (a typo is a compile error, never a silent degradation).
 
 ## Trusted compilation and composition
 
@@ -143,10 +147,15 @@ authoring -> frozen -> validated -> visual-review -> approved -> final
   stylized runs require the current freeze plus a passing validation bound to
   that freeze.
 - `review-ready` binds the construction freeze id, the style binding hash, and
-  the exact style-pack files (references + brief) into the canonical review
-  binding alongside the legacy deterministic/style evidence — the human judges
-  style identity against the registered art-direction pack, not just the
-  executable style contract.
+  the exact style-pack files into BOTH the canonical review binding AND the
+  review packet itself (schema v5): `packet.json` carries `constructionFreezeId`,
+  `styleBindingHash`, and the style-reference images + written brief as
+  `style-reference` files the human is presented while approving. Review
+  regeneration is a normal operation (validated/visual-review/approved ->
+  visual-review with a new packet, same freeze + passing validation) and never
+  requires reopening geometry.
+- A written style brief (`style/brief.md`) is REQUIRED at freeze — images alone
+  do not encode the art-direction contract.
 - Human approval (`approve-review`, human-admin only) advances the authoring
   lifecycle to `approved`; `trusted-finalize` re-verifies every bound review
   artifact, executes a fresh replay, and certifies — closing the chain
@@ -156,9 +165,16 @@ authoring -> frozen -> validated -> visual-review -> approved -> final
 
 ```text
 author-status | author-compile | author-check | author-checkpoint
-author-measure | reference-scene | validate-frozen
+author-measure | author-compare | reference-scene | validate-frozen
 freeze-construction | reopen-authoring
 ```
+
+`author-compare` is the minimal comparison surface (Bundle F minimum, design
+§12/§40): one operation that produces, for side/front/rear/plan/front-3/4 views,
+**Oracle | Candidate | Style-reference** triplet boards plus oracle ghost
+overlays (oracle silhouette at 50% over the candidate render). The style column
+comes only from the bound style pack. This exists so the builder must actually
+LOOK at the art direction — the failure mode that motivated the mode.
 
 Disallowed in this mode: `derive` (`MODE_FORBIDS_DERIVATION`), all
 source-derived repair construction, oracle mesh export, oracle→AuthorSpec

@@ -38,7 +38,13 @@ export interface AuthoringFreezeRecord {
   oracleBinding: string;
   featurePlanHash: string | null;
   compilerVersion: string;
+  /** Content binding of the final-draft visual evidence (design §19): the freeze does not
+   * merely PRECONDITION on a final-draft checkpoint, it binds the checkpoint's candidate
+   * hash, capture-set hash, and assessment hash so "visual evidence before freeze" is a
+   * verifiable content fact inside the freeze identity itself. */
   finalDraftCheckpointId: string;
+  finalDraftCapturesHash: string;
+  finalDraftAssessmentHash: string | null;
   createdAt: string;
 }
 
@@ -144,6 +150,10 @@ export function freezeAuthoring(state: TaskState, freeze: Omit<AuthoringFreezeRe
   const next = structuredClone(state);
   const record: AuthoringFreezeRecord = {
     ...structuredClone(freeze),
+    // The freeze BINDS the final-draft evidence content, not just its existence.
+    finalDraftCheckpointId: finalDraft.id,
+    finalDraftCapturesHash: finalDraft.capturesHash,
+    finalDraftAssessmentHash: finalDraft.assessmentHash ?? null,
     id: "",
     createdAt: new Date().toISOString(),
   };
@@ -153,9 +163,15 @@ export function freezeAuthoring(state: TaskState, freeze: Omit<AuthoringFreezeRe
   return next;
 }
 
-/** Freeze identity: a content hash over everything freeze binds (design §19). */
+/**
+ * Freeze identity: a CONTENT hash over everything freeze binds (design §19). The record
+ * timestamp is deliberately excluded — two freezes of identical bound content are the same
+ * freeze identity, so identity changes only when a bound input actually changes.
+ */
 export function authoringFreezeIdentity(freeze: Omit<AuthoringFreezeRecord, "id" | "createdAt">): string {
-  return sha256(canonicalJson({ kind: "stylized-authored-freeze", ...structuredClone(freeze) }));
+  const { createdAt: _createdAt, ...content } = freeze as AuthoringFreezeRecord;
+  void _createdAt;
+  return sha256(canonicalJson({ kind: "stylized-authored-freeze", ...structuredClone(content) }));
 }
 
 /**
@@ -193,11 +209,19 @@ export function recordAuthoringValidation(state: TaskState, input: { freezeId: s
   return next;
 }
 
-/** Moves a validated freeze to visual review with its packet binding (design §23). */
+/**
+ * Moves a validated freeze to visual review with its packet binding (design §23). Review
+ * REGENERATION is a normal operation and never requires reopening geometry: a refreshed
+ * packet is allowed from `visual-review` (new captures) and from `approved` (a refreshed
+ * packet invalidates the prior approval — the canonical authority clears it when the new
+ * packet binds). The freeze and its passing validation must be unchanged in every case.
+ */
 export function recordAuthoringReviewReady(state: TaskState, input: { freezeId: string; packetHash: string }): TaskState {
   const authoring = requireAuthoring(state);
-  if (authoring.status !== "validated") fail("FREEZE_STALE", "visual review requires a passing deterministic validation first");
+  const refreshable = authoring.status === "validated" || authoring.status === "visual-review" || authoring.status === "approved";
+  if (!refreshable) fail("FREEZE_STALE", `visual review requires a passing deterministic validation first (current status: ${authoring.status})`);
   if (!authoring.freeze || authoring.freeze.id !== input.freezeId) fail("FREEZE_STALE", "review packet freeze id does not match the current freeze");
+  if (!authoring.validation?.passed || authoring.validation.freezeId !== input.freezeId) fail("FREEZE_STALE", "review regeneration requires the passing validation bound to the current freeze");
   if (!/^[a-f0-9]{64}$/u.test(input.packetHash)) fail("AUTHOR_SPEC_INVALID", "review packetHash must be sha256");
   const next = structuredClone(state);
   const authoringNext = next.authoring!;

@@ -218,19 +218,24 @@ describe("authored semantic graph", () => {
   const hull: AuthorSpec = { schemaVersion: 1, semanticId: "hull", parts: [{ name: "shell", geometry: { kind: "box", size: [2, 0.5, 1] } }] };
   const turretPivot: AuthorSpec = { schemaVersion: 1, semanticId: "turret-pivot", kind: "group", origin: [0, 1.6, 0.3], parts: [] };
   const turret: AuthorSpec = { schemaVersion: 1, semanticId: "turret", parentSemanticId: "turret-pivot", parts: [{ name: "shell", geometry: { kind: "box", size: [1, 0.5, 1] } }] };
+  const gunPivot: AuthorSpec = { schemaVersion: 1, semanticId: "gun-pivot", kind: "group", origin: [0, 0.42, 0.95], parts: [] };
   const gun: AuthorSpec = { schemaVersion: 1, semanticId: "gun", parentSemanticId: "gun-pivot", parts: [{ name: "barrel", geometry: { kind: "tube", from: [0, 0, 0], to: [1.5, 0, 0], radius: 0.05, segments: 8 } }] };
 
   test("one root per semantic; parents precede children; external pivot nestings recorded", () => {
-    const { ordered, pivotNestings } = validateAuthoredSemanticGraph([turret, turretPivot, hull, gun], new Set(["gun-pivot"]));
-    expect(ordered.map((spec) => spec.semanticId)).toEqual(["turret-pivot", "turret", "hull", "gun"]);
-    // Every parented semantic nests (authored pivot parents AND external pivots).
+    const gunPivot: AuthorSpec = { schemaVersion: 1, semanticId: "gun-pivot", kind: "group", origin: [0, 0.42, 0.95], parts: [] };
+    const { ordered, pivotNestings } = validateAuthoredSemanticGraph([turret, turretPivot, hull, gun, gunPivot]);
+    expect(ordered.map((spec) => spec.semanticId)).toEqual(["turret-pivot", "turret", "hull", "gun-pivot", "gun"]);
+    // Every parented semantic nests under its AUTHORED pivot parent.
+    expect(ordered.map((spec) => spec.semanticId)).not.toContain("bogus");
+    void ordered;
+
     expect(pivotNestings).toEqual([["turret", "turret-pivot"], ["gun", "gun-pivot"]]);
   });
 
-  test("negative: unresolvable external parent fails compile instead of silently unparenting", () => {
-    expect(() => validateAuthoredSemanticGraph([hull, gun])).toThrow(/neither an authored semantic root nor a known oracle pivot semantic/u);
-    // Declared by the live oracle semantic map -> legal external pivot.
-    expect(() => validateAuthoredSemanticGraph([hull, gun], new Set(["gun-pivot"]))).not.toThrow();
+  test("negative: parent without an AuthorSpec is a compile error, never a silent unparent", () => {
+    // "gun-pivot" exists in the oracle but has NO authored spec -> refused even though the
+    // oracle semantic map knows the name (the registry composes authored objects only).
+    expect(() => validateAuthoredSemanticGraph([hull, gun])).toThrow(/names parent "gun-pivot", which has no AuthorSpec/u);
   });
 
   test("negative: duplicate roots and cycles fail closed", () => {
@@ -254,12 +259,15 @@ describe("authored semantic graph", () => {
     await mkdir(join(root, "model/stylized"), { recursive: true });
     await writeFile(join(root, "model/stylized/hull.json"), JSON.stringify(hull, null, 2));
     await writeFile(join(root, "model/stylized/turret-pivot.json"), JSON.stringify(turretPivot, null, 2));
+    await writeFile(join(root, "model/stylized/gun-pivot.json"), JSON.stringify(gunPivot, null, 2));
     await writeFile(join(root, "model/stylized/turret.json"), JSON.stringify(turret, null, 2));
+    const gunPivotSpec: AuthorSpec = { schemaVersion: 1, semanticId: "gun-pivot", kind: "group", origin: [0, 0.42, 0.95], parts: [] };
+    await writeFile(join(root, "model/stylized/gun-pivot.json"), JSON.stringify(gunPivotSpec, null, 2));
     await writeFile(join(root, "model/stylized/gun.json"), JSON.stringify(gun, null, 2));
-    const first = await compileAuthoredWorkspace(root, { knownExternalParents: new Set(["gun-pivot"]) });
-    const second = await compileAuthoredWorkspace(root, { knownExternalParents: new Set(["gun-pivot"]) });
+    const first = await compileAuthoredWorkspace(root);
+    const second = await compileAuthoredWorkspace(root);
     expect(first.compiledGraphHash).toBe(second.compiledGraphHash);
-    expect(first.ordered.map((spec) => spec.semanticId)).toEqual(["gun", "hull", "turret-pivot", "turret"]);
+    expect(first.ordered.map((spec) => spec.semanticId)).toEqual(["gun-pivot", "gun", "hull", "turret-pivot", "turret"]);
     expect(first.registrySource).toContain("turret-pivot.mjs");
     for (const module of first.modules) {
       expect(module.manifest.kind).toBe("mesh2threejs-authored-part");
@@ -268,7 +276,7 @@ describe("authored semantic graph", () => {
     }
     // A mutated spec changes the compiled graph hash.
     await writeFile(join(root, "model/stylized/hull.json"), JSON.stringify({ ...hull, origin: [0, 0.1, 0] }, null, 2));
-    const mutated = await compileAuthoredWorkspace(root, { knownExternalParents: new Set(["gun-pivot"]) });
+    const mutated = await compileAuthoredWorkspace(root);
     expect(mutated.compiledGraphHash).not.toBe(first.compiledGraphHash);
   });
 });
@@ -536,6 +544,8 @@ describe("stylized authoring lifecycle", () => {
     featurePlanHash: null,
     compilerVersion: AUTHORED_COMPILER_VERSION,
     finalDraftCheckpointId: "final-draft-1",
+    finalDraftCapturesHash: H,
+    finalDraftAssessmentHash: null,
     neutralGeometryHash: H,
     articulationBehaviorHash: H,
   };
@@ -575,6 +585,48 @@ describe("stylized authoring lifecycle", () => {
     // Freeze identity is content-derived: a changed binding changes the id.
     const changedFreeze = freezeAuthoring(matching, { ...freezeBase, styleBinding: "c".repeat(64) });
     expect(changedFreeze.authoring!.freeze!.id).not.toBe(frozen.authoring!.freeze!.id);
+  });
+
+  test("freeze BINDS final-draft evidence content, not just its existence (lifecycle closure)", () => {
+    const state = stateWithAuthoring();
+    const capturesHash = "e".repeat(64);
+    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash, assessment: { style: "PASS" } });
+    const frozen = freezeAuthoring(withFinalDraft, freezeBase);
+    expect(frozen.authoring!.freeze!.finalDraftCheckpointId).toBe("final-draft-1");
+    expect(frozen.authoring!.freeze!.finalDraftCapturesHash).toBe(capturesHash);
+    // Caller-supplied capture hashes cannot forge the binding: the freeze binds the ACTUAL
+    // final-draft checkpoint content.
+    const forgedInput = freezeAuthoring(withFinalDraft, { ...freezeBase, finalDraftCapturesHash: "f".repeat(64) });
+    expect(forgedInput.authoring!.freeze!.finalDraftCapturesHash).toBe(capturesHash);
+    expect(forgedInput.authoring!.freeze!.id).toBe(frozen.authoring!.freeze!.id);
+    // A DIFFERENT final-draft checkpoint (fresh capture set) produces a different freeze id.
+    const freshCheckpoint = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: "f".repeat(64), assessment: { style: "PASS" } });
+    const refrozen = freezeAuthoring(freshCheckpoint, freezeBase);
+    expect(refrozen.authoring!.freeze!.finalDraftCapturesHash).toBe("f".repeat(64));
+    expect(refrozen.authoring!.freeze!.id).not.toBe(frozen.authoring!.freeze!.id);
+  });
+
+  test("review refresh transitions: validated/visual-review/approved -> visual-review without reopening geometry", () => {
+    const state = stateWithAuthoring();
+    const withFinalDraft = recordAuthorCheckpoint(state, { kind: "final-draft", candidateHash: H, capturesHash: H });
+    const frozen = freezeAuthoring(withFinalDraft, freezeBase);
+    const freezeId = frozen.authoring!.freeze!.id;
+    const validated = recordAuthoringValidation(frozen, { freezeId, reportHash: H, passed: true });
+    // First packet.
+    const atReview = recordAuthoringReviewReady(validated, { freezeId, packetHash: "1".repeat(64) });
+    expect(atReview.authoring!.status).toBe("visual-review");
+    // Refreshed packet WITHOUT reopening geometry (visual-review -> visual-review).
+    const refreshed = recordAuthoringReviewReady(atReview, { freezeId, packetHash: "2".repeat(64) });
+    expect(refreshed.authoring!.status).toBe("visual-review");
+    expect(refreshed.authoring!.review!.packetHash).toBe("2".repeat(64));
+    // Approval then a refreshed packet invalidates back to visual-review (approved -> visual-review).
+    const approved = recordAuthoringReviewDecision(refreshed, { freezeId, packetHash: "2".repeat(64), decision: "approved" });
+    expect(approved.authoring!.status).toBe("approved");
+    const reReview = recordAuthoringReviewReady(approved, { freezeId, packetHash: "3".repeat(64) });
+    expect(reReview.authoring!.status).toBe("visual-review");
+    expect(reReview.authoring!.review!.status).toBe("awaiting");
+    // Refresh still requires the freeze + validation to be current.
+    expect(() => recordAuthoringReviewReady(withFinalDraft, { freezeId, packetHash: "4".repeat(64) })).toThrow(/visual review requires a passing deterministic validation first/u);
   });
 
   test("compiler version change changes freeze identity (§33.5)", () => {

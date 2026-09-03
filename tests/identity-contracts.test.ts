@@ -230,7 +230,7 @@ describe("live workspace candidate binding", () => {
     expect(cache.candidateFiles).toEqual(expect.arrayContaining([expect.objectContaining({ path: "model.mjs", sha256: expect.stringMatching(/^[a-f0-9]{64}$/u) })]));
     expect(styleArtifact).toMatchObject({ styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash });
     expect(renderManifest).toMatchObject({ styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash });
-    expect(reviewPacket).toMatchObject({ schemaVersion: 4, styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash });
+    expect(reviewPacket).toMatchObject({ schemaVersion: 5, styleContractHash: state.styleContractHash, evaluationIdentityHash: state.evaluationIdentityHash });
   }, 30_000);
 
   test("rejects recording a verdict after candidate source changes", async () => {

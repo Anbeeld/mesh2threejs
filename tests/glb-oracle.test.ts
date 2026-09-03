@@ -79,7 +79,7 @@ describe("source and prepared oracle lifecycle", () => {
     expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "captures", "render-0001", "render-manifest.json"), "utf8"))).toMatchObject({ schemaVersion: 1 });
     expect(await runCli(["prepare-review", root], sink)).toBe(0);
     expect(await runCli(["review-status", root], sink)).toBe(0);
-    expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "visual-review", "review-0001", "packet.json"), "utf8"))).toMatchObject({ schemaVersion: 4 });
+    expect(JSON.parse(await readFile(join(root, ".mesh2threejs", "visual-review", "review-0001", "packet.json"), "utf8"))).toMatchObject({ schemaVersion: 5 });
     const firstGateArtifact = await readFile(join(root, ".mesh2threejs", "evidence", "gate-0001", "gate-0001-primary-mass.json"), "utf8");
     expect(await runCli(["gate", root, "--global"], sink)).toBe(0);
     expect(await readFile(join(root, ".mesh2threejs", "evidence", "gate-0001", "gate-0001-primary-mass.json"), "utf8")).toBe(firstGateArtifact);

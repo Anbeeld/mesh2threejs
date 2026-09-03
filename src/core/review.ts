@@ -13,11 +13,28 @@ export interface CaptureReference {
 export interface ReviewFileReference {
   path: string;
   sha256: string;
-  role: "capture" | "comparison-board" | "turntable" | "deterministic" | "style" | "articulation" | "region";
+  role: "capture" | "comparison-board" | "turntable" | "deterministic" | "style" | "articulation" | "region" | "style-reference";
+}
+
+/**
+ * Style authority files presented to the reviewer (schema v5, stylized-authored mode): the
+ * registered art-direction images and the written brief the human must view while judging
+ * style identity. Each entry is byte-verified like every other referenced file.
+ */
+export interface StyleReferenceBinding {
+  path: string;
+  sha256: string;
+  label: string;
 }
 
 export interface VisualReviewPacket {
-  schemaVersion: 4;
+  schemaVersion: 5;
+  /** Stylized-authored only: the frozen construction this packet reviews. */
+  constructionFreezeId?: string;
+  /** Stylized-authored only: the style binding the reviewed candidate was frozen against. */
+  styleBindingHash?: string;
+  /** Stylized-authored only: the exact art-direction files bound into this packet. */
+  styleReferences?: StyleReferenceBinding[];
   oracleHash: string;
   candidateHash: string;
   profile: ProfileId;
@@ -72,7 +89,7 @@ function assertVisualReviewPacketContents(input: Omit<VisualReviewPacket, "packe
 
 export function createVisualReviewPacket(input: Omit<VisualReviewPacket, "schemaVersion" | "packetHash">): VisualReviewPacket {
   assertVisualReviewPacketContents(input);
-  const payload = { schemaVersion: 4 as const, ...input };
+  const payload = { schemaVersion: 5 as const, ...input };
   return { ...payload, packetHash: sha256(canonicalJson(payload)) };
 }
 
@@ -91,7 +108,20 @@ export async function verifyVisualReviewPacketFiles(packet: VisualReviewPacket, 
 }
 
 export function verifyVisualReviewPacket(packet: VisualReviewPacket): void {
-  if (packet.schemaVersion !== 4 || !packet.styleContractHash || !packet.evaluationIdentityHash) throw new Error("visual review packet schema or evaluation identity is invalid");
+  if (packet.schemaVersion !== 5 || !packet.styleContractHash || !packet.evaluationIdentityHash) throw new Error("visual review packet schema or evaluation identity is invalid");
+  // Stylized art authority: a packet bound to a construction freeze must carry the exact
+  // style-reference files in its referenced set (design §23).
+  if (packet.constructionFreezeId) {
+    if (!packet.styleBindingHash) throw new Error("a stylized review packet bound to a construction freeze must carry the style binding hash");
+    if (!packet.styleReferences?.length) throw new Error("a stylized review packet bound to a construction freeze must reference the registered style files");
+    for (const reference of packet.styleReferences) {
+      const bound = packet.files.find((file) => file.role === "style-reference" && file.path === reference.path && file.sha256 === reference.sha256);
+      if (!bound) throw new Error(`style reference is absent from the referenced files: ${reference.path}`);
+      if (reference.label !== "brief" && !/\.(png|jpg|jpeg|webp|avif|bmp)$/iu.test(reference.path)) {
+        throw new Error(`style reference image has an unsupported extension: ${reference.path}`);
+      }
+    }
+  }
   const { packetHash, ...payload } = packet;
   if (sha256(canonicalJson(payload)) !== packetHash) throw new Error("visual review packet hash is invalid");
   assertVisualReviewPacketContents(packet);

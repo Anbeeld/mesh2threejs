@@ -57,6 +57,7 @@ import { verifyFreezeCurrent, featurePlanHash } from "../core/authoring-freeze.j
 import { computeStyleBinding, verifyStyleBindingCurrent, type StyleBinding } from "../core/style-binding.js";
 import { buildReferenceScene, writeReferenceScene, verifyReferenceSceneAlignment } from "../core/reference-scene.js";
 import { buildOracleGuides } from "../core/oracle-guides.js";
+import { performAuthorCompareRun } from "../core/author-compare.js";
 import { auditOracleCopy } from "../core/oracle-copy-audit.js";
 import { snapshotScene } from "../core/geometry.js";
 import { trustedDerivedBackend } from "../core/candidate-sandbox.js";
@@ -625,11 +626,7 @@ export class TrustedPipeline {
     const { record, workspace } = await this.stylizedContext(runId);
     const preparation = await verifyWorkspaceOraclePreparation(workspace);
     assertAuthoringEditable(record.embedded.state);
-    // External parent authority: the live prepared oracle's semantic map (same canonical
-    // frame the evaluator consumes) declares which non-authored pivots/anchors exist.
-    const oracleScene = await loadPreparedOracle(preparation.manifest, workspace.root);
-    const knownExternalParents = new Set(Object.keys(snapshotScene(oracleScene).components));
-    const compilation = await compileAuthoredWorkspace(workspace.root, { knownExternalParents });
+    const compilation = await compileAuthoredWorkspace(workspace.root);
     // Hard architecture boundary (design §16.1): candidate files may never reach oracle data.
     await assertNoOracleReachingCandidateFiles(workspace.root);
     // Persist pipeline-owned generated modules + manifests.
@@ -725,6 +722,62 @@ export class TrustedPipeline {
     return { status: "guides-computed", guide, note: "low-dimensional measurement facts only; source topology never leaves the trusted boundary" };
   }
 
+  /**
+   * Minimal Bundle F comparison surface (design §12/§40): ONE supported operation that gives
+   * the builder Oracle | Candidate | Style-reference triplet boards for side/front/rear/plan/
+   * front-3/4 plus oracle ghost overlays. Diagnostic evidence only — it exists so the agent
+   * must actually LOOK at the art direction, never to satisfy gates.
+   */
+  async authorCompare(runId: string): Promise<Record<string, unknown>> {
+    const { record, workspace } = await this.stylizedContext(runId);
+    const state = record.embedded.state;
+    const preparation = await verifyWorkspaceOraclePreparation(workspace);
+    const oracle = await loadPreparedOracle(preparation.manifest, workspace.root);
+    const execution = await inspectWorkspaceCandidateViaExecutor({
+      workspaceRoot: workspace.root,
+      modelEntryPath: workspace.resolved.model,
+      boundaryRoot: resolve(workspace.root, "model"),
+      poses: [neutralPoseForProfile(workspace.project.profile)],
+      auditOptions: { trustedGeneratedModules: await loadTrustedAuthoredModules({ workspaceRoot: workspace.root, authoredBindings: state.authoredBindings ?? {} }) },
+      trusted: true,
+      ...(this.executionScratchRoot ? { executionScratchRoot: this.executionScratchRoot } : {}),
+    });
+    // Style images come ONLY from the bound style pack (verified against the recorded binding).
+    const styleBinding = state.authoring?.styleBinding;
+    if (!styleBinding?.references.length) {
+      throw new PipelineError("STYLE_BINDING_REQUIRED", "author-compare requires a bound style pack; register style references and rerun author-compile");
+    }
+    if (state.authoring?.freeze) {
+      // Post-freeze: the compared inputs must still match the frozen binding.
+      await verifyStyleBindingCurrent(workspace.root, styleBinding);
+  }
+    const styleImages = styleBinding.references
+      .filter((reference) => /\.(png)$/iu.test(reference.path))
+      .slice(0, 1)
+      .map((reference) => ({ label: reference.role, path: resolve(workspace.root, reference.path) }));
+    if (!styleImages.length) {
+      throw new PipelineError("STYLE_BINDING_REQUIRED", "author-compare requires at least one registered style IMAGE reference (PNG)");
+    }
+    const directory = join(workspace.layout.internal.captures, `author-compare-${record.mirrorSequence + 1}`);
+    const result = await performAuthorCompareRun({
+      directory,
+      oracle,
+      candidate: execution.neutralRoot,
+      styleImages,
+      runId: `author-compare-${record.mirrorSequence + 1}`,
+    });
+    return {
+      status: "author-compare-captured",
+      directory: this.toProjectPath(result.directory, workspace),
+      views: result.views,
+      boards: result.boards.map((board) => ({ path: this.toProjectPath(board.path, workspace), sha256: board.sha256, view: board.view })),
+      ghostOverlays: result.ghostOverlays.map((board) => ({ path: this.toProjectPath(board.path, workspace), sha256: board.sha256, view: board.view })),
+      manifest: this.toProjectPath(result.manifestPath, workspace),
+      manifestHash: result.manifestHash,
+      note: "Oracle | Candidate | Style triplet boards + oracle ghost overlays; diagnostic evidence only — look at the art direction",
+    };
+  }
+
   /** Visual checkpoint evidence (design §18): renders first, then records the checkpoint. */
   async authorCheckpoint(runId: string, input: { kind: string; assessment?: Record<string, unknown> }): Promise<Record<string, unknown>> {
     const { record, workspace } = await this.stylizedContext(runId);
@@ -770,13 +823,15 @@ export class TrustedPipeline {
     }
     const styleBinding = state.authoring.styleBinding;
     if (!styleBinding) throw new PipelineError("STYLE_BINDING_REQUIRED", "missing style binding prevents stylized freeze; register style/references.json and rerun author-compile");
+    // A written brief is required at freeze (design §14): images alone do not encode the
+    // art-direction contract ("copy abstraction, do not copy inaccurate proportions").
+    if (!styleBinding.briefPath) {
+      throw new PipelineError("STYLE_BINDING_REQUIRED", "stylized freeze requires a written style brief at style/brief.md; images alone do not carry the art-direction contract");
+    }
     await verifyStyleBindingCurrent(workspace.root, styleBinding);
     // The frozen compilation must be the CURRENT one: recompile deterministically and verify
-    // the durable bindings still reproduce it. External parent authority comes from the live
-    // prepared oracle semantic map, exactly as at compile time.
-    const frozenOracle = await loadPreparedOracle(preparation.manifest, workspace.root);
-    const frozenExternalParents = new Set(Object.keys(snapshotScene(frozenOracle).components));
-    const compilation = await compileAuthoredWorkspace(workspace.root, { knownExternalParents: frozenExternalParents });
+    // the durable bindings still reproduce it.
+    const compilation = await compileAuthoredWorkspace(workspace.root);
     const bindings: Record<string, AuthoredBinding> = {};
     for (const module of compilation.modules) bindings[`model/.generated-authored/${module.semanticId}.mjs`] = module.binding;
     if (canonicalJson(bindings) !== canonicalJson(state.authoredBindings ?? {})) {
@@ -805,7 +860,11 @@ export class TrustedPipeline {
       oracleBinding: preparation.binding.identity,
       featurePlanHash: await featurePlanHash(workspace.root),
       compilerVersion: AUTHORED_COMPILER_VERSION,
+      // finalDraftCheckpointId/CapturesHash/AssessmentHash are bound by freezeAuthoring
+      // from the matching final-draft checkpoint (content binding, not just a precondition).
       finalDraftCheckpointId: "",
+      finalDraftCapturesHash: "",
+      finalDraftAssessmentHash: null,
       neutralGeometryHash: execution.neutralSceneHash,
       articulationBehaviorHash: sha256(canonicalJson({ posedRoots: execution.posedRoots.length, deterministic: execution.deterministic })),
     };
@@ -1298,6 +1357,13 @@ export class TrustedPipeline {
     const boardFiles = renderManifest.comparisonBoards.map((item) => ({ path: item.path, sha256: item.sha256, role: "comparison-board" as const }));
     const turntableFiles = renderManifest.turntable.map((item) => ({ path: item.path, sha256: item.sha256, role: "turntable" as const }));
     const regionFile = renderManifest.regionDiagnostics ? { ...renderManifest.regionDiagnostics, role: "region" as const } : undefined;
+    // Stylized art authority IN the packet (design §23): the human is presented the exact
+    // registered style images + written brief while approving, bound byte-exact.
+    const styleReferenceFiles = stylePackFiles.map((file) => ({
+      path: file.path,
+      sha256: file.sha256,
+      label: file.path.endsWith(".md") ? "brief" : (record.embedded.state.authoring?.styleBinding?.references.find((reference) => reference.path === file.path)?.role ?? "style-reference"),
+    }));
     const packet = createVisualReviewPacket({
       oracleHash: manifest.binding.identity,
       candidateHash: replay.candidateHash,
@@ -1311,8 +1377,10 @@ export class TrustedPipeline {
       comparisonBoardHashes: boardFiles.map((item) => item.sha256),
       turntableHashes: turntableFiles.map((item) => item.sha256),
       ...(articulationFile ? { articulationArtifactHash: articulationFile.sha256 } : {}),
+      ...(constructionFreezeId ? { constructionFreezeId, styleBindingHash: styleBindingHash!, styleReferences: styleReferenceFiles } : {}),
       regionEvidence: regionFile ? { status: "available", semanticArtifactHash: regionFile.sha256 } : { status: "unavailable", reason: "this render run did not emit semantic region diagnostics" },
-      files: [...captureFiles, ...boardFiles, ...turntableFiles, deterministicFile, styleFile, ...(articulationFile ? [articulationFile] : []), ...(regionFile ? [regionFile] : [])],
+      files: [...captureFiles, ...boardFiles, ...turntableFiles, deterministicFile, styleFile, ...(articulationFile ? [articulationFile] : []), ...(regionFile ? [regionFile] : []),
+        ...stylePackFiles.map((file) => ({ path: file.path, sha256: file.sha256, role: "style-reference" as const }))],
     });
     const packetPath = join(renderRunDirectory, "packet.json");
     await writeFile(packetPath, `${JSON.stringify(packet, null, 2)}\n`, { flag: "wx" });
@@ -1389,6 +1457,8 @@ export class TrustedPipeline {
         boards: result.comparisonBoards.map((board) => this.toProjectPath(board.path, workspace)),
         turntable: `${this.toProjectPath(renderRunDirectory, workspace)}/turntable/`,
         viewerScene: this.toProjectPath(sceneArtifactPath, workspace),
+        ...(stylePackFiles.length ? { styleReferences: stylePackFiles.map((file) => ({ path: file.path, sha256: file.sha256, label: file.path.endsWith(".md") ? "brief" : (record.embedded.state.authoring?.styleBinding?.references.find((reference) => reference.path === file.path)?.role ?? "style-reference") })) } : {}),
+        ...(constructionFreezeId ? { constructionFreezeId } : {}),
       },
       viewerStatus: "not-started",
       note: "final human visual approval is required; the interactive viewer is optional and starts only with explicit user approval",
@@ -1409,6 +1479,14 @@ export class TrustedPipeline {
 
   /** Human/admin approval sealed from canonical values only (§9.F3). */
   async approveReview(runId: string, input: { method?: "broker-console" | "host-capability" | "test-capability" }, capability: Capability): Promise<Record<string, unknown>> {
+    // Stylized invariant (lifecycle closure): EVERY post-freeze authority boundary fails
+    // stale immediately. Approval verifies the CURRENT freeze inputs (specs, feature plan,
+    // style binding, compiler version) before sealing, so a human can never approve a
+    // construction whose frozen inputs were edited out from under the review packet.
+    const preRecord = await this.authority.readRun(runId);
+    if (effectiveConstructionMode(preRecord.policy.constructionMode) === "stylized-authored") {
+      await this.stylizedFrozenContext(runId);
+    }
     const next = await this.authority.approveReview(runId, { method: input.method ?? "broker-console" }, this.context(capability));
     await this.commitCanonicalAndMirror(next);
     return { status: "approved", approvedAt: next.review.humanApproval?.approvedAt };

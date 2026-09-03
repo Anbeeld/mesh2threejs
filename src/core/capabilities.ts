@@ -37,6 +37,7 @@ export const BUILDER_OPERATIONS = new Set([
   "author-check",
   "author-checkpoint",
   "author-measure",
+  "author-compare",
   "reference-scene",
   "validate-frozen",
   "freeze-construction",
