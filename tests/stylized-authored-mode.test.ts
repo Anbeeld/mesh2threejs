@@ -204,7 +204,7 @@ describe("trusted author compiler", () => {
     const ordered = ["turret-pivot", "turret", "hull"];
     const nestings: Array<readonly [string, string]> = [["turret", "turret-pivot"]];
     const source = generateAuthoredRegistrySource(ordered, nestings);
-    expect(source).toContain(`import { createSeed as createSeedturretpivot } from "./turret-pivot.mjs";`);
+    expect(source).toContain(`import { createSeed as createSeedturret_pivot } from "./turret-pivot.mjs";`);
     expect(source).toContain(JSON.stringify(nestings));
     expect(source).toContain("setPose(pose)");
     expect(source).toContain("turret-pivot");
@@ -267,7 +267,7 @@ describe("authored semantic graph", () => {
     const first = await compileAuthoredWorkspace(root);
     const second = await compileAuthoredWorkspace(root);
     expect(first.compiledGraphHash).toBe(second.compiledGraphHash);
-    expect(first.ordered.map((spec) => spec.semanticId)).toEqual(["gun-pivot", "gun", "hull", "turret-pivot", "turret"]);
+    expect(first.ordered.map((spec) => spec.semanticId)).toEqual(["gun", "gun-pivot", "hull", "turret", "turret-pivot"]);
     expect(first.registrySource).toContain("turret-pivot.mjs");
     for (const module of first.modules) {
       expect(module.manifest.kind).toBe("mesh2threejs-authored-part");

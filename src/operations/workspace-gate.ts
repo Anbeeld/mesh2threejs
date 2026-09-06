@@ -193,15 +193,18 @@ export async function computeWorkspaceGate(workspace: ResumedWorkspace, options:
   if (options.trusted && isStylized) {
     const { MODEL_STYLIZED_SCAFFOLD, AUTHORED_REGISTRY_PATH, generateAuthoredRegistrySource } = await import("../core/author-compiler.js");
     const bindings = workspace.state.authoredBindings ?? {};
-    const ordered = (await import("../core/authored-candidate.js")).orderedAuthoredSemanticsFromBindings(bindings);
-    // Pivot nestings (child under a NON-authored pivot semantic) are reconstructable from
-    // the bindings' parentSemanticId fields.
-    const nestings = ordered
-      .map((semanticId) => {
-        const binding = Object.values(bindings).find((item) => item.semanticId === semanticId);
-        return binding?.parentSemanticId ? ([semanticId, binding.parentSemanticId] as const) : null;
-      })
-      .filter((item): item is readonly [string, string] => item !== null);
+    // Read the authored specs from the filesystem and use the SAME ordering as
+    // compileAuthoredWorkspace (validateAuthoredSemanticGraph) so the expected registry
+    // source matches what the author-compile wrote.
+    const ac = await import("../core/authored-candidate.js");
+    const discovered = await ac.discoverAuthorSpecs(workspace.root);
+    const specs = [];
+    for (const entry of discovered) specs.push(await ac.readAuthorSpec(workspace.root, entry.path));
+    const { ordered: graphOrdered, pivotNestings } = ac.validateAuthoredSemanticGraph(specs);
+    // Match compileAuthoredWorkspace exactly: sort the traversed semantics alphabetically,
+    // but keep the pivot nestings in the traversal (pre-sort) order.
+    const ordered = graphOrdered.map((spec) => spec.semanticId).sort((a, b) => a.localeCompare(b));
+    const nestings = pivotNestings;
     authorityExpectations = {
       scaffoldSource: MODEL_STYLIZED_SCAFFOLD,
       registryPath: resolve(workspace.root, AUTHORED_REGISTRY_PATH),

@@ -171,6 +171,9 @@ export async function compileAuthoredWorkspace(workspaceRoot: string): Promise<A
   const specs: AuthorSpec[] = [];
   for (const entry of discovered) specs.push(await readAuthorSpec(workspaceRoot, entry.path));
   const { ordered, pivotNestings } = validateAuthoredSemanticGraph(specs);
+  // Sort to match the workspace-gate's alphabetical ordering (the registry source must be
+  // identical between the author-compile and the validate-frozen's expectation generation).
+  ordered.sort((a, b) => a.semanticId.localeCompare(b.semanticId));
   const modules: AuthoredCompilation["modules"] = [];
   for (const spec of ordered) {
     const compiled = compileAuthorSpec(spec);
